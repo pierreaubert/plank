@@ -36,6 +36,8 @@ pub struct Checkpoint {
     pub summary: String,
     /// Full transcript snapshot, restored verbatim on rollback.
     pub transcript: Vec<Message>,
+    /// Off-path branches whose node IDs belong to the captured transcript.
+    pub branches: Vec<crate::branch::OffNode>,
     /// Task list snapshot, restored alongside the transcript (issue #35).
     pub tasks: crate::tasks::TaskList,
     /// Captured engine KV state; `None` when the engine has no snapshot
@@ -96,6 +98,7 @@ impl CheckpointStore {
             created_at: unix_now(),
             summary: summarize(&session.transcript),
             transcript: session.transcript.clone(),
+            branches: session.branches.clone(),
             tasks: session.tasks.clone(),
             kv,
         };
@@ -115,12 +118,13 @@ impl CheckpointStore {
     }
 }
 
-/// Applies a checkpoint's transcript to `session`, marking it dirty.
+/// Restores a checkpoint's conversation and branches, marking the session dirty.
 ///
 /// The engine KV restore is the caller's responsibility (it owns the engine);
-/// this only rewinds the text state so the two stay consistent.
+/// This restores the transcript, branch records, and task list together.
 pub fn restore_transcript(session: &mut Session, cp: &Checkpoint) {
     session.transcript.clone_from(&cp.transcript);
+    session.branches.clone_from(&cp.branches);
     session.tasks.clone_from(&cp.tasks);
     session.dirty = true;
 }
@@ -203,6 +207,25 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_restores_off_path_branches_with_their_matching_transcript() {
+        let mut session = session_with(&[Message::user("first"), Message::assistant("answer")]);
+        let mut tree = session.tree();
+        tree.clone_active();
+        session.set_tree(&tree);
+        assert_eq!(session.tree().branch_count(), 2);
+        let mut store = CheckpointStore::new();
+        store.save("branched", &session, None);
+        let checkpoint = store.get("branched").unwrap();
+        session.transcript = vec![Message::user("different conversation")];
+        session.branches.clear();
+        restore_transcript(&mut session, checkpoint);
+        assert_eq!(session.transcript, checkpoint.transcript);
+        assert_eq!(session.branches, checkpoint.branches);
+        assert_eq!(session.tree().branch_count(), 2);
+        assert_eq!(session.tree().active_messages(), checkpoint.transcript);
+    }
 
     fn session_with(msgs: &[Message]) -> Session {
         let mut s = Session::new();

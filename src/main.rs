@@ -815,7 +815,19 @@ fn parse_config(
 /// draws on stdout and reads stdin), the front end is the default interactive
 /// one, and the run is not a read-only diagnostic that answers and exits.
 fn menu_allowed(allow_menu: bool, ttys: bool, cfg: &plank::config::AgentConfig) -> bool {
-    allow_menu && ttys && cfg.ui == plank::config::UiMode::Tui && !answers_and_exits(cfg)
+    menu_allowed_with(allow_menu, ttys, cfg, plank::ui::gui_protocol_enabled())
+}
+
+fn menu_allowed_with(
+    allow_menu: bool,
+    ttys: bool,
+    cfg: &plank::config::AgentConfig,
+    gui: bool,
+) -> bool {
+    allow_menu
+        && !answers_and_exits(cfg)
+        && ((ttys && cfg.ui == plank::config::UiMode::Tui)
+            || (gui && cfg.ui == plank::config::UiMode::Console && cfg.prompt.is_none()))
 }
 
 /// [`parse_config`] with the engine catalog and managed paths under `root`,
@@ -1178,6 +1190,7 @@ fn main() -> ExitCode {
         eprintln!("plank: {e}");
         return ExitCode::FAILURE;
     }
+    publish_gui_launch(&cfg, &args);
 
     // First launch after an upgrade: the KV caches self-validate and survive,
     // but a major version change drops the image cache (see upgrade.rs).
@@ -1989,7 +2002,14 @@ fn run(
     }
     let color = std::io::stdout().is_terminal();
     if cfg.ui.is_headless() {
-        return plank::ui::run_headless(engine, cfg, local_engine, reopen, plugins);
+        let code = plank::ui::run_headless(engine, cfg, local_engine, reopen, plugins)?;
+        return match plank::profileedit::take_restart() {
+            None => Ok(code),
+            Some(restart) => Err(format!(
+                "restart failed: {}",
+                plank::profileedit::exec_restart(&restart)
+            )),
+        };
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -2022,6 +2042,22 @@ fn run(
             "restart failed: {}",
             plank::profileedit::exec_restart(&restart)
         )),
+    }
+}
+
+/// Publishes resolved settings before loading an engine for the GUI.
+fn publish_gui_launch(cfg: &AgentConfig, args: &[String]) {
+    if plank::ui::gui_protocol_enabled()
+        && cfg.ui == plank::config::UiMode::Console
+        && !answers_and_exits(cfg)
+    {
+        let mut launch =
+            plank::profileedit::gui_launch_args(args, cfg.model_spec.as_deref(), cfg.model_named);
+        if let Ok(cwd) = std::env::current_dir() {
+            launch.extend(["--chdir".to_owned(), cwd.to_string_lossy().into_owned()]);
+        }
+        plank::profileedit::record_gui_launch(&launch);
+        eprintln!("+PLANK_LAUNCH {}", serde_json::json!({"args": launch}));
     }
 }
 
@@ -2524,6 +2560,19 @@ mod tests {
         assert_eq!(cfg.resume.as_deref(), Some("x"));
         assert!(!root.join("settings.json").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gui_console_menu_works_without_terminal_but_one_shots_do_not_prompt() {
+        let mut cfg = plank::config::AgentConfig {
+            ui: plank::config::UiMode::Console,
+            ..plank::config::AgentConfig::default()
+        };
+        assert!(menu_allowed_with(true, false, &cfg, true));
+        assert!(!menu_allowed_with(false, false, &cfg, true));
+        assert!(!menu_allowed_with(true, false, &cfg, false));
+        cfg.prompt = Some("hello".into());
+        assert!(!menu_allowed_with(true, false, &cfg, true));
     }
 
     #[test]

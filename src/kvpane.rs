@@ -23,6 +23,10 @@ const ORPHAN_KEY: &str = "\u{0}orphans";
 
 /// One render-ready line of the tree, plus the detail line beneath it.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Selection, expansion, child presence, and pin state are independent display properties"
+)]
 pub struct Row {
     /// Indent level: `0` for a root or the orphan header.
     pub depth: usize,
@@ -59,6 +63,8 @@ pub struct Row {
     /// fingerprint travels with the row so the mutation can refuse instead of
     /// acting on the wrong file.
     pub fingerprint: Option<String>,
+    /// Effective pin state for an actionable blob.
+    pub pinned: bool,
 }
 
 /// What a key press asks the caller to do with the pane.
@@ -267,6 +273,7 @@ impl KvPane {
                         has_children: true,
                         idx: None,
                         fingerprint: None,
+                        pinned: false,
                     };
                 };
                 let m = &self.metas[mi];
@@ -280,6 +287,7 @@ impl KvPane {
                     has_children: f.has_children,
                     idx: f.src,
                     fingerprint: Some(m.fingerprint.clone()),
+                    pinned: self.pinned(mi),
                 }
             })
             .collect()

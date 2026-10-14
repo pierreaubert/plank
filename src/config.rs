@@ -986,6 +986,21 @@ pub struct SlashCommand {
 /// the model as an ordinary prompt.
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "/command",
+        args: "",
+        desc: "alias for /commands: list built-in and loaded extension commands",
+    },
+    SlashCommand {
+        name: "/commands",
+        args: "",
+        desc: "list this engine's built-in and loaded extension commands",
+    },
+    SlashCommand {
+        name: "/search",
+        args: "<query> [--all]",
+        desc: "search saved conversations in this project or all projects",
+    },
+    SlashCommand {
         name: "/help",
         args: "",
         desc: "show the full option and command reference",
@@ -1027,7 +1042,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/config",
-        args: "[section.key value]",
+        args: "[section.key value|--page N|--resolved]",
         desc: "edit settings in a form, or set one inline",
     },
     SlashCommand {
@@ -1047,7 +1062,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/list",
-        args: "",
+        args: "[page]",
         desc: "list saved sessions",
     },
     SlashCommand {
@@ -1077,28 +1092,28 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/fork",
-        args: "[name]",
-        desc: "branch the conversation at the current turn",
+        args: "[n]",
+        desc: "branch before a numbered user prompt; list fork points when bare",
     },
     SlashCommand {
         name: "/clone",
         args: "",
-        desc: "copy the current branch into a new session",
+        desc: "duplicate the active branch within this session",
     },
     SlashCommand {
         name: "/tree",
-        args: "",
+        args: "[--page N]",
         desc: "show the branch tree of this session",
     },
     SlashCommand {
         name: "/checkpoint",
-        args: "[name]",
-        desc: "snapshot the working tree so a turn can be undone",
+        args: "[name|--page N]",
+        desc: "list or capture an in-session conversation rollback point",
     },
     SlashCommand {
         name: "/rollback",
         args: "[name]",
-        desc: "restore the working tree from a checkpoint",
+        desc: "restore the conversation and optional engine cache from a checkpoint",
     },
     SlashCommand {
         name: "/history",
@@ -1122,8 +1137,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/tasks",
-        args: "",
-        desc: "show the model's task list for this session",
+        args: "[add <subject>|set <id> <pending|in_progress|completed>|rename <id> <subject>|active <id> <text|->]",
+        desc: "inspect or edit this session's task list; task IDs remain stable",
     },
     SlashCommand {
         name: "/goal",
@@ -1157,8 +1172,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/engines",
-        args: "",
-        desc: "choose or download an engine that fits this machine, then restart into it",
+        args: "[--page N]",
+        desc: "choose an engine, or inspect a read-only page of the host's catalog",
     },
     SlashCommand {
         name: "/frame",
@@ -1252,8 +1267,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/jobs",
-        args: "",
-        desc: "list running and finished background bash jobs",
+        args: "[output|stop <id>]",
+        desc: "list background bash jobs, read output, or stop a job",
     },
     SlashCommand {
         name: "/notify",
@@ -1262,12 +1277,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/strip",
-        args: "[on|off]",
-        desc: "toggle stripping thinking blocks from the transcript",
+        args: "<prefix>",
+        desc: "remove a saved session's engine payload, keeping its transcript",
     },
     SlashCommand {
         name: "/kvcache",
-        args: "[gc|pin|unpin|rm]",
+        args: "[--page N|gc|pin|unpin|rm]",
         desc: "show the KV cache tree; pin, delete or sweep entries",
     },
     SlashCommand {
@@ -1302,12 +1317,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/remote-control",
-        args: "[on|ask|off]",
+        args: "[on|ask|off|status]",
         desc: "show the TUI remote-control endpoint",
     },
     SlashCommand {
         name: "/rc",
-        args: "[on|ask|off]",
+        args: "[on|ask|off|status]",
         desc: "alias for /remote-control",
     },
     SlashCommand {
@@ -1360,6 +1375,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
     matches!(
         cmd,
         "/help"
+            | "/commands"
             | "/save"
             | "/list"
             | "/retitle"
@@ -1407,6 +1423,9 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         // `/compact focus on the parser bug` are both valid invocations.
         || slash_command_with_args(cmd, "/compact")
         || slash_command_with_args(cmd, "/config")
+        || slash_command_with_args(cmd, "/jobs")
+        || slash_command_with_args(cmd, "/tasks")
+        || slash_command_with_args(cmd, "/engines")
         || slash_command_with_args(cmd, "/fork")
         || slash_command_with_args(cmd, "/btw")
         // `/subagent` also takes a `:<name>` suffix selecting a definition, so
@@ -1474,15 +1493,21 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
 pub fn slash_command_remote_refusal(line: &str) -> Option<&'static str> {
     let mut it = line.split_whitespace();
     let cmd = it.next().unwrap_or("");
+    if matches!(cmd, "/remote-control" | "/rc") && it.clone().eq(["status"]) {
+        // Reporting host policy cannot change ownership or disconnect clients.
+        return None;
+    }
     let bare = it.next().is_none();
     match cmd {
+        "/engines" if line.split_whitespace().nth(1) != Some("--page") => Some(
+            "remote engine restart is not available; use /engines --page N to inspect the host catalog",
+        ),
         "/grant" => Some(
             "/grant answers a remote request and is local-only — asking for it from the client that wants control would be self-granting",
         ),
         "/remote-control" | "/rc" => {
             Some("toggling remote control would disconnect this client; run it locally")
         }
-        "/open" => Some("/open takes over the local terminal with the built-in editor"),
         "/quit" | "/exit" => Some("quitting is local-only; use the local terminal to stop plank"),
         "/kvcache" | "/resume" if bare => {
             Some("opens an interactive local pane; pass an argument for the non-interactive form")
@@ -3280,6 +3305,13 @@ mod tests {
         assert!(slash_command_known("/strip"));
         assert!(slash_command_known("/kvcache"));
         assert!(slash_command_known("/jobs"));
+        assert!(slash_command_known("/jobs output 1"));
+        assert!(slash_command_known("/jobs stop 1"));
+        assert!(slash_command_known("/engines --page 1"));
+        assert!(slash_command_remote_refusal("/engines").is_some());
+        assert!(slash_command_remote_refusal("/engines --page 1").is_none());
+        assert!(!slash_command_known("/enginesx --page 1"));
+        assert!(!slash_command_known("/jobsx output 1"));
         assert!(slash_command_known("/kvcache gc"));
         assert!(!slash_command_known("/kvcaches"));
         assert!(slash_command_known("/history 10"));
@@ -3350,7 +3382,16 @@ mod tests {
 
     #[test]
     fn ordinary_commands_and_prompts_are_remote_safe() {
-        for line in ["/help", "/context", "/compact focus on the parser", "hello"] {
+        for line in [
+            "/help",
+            "/context",
+            "/compact focus on the parser",
+            "/open",
+            "/open src/ui.rs",
+            "/rc status",
+            " /remote-control  status ",
+            "hello",
+        ] {
             assert_eq!(slash_command_remote_refusal(line), None, "{line}");
         }
     }
@@ -3362,9 +3403,10 @@ mod tests {
             "/grant 3",
             "/rc",
             "/rc off",
+            "/rc on",
+            "/rc ask",
+            "/rc status off",
             "/remote-control",
-            "/open",
-            "/open src/ui.rs",
             "/quit",
             "/exit",
         ] {

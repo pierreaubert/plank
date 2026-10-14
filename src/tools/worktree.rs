@@ -46,10 +46,14 @@ pub fn tool_enter_worktree(ctx: &mut ToolContext, call: &ToolCall) -> String {
         sparse_paths: settings.worktree.sparse_paths.clone(),
         symlink_dirs: settings.worktree.symlink_directories.clone(),
     };
-    let mut session = match worktree::create_for_session(&from, name, &ctx.hooks, &opts) {
-        Ok(s) => s,
-        Err(e) => return format!("Tool error: could not create worktree '{name}': {e}\n"),
-    };
+    let console = std::sync::Arc::clone(&ctx.console);
+    let mut session =
+        match worktree::create_for_session_interruptible(&from, name, &ctx.hooks, &opts, &|| {
+            console.interrupted()
+        }) {
+            Ok(s) => s,
+            Err(e) => return format!("Tool error: could not create worktree '{name}': {e}\n"),
+        };
     // `create_for_session` was handed the repo root, but the session has to
     // return to wherever the model actually was.
     session.original_cwd.clone_from(&ctx.cwd);
@@ -127,7 +131,8 @@ fn remove_worktree(ctx: &mut ToolContext, discard: bool) -> String {
         }
     }
     let session = take_session(ctx);
-    match worktree::cleanup(&session, &ctx.hooks) {
+    let console = std::sync::Arc::clone(&ctx.console);
+    match worktree::cleanup_interruptible(&session, &ctx.hooks, &|| console.interrupted()) {
         Ok(()) => format!(
             "Removed worktree '{}' and its branch; the working directory is back to {}.\n",
             session.name,

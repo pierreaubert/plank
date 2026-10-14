@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::Read as _;
+use std::io::Seek as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -454,14 +455,14 @@ impl BashJob {
     /// process group, so the terminal's SIGINT no longer reaches it and plank
     /// has to forward the intent itself. The flag is left set for the turn
     /// loop, which is what stops the generation.
-    fn refresh_for(&mut self, refresh_sec: u64) {
+    fn refresh_for(&mut self, refresh_sec: u64, interrupted: &dyn Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(refresh_sec);
         while self.running && Instant::now() < deadline {
             self.poll();
             if !self.running {
                 break;
             }
-            if crate::interrupt::pending() {
+            if crate::interrupt::pending() || interrupted() {
                 self.terminate();
                 break;
             }
@@ -476,13 +477,13 @@ impl BashJob {
     /// interrupt kills it as in [`refresh_for`](Self::refresh_for); nothing
     /// else does. `refresh_sec` is capped at an hour while a timeout may run to
     /// a day, so the refresh wait cannot stand in for this.
-    fn wait_for_exit(&mut self) {
+    fn wait_for_exit(&mut self, interrupted: &dyn Fn() -> bool) {
         while self.running {
             self.poll();
             if !self.running {
                 break;
             }
-            if crate::interrupt::pending() {
+            if crate::interrupt::pending() || interrupted() {
                 self.terminate();
                 break;
             }
@@ -628,6 +629,54 @@ impl BashJobs {
         render_rows(&self.rows())
     }
 
+    /// Reports or stops a job without consuming its model notification.
+    ///
+    /// Reads only the final 32 KiB, matching the tool output tail limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the job disappeared or its output cannot be read.
+    pub(crate) fn report_job(&mut self, id: i64, stop: bool) -> Result<String, String> {
+        self.sweep();
+        let idx = self
+            .find(id, 0)
+            .ok_or_else(|| format!("Background job #{id} is no longer tracked"))?;
+        let job = &mut self.jobs[idx];
+        if stop {
+            job.terminate();
+        }
+        let mut file = std::fs::File::open(&job.path)
+            .map_err(|error| format!("Cannot read job #{id}: {error}"))?;
+        let bytes = file.metadata().map_err(|error| error.to_string())?.len();
+        let start = bytes.saturating_sub(BASH_TAIL_BYTES as u64);
+        file.seek(std::io::SeekFrom::Start(start))
+            .map_err(|error| error.to_string())?;
+        let mut tail = Vec::new();
+        file.take(BASH_TAIL_BYTES as u64)
+            .read_to_end(&mut tail)
+            .map_err(|error| error.to_string())?;
+        let mut report = render_rows(&[JobRow {
+            id: job.id,
+            pid: job.pid,
+            started: job.start,
+            state: if job.running {
+                JobState::Running
+            } else if job.timed_out {
+                JobState::TimedOut(job.exit_status)
+            } else {
+                JobState::Done(job.exit_status)
+            },
+            path: job.path.clone(),
+        }]);
+        if start > 0 {
+            report.push_str("\n[Earlier output omitted; showing the final 32 KiB]\n");
+        } else {
+            report.push('\n');
+        }
+        report.push_str(&String::from_utf8_lossy(&tail));
+        Ok(report)
+    }
+
     /// Whether any job in the table has finished (after a `sweep`).
     #[must_use]
     pub fn has_finished(&self) -> bool {
@@ -674,13 +723,14 @@ impl BashJobs {
         refresh_sec: u64,
         stop: bool,
         remove_if_done: bool,
+        interrupted: &dyn Fn() -> bool,
     ) -> String {
         let job = &mut self.jobs[idx];
         if stop {
             job.terminate();
         }
         if wait || stop {
-            job.refresh_for(refresh_sec);
+            job.refresh_for(refresh_sec, interrupted);
         } else {
             job.poll();
         }
@@ -702,11 +752,12 @@ impl BashJobs {
         refresh_sec: u64,
         sandbox: Option<crate::sandbox::Sandbox>,
         wait_to_exit: bool,
+        interrupted: &dyn Fn() -> bool,
     ) -> String {
         if wait_to_exit {
-            self.jobs[idx].wait_for_exit();
+            self.jobs[idx].wait_for_exit(interrupted);
         } else {
-            self.jobs[idx].refresh_for(refresh_sec);
+            self.jobs[idx].refresh_for(refresh_sec, interrupted);
         }
         let job = &self.jobs[idx];
         // A pending interrupt means refresh_for/wait_for_exit killed the job
@@ -715,19 +766,19 @@ impl BashJobs {
         // trusting that would unload and reload the model for a run the user
         // asked to stop, not one that wants to try again. Esc/Ctrl-C must
         // never lead to a cycle.
-        let interrupted = crate::interrupt::pending();
+        let was_interrupted = crate::interrupt::pending() || interrupted();
         self.last_foreground = (!job.running).then(|| {
             let signal = job.signal.as_deref().and_then(crate::gpuyield::take_signal);
             crate::gpuyield::ForegroundExit {
                 exit_status: job.exit_status,
-                needs_gpu: !interrupted
+                needs_gpu: !was_interrupted
                     && (signal.is_some()
                         || crate::gpuyield::output_file_needs_gpu(job.exit_status, &job.path)),
                 signal,
                 sandbox,
             }
         });
-        self.job_tool_result(idx, false, 0, false, true)
+        self.job_tool_result(idx, false, 0, false, true, interrupted)
     }
 }
 
@@ -960,6 +1011,9 @@ fn bare_ampersand_backgrounds(chars: &[char], i: usize) -> bool {
 
 /// Implements the `bash` tool: start a job and wait up to `refresh_sec`.
 pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    if ctx.console.interrupted() {
+        return "Tool error: interrupted before dispatch\n".into();
+    }
     let cmd = call.arg_value("command").unwrap_or("");
     if cmd.is_empty() {
         return "Tool error: bash requires command\n".to_string();
@@ -979,6 +1033,9 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         None => resolve_sandbox(ctx, cmd),
     };
     ctx.bash.sweep();
+    if ctx.console.interrupted() {
+        return "Tool error: interrupted before dispatch\n".into();
+    }
     if let Err(err) = ctx
         .bash
         .start(&ctx.cwd.clone(), cmd, timeout, sandbox.as_ref())
@@ -987,7 +1044,9 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     }
     let idx = ctx.bash.jobs.len() - 1;
     let wait = std::mem::take(&mut ctx.bash.wait_to_exit);
-    ctx.bash.foreground_result(idx, refresh, sandbox, wait)
+    let console = Arc::clone(&ctx.console);
+    ctx.bash
+        .foreground_result(idx, refresh, sandbox, wait, &|| console.interrupted())
 }
 
 /// Decides the sandbox policy one command runs under, asking about any
@@ -1054,7 +1113,9 @@ pub fn tool_bash_status_or_stop(ctx: &mut ToolContext, call: &ToolCall, stop: bo
     if stop && refresh == 0 {
         refresh = 1;
     }
-    ctx.bash.job_tool_result(idx, wait, refresh, stop, true)
+    let console = Arc::clone(&ctx.console);
+    ctx.bash
+        .job_tool_result(idx, wait, refresh, stop, true, &|| console.interrupted())
 }
 
 /// Outcome of an immediate (`!`-prefixed) shell command.
@@ -1260,6 +1321,150 @@ pub fn run_immediate(
 mod tests {
     use super::*;
     use crate::tools::{home_writable, test_call, test_ctx};
+
+    #[test]
+    fn remote_shell_stop_ends_waits_skips_later_writes_and_suppresses_gpu_yield() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        for wait_to_exit in [false, true] {
+            let (mut ctx, dir) = test_ctx();
+            let remote = crate::remote::control::RemoteState::test_bridge();
+            ctx.console.attach(Some(Arc::clone(&remote)));
+            ctx.bash.wait_to_exit = wait_to_exit;
+            let ready = dir.join("ready");
+            let stop = Arc::clone(&remote.shared);
+            let setter = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ready.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let started = ready.exists();
+                stop.interrupt
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                started
+            });
+            let started = Instant::now();
+            let output = crate::tools::dispatch_all(
+                &[
+                    test_call(
+                        "bash",
+                        &[
+                            (
+                                "command",
+                                "printf 'needs GPU\\n' > \"$PLANK_GPU_YIELD_FILE\"; touch ready; sleep 30",
+                            ),
+                            ("refresh_sec", "60"),
+                        ],
+                    ),
+                    test_call(
+                        "write",
+                        &[("path", "after.txt"), ("content", "must not be written")],
+                    ),
+                ],
+                &mut ctx,
+            );
+            assert!(setter.join().unwrap(), "shell started before cancellation");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "remote stop must not wait for the sleeping shell"
+            );
+            assert!(
+                output.contains("Tool result 2 (write):\nTool error: interrupted before dispatch")
+            );
+            assert!(!dir.join("after.txt").exists());
+            assert_eq!(ctx.bash.running_count(), 0);
+            let exit = ctx.bash.last_foreground.as_ref().unwrap();
+            assert_eq!(exit.signal.as_deref(), Some("needs GPU"));
+            assert!(!exit.needs_gpu);
+            assert!(
+                ctx.console.interrupted(),
+                "the tool must leave stop retirement to dispatch"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn remote_shell_stop_honors_identified_cancellation_with_the_transient_flag_cleared() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        remote
+            .shared
+            .push_prompt_request("stopped".into(), "prompt".into())
+            .unwrap();
+        remote.shared.take_prompt_requests();
+        assert!(remote.shared.begin_prompt_request("stopped"));
+        assert!(!remote.shared.cancel_prompt_request("stopped"));
+        remote
+            .shared
+            .interrupt
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        ctx.console.attach(Some(remote));
+        let output = tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", "touch blocked")]),
+        );
+        assert!(output.starts_with("Tool error: interrupted before dispatch"));
+        assert!(!dir.join("blocked").exists());
+        assert!(ctx.bash.jobs.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_shell_stop_interrupts_a_requested_status_wait() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        ctx.console.attach(Some(Arc::clone(&remote)));
+        let id = ctx
+            .bash
+            .start(&ctx.cwd, "sleep 30", 60, None)
+            .unwrap()
+            .to_string();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            remote
+                .shared
+                .interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let output = tool_bash_status_or_stop(
+            &mut ctx,
+            &test_call("bash_status", &[("job", &id), ("refresh_sec", "60")]),
+            false,
+        );
+        setter.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(output.contains("status=done"));
+        assert_eq!(ctx.bash.running_count(), 0);
+        assert!(ctx.console.interrupted());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn job_reports_bound_output_and_preserve_completion_notifications() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let id = ctx.bash.start(&ctx.cwd, "sleep 30", 60, None).unwrap();
+        let job = &ctx.bash.jobs[0];
+        let mut bytes = vec![b'x'; BASH_TAIL_BYTES * 2];
+        bytes.extend_from_slice(b"\nfinal output\n");
+        std::fs::write(&job.path, &bytes).unwrap();
+        let report = ctx.bash.report_job(id, false).unwrap();
+        assert!(report.contains("Earlier output omitted"));
+        assert!(report.ends_with("\nfinal output\n"));
+        assert!(report.len() < BASH_TAIL_BYTES + 1024);
+        assert!(!ctx.bash.jobs[0].observed_once);
+        assert!(ctx.bash.report_job(id + 1, true).is_err());
+        assert!(ctx.bash.jobs[0].running);
+        let report = ctx.bash.report_job(id, true).unwrap();
+        assert!(report.contains("done"));
+        assert!(!ctx.bash.jobs[0].running);
+        assert_eq!(ctx.bash.take_finished().len(), 1);
+        assert!(ctx.bash.take_finished().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn bash_echo_round_trip() {

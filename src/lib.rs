@@ -21,6 +21,7 @@ pub mod complete;
 pub mod config;
 pub mod configform;
 pub mod consent;
+mod console_input;
 pub mod context;
 pub mod ctxreport;
 pub mod cursor;

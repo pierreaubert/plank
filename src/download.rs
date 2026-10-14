@@ -1537,10 +1537,83 @@ fn wait_screen(
     set: crate::manifest::EngineId,
     manifest: &crate::manifest::Manifest,
 ) -> Result<Waited, String> {
+    if crate::ui::gui_protocol_enabled() {
+        return wait_gui(root, set, manifest);
+    }
     let mut terminal = ratatui::init();
     let result = wait_ui(&mut terminal, root, set, manifest);
     ratatui::restore();
     result
+}
+
+/// Streams helper progress while the GUI can leave or cancel the download.
+fn wait_gui(
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+) -> Result<Waited, String> {
+    let request = GuiWaitQuestion(crate::ui::gui_send_question(
+        &format!(
+            "Downloading {set}. Leave it running to resume the previous engine, or cancel and keep partial files."
+        ),
+        "Model download",
+        &[
+            serde_json::json!({"label":"Leave downloading"}),
+            serde_json::json!({"label":"Cancel download", "description":"Keep partial files for resuming"}),
+        ],
+        false,
+    ));
+    let started = Instant::now();
+    let mut eof = false;
+    loop {
+        let state = crate::downloader::read_state_in(root);
+        match next_move(
+            state.as_ref(),
+            set.as_str(),
+            crate::downloader::running_in(root),
+            started.elapsed() >= Duration::from_secs(5),
+            crate::downloader::is_staged_in(root, set),
+            &crate::downloader::log_path_in(root),
+        ) {
+            Move::Install => return Ok(Waited::Staged),
+            Move::Fail(error) => return Err(error),
+            Move::Wait => {}
+        }
+        let (current, total) = match wait_step(state.as_ref(), set.as_str()) {
+            WaitStep::Progress { done, index, .. } => set_progress(manifest, index, done),
+            _ => (0, 0),
+        };
+        eprintln!(
+            "+PLANK_PROGRESS {}",
+            serde_json::json!({"label": format!("Downloading {set}"), "current": current, "total": total})
+        );
+        if let Some(reply) =
+            crate::ui::read_quiet_batched(&mut eof, 1000).map_err(|error| error.to_string())?
+        {
+            match crate::ui::gui_answer(&request.0, &reply).as_deref() {
+                Some("2") => {
+                    crate::downloader::request_cancel_in(root, crate::downloader::Cancel::Keep)
+                        .map_err(|error| error.to_string())?;
+                    return Ok(Waited::Detached);
+                }
+                Some("1" | "0") => return Ok(Waited::Detached),
+                _ => {}
+            }
+        }
+        if eof {
+            return Ok(Waited::Detached);
+        }
+    }
+}
+
+/// Closes a cancellable progress question when the helper finishes without a reply.
+#[derive(Debug)]
+struct GuiWaitQuestion(String);
+
+impl Drop for GuiWaitQuestion {
+    fn drop(&mut self) {
+        eprintln!("+PLANK_QUESTION_DONE {}", serde_json::json!({"id": self.0}));
+    }
 }
 
 fn wait_ui(

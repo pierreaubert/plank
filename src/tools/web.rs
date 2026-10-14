@@ -39,8 +39,8 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-#[cfg(not(feature = "use_obscura"))]
-use std::process::Command;
+use std::os::unix::process::CommandExt as _;
+use std::process::{Command, Output, Stdio};
 
 use crate::dsml::ToolCall;
 
@@ -84,6 +84,9 @@ pub struct WebState {
     allow(clippy::needless_return)
 )]
 pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    if ctx.console.interrupted() {
+        return "Tool error: web request interrupted\n".into();
+    }
     let query = call.arg_value("query").unwrap_or("").trim();
     if query.is_empty() {
         return "Tool error: google_search requires query\n".to_string();
@@ -99,6 +102,7 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
         }
         let query = query.to_string();
         return match browser(ctx).and_then(|b| b.google_search(&query)) {
+            Ok(_) if ctx.console.interrupted() => "Tool error: web request interrupted\n".into(),
             Ok(md) => md,
             Err(e) => {
                 crate::errlog::log_error("google_search", &format!("query \"{query}\": {e}"));
@@ -116,7 +120,7 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
                 .to_string();
         }
         let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-        let html = match fetch_html(&url) {
+        let html = match fetch_html(&url, &|| ctx.console.interrupted()) {
             Ok(html) => html,
             Err(e) => {
                 crate::errlog::log_error("google_search", &format!("query \"{query}\": {e}"));
@@ -127,12 +131,18 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
             return "Tool error: google_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
         }
         let hits = filter_by_domains(parse_ddg_results(&html), &allowed, &blocked);
+        if ctx.console.interrupted() {
+            return "Tool error: web request interrupted\n".into();
+        }
         render_search_results(query, &hits)
     }
 }
 
 /// Executes the `visit_page` tool: renders a URL to Markdown with link map.
 pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    if ctx.console.interrupted() {
+        return "Tool error: web request interrupted\n".into();
+    }
     let url = call.arg_value("url").unwrap_or("").to_string();
     if url.is_empty() {
         return "Tool error: visit_page requires url\n".to_string();
@@ -143,6 +153,9 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     ctx.publish_status(&format!("Opening page {url}..."));
     if let Err(e) = ensure_allowed(ctx) {
         return format!("Tool error: visit_page failed: {e}\n");
+    }
+    if ctx.console.interrupted() {
+        return "Tool error: web request interrupted\n".into();
     }
     // A URL that names a document is downloaded and converted rather than
     // rendered: an HTML renderer handed a PDF produces the lossy-decoded
@@ -173,7 +186,7 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     };
     #[cfg(any(not(ds4_engine), feature = "use_obscura"))]
     let md = {
-        let html = match fetch_html(&url) {
+        let html = match fetch_html(&url, &|| ctx.console.interrupted()) {
             Ok(html) => html,
             Err(e) => {
                 crate::errlog::log_error("visit_page", &format!("{url}: {e}"));
@@ -195,6 +208,9 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
         }
         extract_page_markdown(&url, &html)
     };
+    if ctx.console.interrupted() {
+        return "Tool error: web request interrupted\n".into();
+    }
     let path = match write_temp_text("ds4_agent_web", &md) {
         Ok(path) => path,
         Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
@@ -222,7 +238,10 @@ fn browser(ctx: &mut ToolContext) -> Result<&mut crate::ds4web::WebBrowser, Stri
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map_or_else(|| ctx.cwd.clone(), std::path::PathBuf::from);
-        ctx.web_browser = Some(crate::ds4web::WebBrowser::new(&home)?);
+        ctx.web_browser = Some(crate::ds4web::WebBrowser::with_input(
+            &home,
+            std::sync::Arc::clone(&ctx.console),
+        )?);
     }
     Ok(ctx.web_browser.as_mut().expect("web_browser was just set"))
 }
@@ -253,10 +272,8 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
         ctx.web.allowed = true;
         return Ok(());
     }
-    // TUI: approve via the ask bridge, never blocking stdin under raw mode.
-    if ctx.ask_bridge.is_some()
-        && let Some(asker) = ctx.asker.as_mut()
-    {
+    // Every interactive front end uses its asker, including the GUI protocol.
+    if let Some(asker) = ctx.asker.as_mut() {
         let req = crate::tools::ask::AskRequest {
             question: "Allow the web tool to start a visible Chrome browser?".to_string(),
             header: "Web".to_string(),
@@ -335,45 +352,116 @@ fn url_is_document(url: &str) -> bool {
 /// download fails, the body is not a PDF, or conversion fails.
 fn document_markdown(ctx: &mut ToolContext, url: &str) -> Result<String, String> {
     ctx.publish_status(&format!("Converting document {url}..."));
-    let bytes = curl_fetch_bytes(url)?;
+    let bytes = curl_fetch_bytes(url, &|| ctx.console.interrupted())?;
     if !bytes.starts_with(b"%PDF-") {
         return Err(format!(
             "{url} has a document extension but the response is not a PDF"
         ));
+    }
+    if ctx.console.interrupted() {
+        return Err("web request interrupted".into());
     }
     // The extension matters: liteparse dispatches on it, and rejects a
     // suffixless path outright.
     let tmp = write_temp_bytes("plank_web_doc", "pdf", &bytes)?;
     let converted = crate::doc::to_markdown(std::path::Path::new(&tmp), url);
     std::fs::remove_file(&tmp).ok();
+    if ctx.console.interrupted() {
+        return Err("web request interrupted".into());
+    }
     let md = std::fs::read_to_string(converted?)
         .map_err(|e| format!("failed to read the converted document: {e}"))?;
+    if ctx.console.interrupted() {
+        return Err("web request interrupted".into());
+    }
     let path = write_temp_text("ds4_agent_web", &md)?;
     Ok(frame_visit_output(url, &path, &md))
 }
 
-/// Fetches a URL with curl as raw bytes, refusing bodies over [`MAX_DOC_BYTES`].
-///
-/// Separate from [`curl_fetch`] because a document must survive byte-for-byte:
-/// the lossy UTF-8 decode and mid-body truncation that are harmless for HTML
-/// both destroy a PDF. Used on every build, including `use_obscura` ones, since
-/// a headless renderer has nothing useful to do with a document either.
-fn curl_fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("curl")
-        .args([
-            "-sL",
-            "--max-time",
-            "60",
-            "--max-filesize",
-            &MAX_DOC_BYTES.to_string(),
-            "-A",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+fn drain_web_pipe(mut pipe: impl std::io::Read, max_bytes: usize) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(0) | Err(_) => break,
+            Ok(count) => output
+                .extend_from_slice(&buffer[..count.min(max_bytes.saturating_sub(output.len()))]),
+        }
+    }
+    output
+}
+
+/// Collects bounded curl output while polling the owning turn's cancellation.
+fn cancellable_output(
+    mut command: Command,
+    max_bytes: usize,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Output, String> {
+    use std::time::Duration;
+    if interrupted() {
+        return Err("web request interrupted".into());
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("failed to run curl: {error}"))?;
+    let stdout = child.stdout.take().expect("piped curl stdout");
+    let stderr = child.stderr.take().expect("piped curl stderr");
+    let out_reader = std::thread::spawn(move || drain_web_pipe(stdout, max_bytes));
+    // Curl error text is diagnostic only; retain a bounded buffer.
+    let err_reader = std::thread::spawn(move || drain_web_pipe(stderr, 8 * 1024));
+    let status = loop {
+        if interrupted() {
+            crate::tools::bash::kill_process_group(&mut child);
+            break Err("web request interrupted".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                crate::tools::bash::kill_process_group(&mut child);
+                break Err(error.to_string());
+            }
+        }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if interrupted() {
+        return Err("web request interrupted".into());
+    }
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+/// Downloads intact document bytes; oversized documents are refused, never clipped.
+fn curl_fetch_bytes(url: &str, interrupted: &dyn Fn() -> bool) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-sL",
+        "--max-time",
+        "60",
+        "--max-filesize",
+        &MAX_DOC_BYTES.to_string(),
+        "-A",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
              Chrome/124.0 Safari/537.36",
-            "--",
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
+        "--",
+        url,
+    ]);
+    let out = cancellable_output(
+        command,
+        usize::try_from(MAX_DOC_BYTES)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1),
+        interrupted,
+    )?;
     if !out.status.success() {
         // 63 is curl's "maximum file size exceeded".
         if out.status.code() == Some(63) {
@@ -385,6 +473,12 @@ fn curl_fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
         return Err(format!(
             "curl exited with status {}",
             out.status.code().unwrap_or(-1)
+        ));
+    }
+    if u64::try_from(out.stdout.len()).unwrap_or(u64::MAX) > MAX_DOC_BYTES {
+        return Err(format!(
+            "the document is larger than {} MiB",
+            MAX_DOC_BYTES / (1024 * 1024)
         ));
     }
     Ok(out.stdout)
@@ -411,11 +505,11 @@ fn write_temp_bytes(prefix: &str, ext: &str, bytes: &[u8]) -> Result<String, Str
 ///
 /// Returns a message when the fetch fails.
 #[cfg_attr(all(ds4_engine, not(feature = "use_obscura")), allow(dead_code))]
-fn fetch_html(url: &str) -> Result<String, String> {
+fn fetch_html(url: &str, interrupted: &dyn Fn() -> bool) -> Result<String, String> {
     #[cfg(feature = "use_obscura")]
-    let mut body = crate::obscura_web::fetch(url)?;
+    let mut body = crate::obscura_web::fetch_interruptible(url, interrupted)?;
     #[cfg(not(feature = "use_obscura"))]
-    let mut body = curl_fetch(url)?;
+    let mut body = curl_fetch(url, interrupted)?;
     if body.len() > MAX_HTML_BYTES {
         let mut end = MAX_HTML_BYTES;
         while !body.is_char_boundary(end) {
@@ -436,21 +530,21 @@ fn fetch_html(url: &str) -> Result<String, String> {
 /// Returns a message when curl cannot be spawned or exits nonzero.
 #[cfg(not(feature = "use_obscura"))]
 #[cfg_attr(ds4_engine, allow(dead_code))]
-fn curl_fetch(url: &str) -> Result<String, String> {
-    let out = Command::new("curl")
-        .args([
-            "-sL",
-            "--max-time",
-            &CURL_TIMEOUT_SEC.to_string(),
-            "--compressed",
-            "-A",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+fn curl_fetch(url: &str, interrupted: &dyn Fn() -> bool) -> Result<String, String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-sL",
+        "--max-time",
+        &CURL_TIMEOUT_SEC.to_string(),
+        "--compressed",
+        "-A",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
              Chrome/124.0 Safari/537.36",
-            "--",
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
+        "--",
+        url,
+    ]);
+    // Four lookahead bytes preserve UTF-8 characters crossing the display cap.
+    let out = cancellable_output(command, MAX_HTML_BYTES + 4, interrupted)?;
     if !out.status.success() {
         return Err(format!(
             "curl exited with status {}",
@@ -1272,6 +1366,82 @@ pub fn frame_visit_output(url: &str, path: &str, md: &str) -> String {
 mod tests {
     use super::*;
     use crate::tools::{dispatch, test_call, test_ctx};
+
+    #[test]
+    fn remote_web_stop_terminates_sleeping_fetch_and_preserves_turn_cancellation() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let _guard = crate::interrupt::test_guard();
+        let (ctx, dir) = test_ctx();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        ctx.console.attach(Some(Arc::clone(&remote)));
+        let ready = dir.join("ready");
+        let stop = Arc::clone(&remote.shared);
+        let setter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let started = ready.exists();
+            stop.interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            started
+        });
+        let mut command = Command::new("/bin/sh");
+        command
+            .current_dir(&dir)
+            .args(["-c", "touch ready; sleep 30; touch late"]);
+        let started = Instant::now();
+        let error = cancellable_output(command, 1024, &|| ctx.console.interrupted()).unwrap_err();
+        assert!(setter.join().unwrap(), "fetch started before cancellation");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(error, "web request interrupted");
+        assert!(ctx.console.interrupted(), "only turn cleanup retires stop");
+        assert!(!dir.join("late").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_web_stop_refuses_new_fetches_before_approval_or_process_start() {
+        let _guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        ctx.console.attach(Some(std::sync::Arc::clone(&remote)));
+        remote
+            .shared
+            .interrupt
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            tool_google_search(&mut ctx, &test_call("google_search", &[("query", "test")])),
+            "Tool error: web request interrupted\n"
+        );
+        assert_eq!(
+            tool_visit_page(
+                &mut ctx,
+                &test_call("visit_page", &[("url", "https://example.com")])
+            ),
+            "Tool error: web request interrupted\n"
+        );
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(&dir).args(["-c", "touch unexpected"]);
+        assert_eq!(
+            cancellable_output(command, 1024, &|| ctx.console.interrupted()).unwrap_err(),
+            "web request interrupted"
+        );
+        assert!(!dir.join("unexpected").exists());
+        assert!(!ctx.web.allowed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_web_stop_transport_drains_large_pipes_without_retaining_unbounded_output() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "dd if=/dev/zero bs=1024 count=256 2>/dev/null; dd if=/dev/zero bs=1024 count=256 1>&2 2>/dev/null"]);
+        let output = cancellable_output(command, 37, &|| false).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, vec![0; 37]);
+        assert_eq!(output.stderr, vec![0; 8 * 1024]);
+    }
 
     /// A document URL is downloaded, converted, and framed like any other
     /// `visit_page` result — text the model can read, not lossy binary. The

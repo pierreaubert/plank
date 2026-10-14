@@ -147,6 +147,740 @@ fn state_name(s: WorkerState) -> &'static str {
     }
 }
 
+/// Remote-host policy without the bearer token or transcript contents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostWire {
+    pub endpoint: Option<String>,
+    pub holder: String,
+    pub controller: Option<u64>,
+    /// Whether a client may take the local controller slot without a grant.
+    pub automatic: bool,
+    /// A disconnected controller still owns its reconnect grace reservation.
+    pub reserved: bool,
+    pub pending: Vec<u64>,
+    pub pending_total: usize,
+}
+
+impl HostWire {
+    /// Reports that no host is running.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            endpoint: None,
+            holder: "off".into(),
+            controller: None,
+            automatic: false,
+            reserved: false,
+            pending: Vec::new(),
+            pending_total: 0,
+        }
+    }
+}
+
+/// Requested activity, context, usage, and throughput measurements from the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MetricsWire {
+    /// Delegated runs captured from the shared terminal roster.
+    Subagents {
+        rows: Vec<SubagentWire>,
+        total: usize,
+        running: usize,
+    },
+    /// Bounded statistics and prose from the completed insights report.
+    Insights {
+        markdown: String,
+        /// Checksum of the completed standalone HTML, linking its download to this view.
+        #[serde(default)]
+        html_sha256: Option<String>,
+    },
+    /// Requested engine catalog and host availability, independent of model load.
+    Engines {
+        snapshot: crate::enginefit::EngineInventory,
+    },
+    /// Year-wide activity and scoped figures from saved-session metadata.
+    Activity {
+        snapshot: crate::stats::ActivitySnapshot,
+    },
+    /// Raw tokenizer estimates; resident usage includes conversation framing.
+    Context {
+        model: String,
+        window: u64,
+        used: u64,
+        /// System, MCP, messages, AGENTS.md, and memory, in that order.
+        categories: [u64; 5],
+    },
+    /// Engine-agnostic session totals; input includes cached provider tokens.
+    Usage {
+        model: String,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        provider_passes: Option<u64>,
+        wall_secs: f64,
+    },
+    /// Process-wide rings: decode windows and completed prefill passes.
+    Throughput {
+        generation: Vec<f64>,
+        prefill: Vec<f64>,
+    },
+}
+
+impl MetricsWire {
+    /// Returns the independently coalesced snapshot category.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Subagents { .. } => "subagents",
+            Self::Insights { .. } => "insights",
+            Self::Engines { .. } => "engines",
+            Self::Activity { .. } => "activity",
+            Self::Context { .. } => "context",
+            Self::Usage { .. } => "usage",
+            Self::Throughput { .. } => "throughput",
+        }
+    }
+}
+
+/// Bounded delegated-run metadata, independent of its output buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentWire {
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub output_truncated: bool,
+    #[serde(default)]
+    pub live: Option<SubagentLiveWire>,
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub report: Option<String>,
+    pub label: String,
+    pub task: String,
+    pub running: bool,
+    pub elapsed_ms: u64,
+    pub prefill: u64,
+    pub generated: u64,
+}
+
+impl SubagentWire {
+    /// Captures active rows first and at most 64 bounded display summaries.
+    #[must_use]
+    pub fn capture(pane: &crate::tui::SubPane, now: u64) -> MetricsWire {
+        let clip = |text: &str, bytes: usize| {
+            let mut text: String = text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let mut end = text.len().min(bytes);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text
+        };
+        let mut runs: Vec<_> = pane.runs.iter().collect();
+        runs.sort_by_key(|run| !run.running);
+        MetricsWire::Subagents {
+            total: runs.len(),
+            running: runs.iter().filter(|run| run.running).count(),
+            rows: runs
+                .into_iter()
+                .take(64)
+                .map(|run| {
+                    let (output, clipped) = bounded_subagent_output(&run.output);
+                    Self {
+                        output_truncated: !output.is_empty() && (run.output_truncated || clipped),
+                        output: (!output.is_empty()).then_some(output),
+                        live: run.live.map(|live| SubagentLiveWire {
+                            prefilling: live.prefilling,
+                            prefill_done: u64::try_from(
+                                live.prefill_done.max(0).min(live.prefill_total.max(0)),
+                            )
+                            .unwrap_or(0),
+                            prefill_total: u64::try_from(live.prefill_total.max(0)).unwrap_or(0),
+                            generated: u64::try_from(live.generated.max(0)).unwrap_or(0),
+                        }),
+                        id: run.id,
+                        report: run.report.as_deref().map(bounded_subagent_report),
+                        label: clip(&run.label, 128),
+                        task: clip(&run.task, 1024),
+                        running: run.running,
+                        elapsed_ms: run.elapsed_ms(now),
+                        prefill: run.prefill,
+                        generated: run.generated,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Counters for an unfinished pass; completed totals exclude these estimates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentLiveWire {
+    pub prefilling: bool,
+    pub prefill_done: u64,
+    pub prefill_total: u64,
+    /// Streamed text pieces; online providers may group multiple tokens.
+    pub generated: u64,
+}
+
+/// Clips report text within the graphical client's escaped frame budget.
+pub(crate) fn bounded_subagent_report(report: &str) -> String {
+    // Sixty-four worst-case escaped rows must fit the client's 2 MiB frame.
+    const REPORT_BYTES: usize = 4096;
+    const NOTICE: &str =
+        "\n[Report truncated; the complete result remains in the parent conversation.]";
+    let mut text: String = report
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .take(REPORT_BYTES + 1)
+        .collect();
+    if text.len() > REPORT_BYTES {
+        let mut end = REPORT_BYTES - NOTICE.len();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(NOTICE);
+    }
+    text
+}
+
+/// Retains the newest 4 KiB of sanitized output without splitting UTF-8.
+pub(crate) const SUBAGENT_OUTPUT_BYTES: usize = 4096;
+
+/// Retains the newest sanitized output within the delegated-stream byte budget.
+pub(crate) fn bounded_subagent_output(text: &str) -> (String, bool) {
+    // Together with each 4 KiB report, 64 rows fit the client's 2 MiB frame.
+    let mut tail: String = text
+        .chars()
+        .rev()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .take(SUBAGENT_OUTPUT_BYTES + 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let clipped = tail.len() > SUBAGENT_OUTPUT_BYTES;
+    if clipped {
+        let mut start = tail.len() - SUBAGENT_OUTPUT_BYTES;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+    }
+    (tail, clipped)
+}
+
+/// A bounded task row shared by native and browser clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRowWire {
+    pub id: u32,
+    pub subject: String,
+    pub status: String,
+    pub active_form: Option<String>,
+}
+
+impl TaskRowWire {
+    /// Captures at most 64 tasks, prioritizing active and pending work.
+    #[must_use]
+    pub fn capture(list: &crate::tasks::TaskList) -> Vec<Self> {
+        let clip = |text: &str| {
+            let mut text: String = text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let mut end = text.len().min(512);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text
+        };
+        let mut tasks = list.tasks().iter().collect::<Vec<_>>();
+        tasks.sort_by_key(|task| {
+            (
+                match task.status {
+                    crate::tasks::TaskStatus::InProgress => 0,
+                    crate::tasks::TaskStatus::Pending => 1,
+                    crate::tasks::TaskStatus::Completed => 2,
+                },
+                task.id,
+            )
+        });
+        tasks
+            .into_iter()
+            .take(64)
+            .map(|task| Self {
+                id: task.id,
+                subject: clip(&task.subject),
+                status: task.status.as_str().into(),
+                active_form: task.active_form.as_deref().map(clip),
+            })
+            .collect()
+    }
+}
+
+/// Detached model-update progress, independent of the active model turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadsWire {
+    /// Current detached helper, absent when no trustworthy state is available.
+    pub state: Option<DownloadStateWire>,
+    /// A recorded manifest job can be started or resumed.
+    pub pending: bool,
+    /// Requested cancellation, while the helper still reports active work.
+    pub cancel_requested: Option<String>,
+}
+
+/// Bounded progress from the detached engine-host downloader.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadStateWire {
+    /// Model family and manifest version.
+    pub set: String,
+    pub version: u32,
+    /// Current artifact and one-based position within the job.
+    pub current: String,
+    pub index: usize,
+    pub of: usize,
+    /// Current artifact progress, not the combined size of the whole job.
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    pub rate_bps: u64,
+    /// Downloading, rehashing, verifying, staged, failed, cancelled, or unknown.
+    pub phase: String,
+    /// Whether a cancelled helper retained its partial files.
+    pub partials_kept: Option<bool>,
+    pub error: Option<String>,
+}
+
+impl DownloadsWire {
+    /// Reads the helper's published state and pending job without starting work.
+    #[must_use]
+    pub fn capture_in(root: &std::path::Path) -> Self {
+        let clip = |text: &str, limit: usize| {
+            let text: String = text
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect();
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        };
+        let state = crate::downloader::read_state_in(root)
+            .filter(|state| {
+                // Terminal results remain useful after the detached helper exits.
+                matches!(
+                    state.phase,
+                    crate::downloader::Phase::Staged
+                        | crate::downloader::Phase::Failed
+                        | crate::downloader::Phase::Cancelled
+                ) || !crate::downloader::is_stale(
+                    state,
+                    crate::downloader::now_epoch(),
+                    &crate::downloader::pid_alive,
+                )
+            })
+            .map(|state| DownloadStateWire {
+                set: clip(&state.set, 256),
+                version: state.version,
+                current: clip(&state.current, 256),
+                index: state.index.min(state.of),
+                of: state.of,
+                done_bytes: state.done_bytes.min(state.total_bytes),
+                total_bytes: state.total_bytes,
+                rate_bps: state.rate_bps,
+                phase: match state.phase {
+                    crate::downloader::Phase::Rehashing => "rehashing",
+                    crate::downloader::Phase::Downloading => "downloading",
+                    crate::downloader::Phase::Verifying => "verifying",
+                    crate::downloader::Phase::Staged => "staged",
+                    crate::downloader::Phase::Failed => "failed",
+                    crate::downloader::Phase::Cancelled => "cancelled",
+                    crate::downloader::Phase::Unknown => "unknown",
+                }
+                .into(),
+                partials_kept: (state.phase == crate::downloader::Phase::Cancelled)
+                    .then(|| crate::downloader::cancelled_kept(&state)),
+                error: state.error.map(|error| clip(&error, 4096)),
+            });
+        let active = state.as_ref().is_some_and(|state| {
+            matches!(
+                state.phase.as_str(),
+                "rehashing" | "downloading" | "verifying" | "unknown"
+            )
+        });
+        let cancel_requested = active
+            .then(|| crate::downloader::read_cancel_in(root))
+            .flatten()
+            .map(|cancel| match cancel {
+                crate::downloader::Cancel::Keep => "keep".into(),
+                crate::downloader::Cancel::Delete => "delete".into(),
+            });
+        Self {
+            state,
+            pending: crate::downloader::pending_job_in(root).is_some(),
+            cancel_requested,
+        }
+    }
+
+    /// Reads current progress from the running engine host's Plank directory.
+    #[must_use]
+    pub fn capture() -> Self {
+        Self::capture_in(&crate::manifest::plank_dir())
+    }
+}
+
+/// One requested page of the engine-host KV cache lineage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheWire {
+    /// Number of lineage rows, including synthetic group headings.
+    pub total: usize,
+    /// One-based page with 32 rows per page.
+    pub page: usize,
+    /// Engine-authored storage and reclamation summary.
+    pub summary: String,
+    /// Bounded rows in tree order.
+    pub rows: Vec<CacheRowWire>,
+}
+
+/// One cache blob or synthetic lineage heading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheRowWire {
+    /// Full fingerprint paired with the file handle, absent for ambiguous rows.
+    pub fingerprint: Option<String>,
+    /// Stable opaque file handle, paired with the full fingerprint.
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// Indentation within the cache lineage.
+    pub depth: usize,
+    /// Role and name as reported by the engine.
+    pub label: String,
+    /// Role-specific engine/model or session details.
+    pub detail: String,
+    /// Size, hits, age and expiration markers.
+    pub status: String,
+    /// Current pin state.
+    pub pinned: bool,
+}
+
+impl CacheWire {
+    /// Captures bounded lineage rows while refusing ambiguous command identities.
+    #[must_use]
+    pub fn capture(view: &crate::kvpane::KvPane, requested: usize) -> Self {
+        Self::capture_with_entries(view, requested, &[])
+    }
+
+    /// Captures rows from the same scan used to construct their lineage view.
+    #[must_use]
+    pub fn capture_with_entries(
+        view: &crate::kvpane::KvPane,
+        requested: usize,
+        entries: &[(std::path::PathBuf, crate::kvmeta::KvMeta)],
+    ) -> Self {
+        // Match other compact activity pages; no cache bodies cross the wire.
+        const PAGE_SIZE: usize = 32;
+        let clip = |text: &str, limit: usize| {
+            let text: String = text
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect();
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        };
+        let rows = view.rows();
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|(path, _)| cache_entry_handle(path))
+            .collect();
+        let mut handle_counts = std::collections::HashMap::new();
+        for handle in &handles {
+            *handle_counts.entry(handle).or_insert(0usize) += 1;
+        }
+        let mut counts = std::collections::HashMap::new();
+        for fingerprint in rows.iter().filter_map(|row| row.fingerprint.as_ref()) {
+            *counts.entry(fingerprint).or_insert(0usize) += 1;
+        }
+        let total = rows.len();
+        let page = requested.clamp(1, total.div_ceil(PAGE_SIZE).max(1));
+        let rows = rows
+            .iter()
+            .skip((page - 1) * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .map(|row| {
+                let entry = row
+                    .idx
+                    .and_then(|index| entries.get(index).zip(handles.get(index)))
+                    .filter(|((_, meta), handle)| {
+                        row.fingerprint.as_ref() == Some(&meta.fingerprint)
+                            && handle_counts.get(handle) == Some(&1)
+                    })
+                    .map(|(_, handle)| handle.clone());
+                let fingerprint = row
+                    .fingerprint
+                    .as_ref()
+                    .filter(|fingerprint| {
+                        (entry.is_some() || counts.get(fingerprint) == Some(&1))
+                            && !fingerprint.is_empty()
+                            && fingerprint.len() <= 4096
+                            && !fingerprint.chars().any(|character| {
+                                character.is_control() || character.is_whitespace()
+                            })
+                    })
+                    .cloned();
+                CacheRowWire {
+                    entry: fingerprint.as_ref().and(entry),
+                    fingerprint,
+                    depth: row.depth,
+                    label: clip(&row.label, 512),
+                    detail: clip(&row.detail, 1024),
+                    status: clip(&row.right, 512),
+                    pinned: row.pinned,
+                }
+            })
+            .collect();
+        Self {
+            total,
+            page,
+            summary: clip(&view.footer(), 512),
+            rows,
+        }
+    }
+}
+
+/// Returns a stable opaque identifier without exposing an engine-host file path.
+#[must_use]
+pub fn cache_entry_handle(path: &std::path::Path) -> String {
+    crate::session::sha1_hex(path.as_os_str().as_encoded_bytes())
+}
+
+/// One requested inventory of the running engine's extensions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtensionsWire {
+    /// Inventory category: plugins, skills, templates, hooks, mcp, or agents.
+    pub kind: String,
+    /// Engine-authored plain-text report, bounded independently of the transcript.
+    pub report: String,
+    /// Session switch for skills and hooks; absent for the other categories.
+    pub enabled: Option<bool>,
+}
+
+impl ExtensionsWire {
+    /// Captures an inventory without allowing terminal escapes or unbounded frames.
+    #[must_use]
+    pub fn capture(kind: &str, report: &str, enabled: Option<bool>) -> Self {
+        // Six reports fit comfortably within the client's frame and replay limits.
+        const LIMIT: usize = 64 * 1024;
+        let mut report: String = report
+            .chars()
+            .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+            .collect();
+        if report.len() > LIMIT {
+            let mut end = LIMIT;
+            while !report.is_char_boundary(end) {
+                end -= 1;
+            }
+            report.truncate(end);
+            report.push_str("\nInventory truncated; request the full slash-command report.");
+        }
+        Self {
+            kind: kind.into(),
+            report,
+            enabled,
+        }
+    }
+}
+
+/// One page of conversation checkpoints or fork points.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryWire {
+    /// `checkpoints` or `forks`.
+    pub kind: String,
+    /// Number of available points.
+    pub total: usize,
+    /// One-based page, with 32 rows per page.
+    pub page: usize,
+    /// Named checkpoints or numbered fork points.
+    pub rows: Vec<HistoryRowWire>,
+    /// Bounded tree report for fork pages; empty for checkpoint pages.
+    pub report: String,
+}
+
+/// One rollback or fork point without its transcript or engine payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryRowWire {
+    /// Complete command argument; absent when too large for inline controls.
+    pub key: Option<String>,
+    /// Display name or numbered fork point.
+    pub label: String,
+    /// Conversation summary.
+    pub detail: String,
+}
+
+/// One page of editable engine settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigWire {
+    /// Number of built-in and contributed fields.
+    pub total: usize,
+    /// One-based page, with 32 rows per page.
+    pub page: usize,
+    /// Editable fields with their authoritative values.
+    pub fields: Vec<ConfigFieldWire>,
+}
+
+/// One editable setting reported by the engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigFieldWire {
+    /// Path accepted by `/config`.
+    pub path: String,
+    /// Human-facing label.
+    pub label: String,
+    /// Current value; empty means unset.
+    pub value: String,
+    /// Accepted shape or enumerated values.
+    pub hint: String,
+    /// False when the value exceeds the inline editor limit.
+    pub editable: bool,
+}
+
+/// A bounded page of saved conversations on the engine host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionsWire {
+    /// Total number of saved conversations.
+    pub total: usize,
+    /// One-based page, with 64 rows per page.
+    pub page: usize,
+    /// Metadata without transcripts or payloads.
+    pub sessions: Vec<SavedSessionWire>,
+}
+
+/// Metadata identifying a saved conversation on the engine host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SavedSessionWire {
+    /// Complete session identifier.
+    pub id: String,
+    /// Human-readable title.
+    pub title: String,
+    /// User-assigned tag.
+    pub tag: String,
+    /// Engine-host project directory.
+    pub cwd: String,
+    /// Last save or creation time.
+    pub updated: u64,
+}
+
+impl SessionsWire {
+    /// Captures a metadata page, clipping display text at UTF-8 boundaries.
+    #[must_use]
+    pub fn capture(entries: &[crate::session::SessionEntry], page: usize) -> Self {
+        let clip = |text: &str| {
+            // Bounds worst-case JSON escaping across a 64-row frame.
+            let mut end = text.len().min(1024);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        };
+        let page = page.clamp(1, entries.len().div_ceil(64).max(1));
+        Self {
+            total: entries.len(),
+            page,
+            sessions: entries
+                .iter()
+                .skip((page - 1) * 64)
+                .take(64)
+                .map(|entry| SavedSessionWire {
+                    id: entry.id.clone(),
+                    title: clip(&entry.title),
+                    tag: clip(&entry.tag),
+                    cwd: clip(&entry.cwd),
+                    updated: entry.last_used.max(entry.created_at),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Bounded portable snapshot of the engine-owned background job table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsWire {
+    /// Number of running jobs, including omitted rows.
+    pub running: usize,
+    /// Number of tracked jobs, including omitted rows.
+    pub total: usize,
+    /// Running rows first, then finished rows, capped at 64.
+    pub jobs: Vec<JobWire>,
+}
+
+/// One engine-owned job; output paths belong to the engine host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobWire {
+    /// Engine job identifier.
+    pub id: i64,
+    /// Shell process identifier.
+    pub pid: u32,
+    /// Elapsed time at capture.
+    pub elapsed_secs: f64,
+    /// Running, done, or `timed_out`.
+    pub state: String,
+    /// Exit code for finished jobs.
+    pub exit_code: Option<i64>,
+    /// Engine-host output file path.
+    pub path: String,
+}
+
+impl JobsWire {
+    /// Captures job rows without transferring process ownership.
+    #[must_use]
+    pub fn capture(rows: &[crate::tools::bash::JobRow]) -> Self {
+        use crate::tools::bash::JobState;
+        let running = |row: &&crate::tools::bash::JobRow| row.state == JobState::Running;
+        Self {
+            running: rows.iter().filter(running).count(),
+            total: rows.len(),
+            jobs: rows
+                .iter()
+                .filter(running)
+                .chain(rows.iter().filter(|row| !running(row)))
+                // Keeps snapshots below the GUI's 2 MiB frame ceiling.
+                .take(64)
+                .map(|row| {
+                    let (state, exit_code) = match row.state {
+                        JobState::Running => ("running", None),
+                        JobState::Done(code) => ("done", Some(code)),
+                        JobState::TimedOut(code) => ("timed_out", Some(code)),
+                    };
+                    let mut path = row.path.to_string_lossy().into_owned();
+                    // Bound escaped paths together with the 64-row frame cap.
+                    if path.len() > 4096 {
+                        let mut end = 4096 - 3;
+                        while !path.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        path.truncate(end);
+                        path.push_str("...");
+                    }
+                    JobWire {
+                        id: row.id,
+                        pid: row.pid,
+                        elapsed_secs: row.started.elapsed().as_secs_f64(),
+                        state: state.into(),
+                        exit_code,
+                        path,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<&Status> for StatusWire {
     fn from(s: &Status) -> Self {
         Self {
@@ -198,6 +932,18 @@ pub enum ServerMsg {
         session_id: u64,
         /// Whether this session currently holds control.
         controller: bool,
+        /// Slash commands produce an explicit completion frame.
+        #[serde(default)]
+        command_completion: bool,
+        /// Ordinary prompts produce an ID-matched completion frame.
+        #[serde(default)]
+        prompt_completion: bool,
+        /// Slash controls produce ID-matched completion frames.
+        #[serde(default)]
+        command_request_completion: bool,
+        /// Inputs retain their accepting controller lease until idle dispatch.
+        #[serde(default)]
+        ownership_fencing: bool,
     },
     /// Scrollback replay on connect / resume.
     Snapshot {
@@ -256,13 +1002,65 @@ pub enum ServerMsg {
         /// Flattened status fields.
         status: StatusWire,
     },
-    /// Task-list counter snapshot (issue #35). The contextual strip is
-    /// local-TUI-only; the remote wire carries just the completed/total counter.
+    /// Task-list snapshot, including the authoritative task and goal report.
     Tasks {
         /// Completed task count.
         completed: usize,
         /// Total task count.
         total: usize,
+        /// Full task/goal report; absent in older servers.
+        #[serde(default)]
+        report: String,
+        /// Bounded editable rows; omitted by older servers.
+        #[serde(default)]
+        rows: Vec<TaskRowWire>,
+        #[serde(default)]
+        goal: Option<String>,
+    },
+    /// Background jobs owned by the engine, not the UI process.
+    Jobs {
+        /// Bounded snapshot with running/total counters.
+        snapshot: JobsWire,
+    },
+    /// Requested page of engine-host saved conversations.
+    Sessions {
+        /// Bounded metadata page.
+        snapshot: SessionsWire,
+    },
+    /// Requested page of editable engine settings.
+    Config {
+        /// Bounded settings metadata.
+        snapshot: ConfigWire,
+    },
+    /// Current remote-host endpoint, policy, and waiting control requests.
+    Host { snapshot: HostWire },
+    /// Requested context, usage, or throughput snapshot.
+    Metrics { snapshot: MetricsWire },
+    /// Detached model-update progress.
+    Downloads {
+        /// Detached model-update helper state and cancellation status.
+        snapshot: DownloadsWire,
+    },
+    /// Requested page of cache lineage.
+    Cache {
+        /// Bounded cache lineage page.
+        snapshot: CacheWire,
+    },
+    /// Requested inventory of running extensions.
+    Extensions {
+        /// Bounded inventory report and optional session switch.
+        snapshot: ExtensionsWire,
+    },
+    /// Requested checkpoint or branch metadata.
+    History {
+        /// Bounded conversation metadata.
+        snapshot: HistoryWire,
+    },
+    /// Rendered side-answer text, explicitly separate from the main conversation.
+    Aside { role: String, text: String },
+    /// Transient complete-file export event; absent from reconnect scrollback.
+    Artifact {
+        event: crate::export::transfer::Transfer,
     },
     /// The transcript was replaced (`/clear`, `/new`, `/switch`, `/resume`).
     /// Everything the client has shown so far belongs to a session that is
@@ -276,6 +1074,54 @@ pub enum ServerMsg {
         title: String,
         /// Notification body.
         body: String,
+    },
+    /// A slash command finished, even when it did not generate a model turn.
+    CommandDone {
+        /// Submitted command and arguments.
+        text: String,
+    },
+    /// An identified remote prompt finished its own dispatcher turn.
+    PromptDone { request_id: String },
+    /// An identified slash command completed, independent of matching text.
+    CommandRequestDone { request_id: String },
+    /// Built-in commands and extensions loaded by the running agent.
+    Controls {
+        /// Versioned engine catalog, independent of the remote transport version.
+        controls: serde_json::Value,
+    },
+    /// A structured question waiting for an explicit controller answer.
+    Question {
+        /// Question identity, options and single/multiple selection mode.
+        request: serde_json::Value,
+    },
+    /// A question closed, including when the local operator answered it.
+    QuestionDone {
+        /// Identity of the closed question.
+        question_id: String,
+    },
+    /// An answer was rejected without cancelling the running turn.
+    AnswerRejected {
+        /// Question the client attempted to answer.
+        question_id: String,
+        /// Why the answer could not be applied.
+        reason: String,
+    },
+    /// A document waiting for explicit Save or Cancel.
+    Editor {
+        /// Editor identity, title and original text.
+        request: serde_json::Value,
+    },
+    /// A document editor closed after submission or interruption.
+    EditorDone {
+        /// Identity of the closed editor.
+        document_id: String,
+    },
+    /// A document reply could not be accepted; the turn remains active.
+    EditRejected {
+        /// Editor the client attempted to submit.
+        document_id: String,
+        /// Why the reply could not be applied.
+        reason: String,
     },
     /// A control request from a non-controller was refused.
     ControlDenied {
@@ -328,6 +1174,14 @@ impl ServerMsg {
                 title: title.clone(),
                 body: body.clone(),
             },
+            UiEvent::CommandDone { text } => Self::CommandDone { text: text.clone() },
+            UiEvent::PromptDone { request_id } => Self::PromptDone { request_id: request_id.clone() },
+            UiEvent::CommandRequestDone { request_id } => Self::CommandRequestDone { request_id: request_id.clone() },
+            UiEvent::Controls(controls) => Self::Controls { controls: controls.clone() },
+            UiEvent::Question(request) => Self::Question { request: request.clone() },
+            UiEvent::QuestionDone { id } => Self::QuestionDone { question_id: id.clone() },
+            UiEvent::Editor(request) => Self::Editor { request: request.clone() },
+            UiEvent::EditorDone { id } => Self::EditorDone { document_id: id.clone() },
             UiEvent::UserEcho(t) => Self::UserEcho { text: t.clone() },
             UiEvent::EndLine => Self::EndLine,
             UiEvent::BtwBegin => Self::BtwBegin,
@@ -339,8 +1193,29 @@ impl ServerMsg {
             },
             UiEvent::Tasks(tv) => {
                 let (completed, total) = tv.counter().unwrap_or((0, 0));
-                Self::Tasks { completed, total }
+                Self::Tasks { completed, total, report: tv.wire_report(), rows: tv.wire_rows().to_vec(), goal: tv.wire_goal().map(str::to_owned) }
             }
+            UiEvent::Jobs(rows) => Self::Jobs { snapshot: rows.clone() },
+            UiEvent::Sessions(snapshot) => Self::Sessions { snapshot: snapshot.clone() },
+            UiEvent::Config(snapshot) => Self::Config { snapshot: snapshot.clone() },
+            UiEvent::Downloads(snapshot) => Self::Downloads { snapshot: snapshot.clone() },
+            UiEvent::Metrics(snapshot) => Self::Metrics { snapshot: snapshot.clone() },
+            UiEvent::Host(snapshot) => Self::Host { snapshot: snapshot.clone() },
+            UiEvent::Cache(snapshot) => Self::Cache { snapshot: snapshot.clone() },
+            UiEvent::Extensions(snapshot) => Self::Extensions { snapshot: snapshot.clone() },
+            UiEvent::History(snapshot) => Self::History { snapshot: snapshot.clone() },
+            UiEvent::Artifact(event) => Self::Artifact { event: event.clone() },
+            UiEvent::Btw(inner) => {
+                let (role, text) = match inner.as_ref() {
+                    UiEvent::Visible(text) | UiEvent::Markdown(text) | UiEvent::Plain(text) => ("answer", text),
+                    UiEvent::Think(text) => ("thinking", text),
+                    UiEvent::Tool(text) => ("tool", text),
+                    UiEvent::Error(text) => ("error", text),
+                    UiEvent::Dim(text) | UiEvent::UserEcho(text) | UiEvent::SystemStatus(text) => ("notice", text),
+                    _ => return None,
+                };
+                Self::Aside { role: role.into(), text: text.clone() }
+            },
             // Sub-agent groundwork (not wired up yet): no remote frame exists
             // for the sub-agent buffer, so these don't cross the wire. A later
             // task adds dedicated frames once a remote client can view it.
@@ -351,7 +1226,6 @@ impl ServerMsg {
             | UiEvent::SubEnd
             | UiEvent::SubTokens { .. }
             | UiEvent::Sub(_)
-            | UiEvent::Btw(_)
             // The live preview counter rewrites a line in place, which the wire
             // cannot express; remote clients skip the tick and still receive the
             // permanent `└ N lines` summary as ordinary `Think` text.
@@ -417,6 +1291,14 @@ impl ServerFrame {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
+    /// An ordinary prompt whose completion must be identified unambiguously.
+    SubmitPrompt { request_id: String, text: String },
+    /// A slash command with an unambiguous completion identity.
+    SubmitCommand { request_id: String, text: String },
+    /// Cancels only the identified input, rather than an unrelated host turn.
+    CancelPrompt { request_id: String },
+    /// Authenticates a mirror without acquiring or reclaiming control.
+    ObserveAuth { token: String },
     /// Mandatory first frame.
     Auth {
         /// Shared bearer token.
@@ -437,6 +1319,20 @@ pub enum ClientMsg {
     },
     /// Interrupt the current turn.
     Interrupt,
+    /// Answer the current structured question; restricted to the controller.
+    Answer {
+        /// Identity from the question frame.
+        question_id: String,
+        /// Explicit numbered choice(s), or zero to decline.
+        answer: String,
+    },
+    /// Save a document or explicitly cancel, restricted to the controller.
+    Edit {
+        /// Identity from the editor frame.
+        document_id: String,
+        /// Explicit string content to save or JSON null to cancel.
+        text: serde_json::Value,
+    },
     /// A `/slash` command. Queued like a prompt and routed through the local
     /// slash dispatcher when the turn loop drains it (issue #25); the web client
     /// sends slash lines as `prompt` too, so both take the same path. Commands
@@ -462,6 +1358,9 @@ pub struct ClientFrame {
     /// Optional client-assigned id (echoed in errors; currently informational).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub id: Option<u64>,
+    /// Opt-in support for complete-file transfer events on the initial auth frame.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub export_stream: Option<bool>,
     /// The message body.
     #[serde(flatten)]
     pub msg: ClientMsg,
@@ -474,6 +1373,7 @@ impl ClientFrame {
         Self {
             v: PROTOCOL_VERSION,
             id: None,
+            export_stream: None,
             msg,
         }
     }
@@ -588,11 +1488,18 @@ pub enum RequestOutcome {
 /// released to the local user / freed (design §4.8 reconnect grace window).
 pub const CONTROL_GRACE: Duration = Duration::from_secs(15);
 
-/// The single-controller coexistence policy (design §4.4): one controller,
-/// many mirrors. Pure state machine; the server holds it behind a `Mutex`.
+/// A queued input's accepting controller and grant generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlStamp {
+    pub(crate) session: u64,
+    epoch: u64,
+}
+
+/// One controller lease; queued inputs cannot outlive the grant that accepted them.
 #[derive(Debug)]
 pub struct ControlPolicy {
     holder: Holder,
+    epoch: u64,
     local_present: bool,
     allow_control: bool,
     /// A controller that dropped and whose slot is reserved until the deadline
@@ -618,6 +1525,7 @@ impl ControlPolicy {
                 Holder::Free
             },
             local_present,
+            epoch: 0,
             allow_control,
             grace: None,
             pending: Vec::new(),
@@ -630,6 +1538,33 @@ impl ControlPolicy {
         self.holder
     }
 
+    fn new_holder(&mut self, holder: Holder) {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("controller epoch exhausted");
+        self.holder = holder;
+        self.grace = None;
+    }
+
+    /// Reclaims control for explicit local input, invalidating the previous grant.
+    pub fn local_input(&mut self) -> bool {
+        self.local_present = true;
+        if self.holder == Holder::Local {
+            return false;
+        }
+        self.new_holder(Holder::Local);
+        true
+    }
+
+    pub(crate) fn stamp(&mut self, session: u64) -> Option<ControlStamp> {
+        self.expire_grace();
+        self.remote_can_control(session).then_some(ControlStamp {
+            session,
+            epoch: self.epoch,
+        })
+    }
+
     /// Drops a stale grace reservation once its window has elapsed, releasing
     /// the reserved slot to the local user (if present) or freeing it. Called
     /// at the start of every decision so a lapsed reconnect never blocks.
@@ -639,11 +1574,11 @@ impl ControlPolicy {
         {
             self.grace = None;
             if self.holder == Holder::Remote(session) {
-                self.holder = if self.local_present {
+                self.new_holder(if self.local_present {
                     Holder::Local
                 } else {
                     Holder::Free
-                };
+                });
             }
         }
     }
@@ -671,8 +1606,7 @@ impl ControlPolicy {
         if let Some((prev, _)) = self.grace
             && self.holder == Holder::Remote(prev)
         {
-            self.holder = Holder::Remote(new_session);
-            self.grace = None;
+            self.new_holder(Holder::Remote(new_session));
             return true;
         }
         false
@@ -701,7 +1635,7 @@ impl ControlPolicy {
                 RequestOutcome::NeedsLocalGrant
             }
             _ => {
-                self.holder = Holder::Remote(session);
+                self.new_holder(Holder::Remote(session));
                 RequestOutcome::Granted
             }
         }
@@ -720,7 +1654,7 @@ impl ControlPolicy {
     /// request with "no". Those clients already hold a `control_denied`, and a
     /// fresh `request_control` re-queues them.
     pub fn grant(&mut self, session: u64) {
-        self.holder = Holder::Remote(session);
+        self.new_holder(Holder::Remote(session));
         self.pending.clear();
     }
 
@@ -745,11 +1679,11 @@ impl ControlPolicy {
     /// returns to the local user if present, else becomes free.
     pub fn release(&mut self, session: u64) {
         if self.holder == Holder::Remote(session) {
-            self.holder = if self.local_present {
+            self.new_holder(if self.local_present {
                 Holder::Local
             } else {
                 Holder::Free
-            };
+            });
         }
     }
 }
@@ -760,6 +1694,8 @@ impl ControlPolicy {
 /// to the rest of plank.
 #[derive(Debug)]
 pub struct RemoteState {
+    /// Loopback WebSocket endpoint, without authentication credentials.
+    pub endpoint: String,
     /// The event fan-out bus the worker broadcasts into.
     pub bus: Arc<BroadcastBus>,
     /// Per-turn shared state (interrupt / queued / btw).
@@ -777,6 +1713,115 @@ pub struct RemoteState {
 }
 
 impl RemoteState {
+    /// Checks and queues input under the same controller-policy lock.
+    fn enqueue_input(
+        &self,
+        session: u64,
+        id: Option<String>,
+        text: String,
+        command: bool,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .control
+            .lock()
+            .map_err(|_| "control policy is poisoned")?;
+        let owner = policy
+            .stamp(session)
+            .ok_or("this client does not hold control")?;
+        match id {
+            Some(id) => self.shared.push_remote_request(owner, id, text, command),
+            None => self.shared.push_legacy_request(owner, text),
+        }
+    }
+
+    /// Claims a queued input only while its original grant remains valid.
+    pub(crate) fn begin_input(&self, id: &str, text: &str) -> bool {
+        let mut policy = self.control.lock().expect("control policy poisoned");
+        let stale = self
+            .shared
+            .request_owner(id)
+            .is_some_and(|owner| policy.stamp(owner.session) != Some(owner));
+        if !stale {
+            return self.shared.begin_prompt_request(id);
+        }
+        drop(policy);
+        self.reject_input(id, text);
+        false
+    }
+
+    pub(crate) fn reject_input(&self, id: &str, text: &str) {
+        self.bus.broadcast(UiEvent::Error(
+            "Remote input rejected: control changed before dispatch\n".into(),
+        ));
+        if self.shared.request_is_legacy(id) && !text.trim_start().starts_with('/') {
+            self.bus.broadcast(UiEvent::Notify {
+                title: "Input rejected".into(),
+                body: "Control changed before queued input started".into(),
+            });
+        }
+        self.complete_input(id, text);
+    }
+
+    /// Retires input and preserves the submitting client's completion protocol.
+    pub(crate) fn complete_input(&self, id: &str, text: &str) {
+        let legacy = self.shared.request_is_legacy(id);
+        let command = self.shared.is_command_request(id);
+        self.shared.finish_prompt_request(id);
+        let event = if legacy {
+            if !command {
+                return;
+            }
+            UiEvent::CommandDone { text: text.into() }
+        } else if command {
+            UiEvent::CommandRequestDone {
+                request_id: id.into(),
+            }
+        } else {
+            UiEvent::PromptDone {
+                request_id: id.into(),
+            }
+        };
+        self.bus.broadcast(event);
+    }
+
+    /// Creates a model-free bridge fixture without binding a network listener.
+    #[cfg(test)]
+    pub(crate) fn test_bridge() -> Arc<Self> {
+        Arc::new(Self {
+            endpoint: "ws://127.0.0.1:9000/".into(),
+            bus: Arc::new(BroadcastBus::new()),
+            shared: Arc::new(TurnShared::default()),
+            control: Mutex::new(ControlPolicy::new(true, false)),
+            token: "fixture".into(),
+            allowed_origins: Vec::new(),
+            queue_max: 1024,
+            session_ids: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
+    /// Captures live control state, expiring elapsed reconnect reservations.
+    #[must_use]
+    pub fn host_snapshot(&self) -> Option<HostWire> {
+        let mut policy = self.control.lock().ok()?;
+        policy.expire_grace();
+        let (holder, controller) = match policy.holder() {
+            Holder::Local => ("local", None),
+            Holder::Free => ("free", None),
+            Holder::Remote(id) => ("remote", Some(id)),
+        };
+        Some(HostWire {
+            endpoint: Some(self.endpoint.clone()),
+            holder: holder.into(),
+            controller,
+            automatic: policy.allow_control,
+            reserved: policy.grace.is_some(),
+            // Match the client's compact inventory bounds.
+            pending: policy.pending().iter().copied().take(64).collect(),
+            pending_total: policy.pending().len(),
+        })
+    }
+
     fn next_session(&self) -> u64 {
         self.session_ids.fetch_add(1, Ordering::Relaxed)
     }
@@ -836,6 +1881,7 @@ impl RemoteServer {
         listener.set_nonblocking(false)?;
         let local_addr = listener.local_addr()?;
         let state = Arc::new(RemoteState {
+            endpoint: format!("ws://{local_addr}/"),
             bus,
             shared,
             control: Mutex::new(ControlPolicy::new(cfg.local_present, cfg.allow_control)),
@@ -938,10 +1984,10 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<RemoteState>) -> Result<
     let mut ws =
         tungstenite::accept_with_config(prefixed, Some(config)).map_err(|e| e.to_string())?;
 
-    let Some(session_id) = do_handshake(&mut ws, state)? else {
+    let Some((session_id, exports)) = do_handshake(&mut ws, state)? else {
         return Ok(()); // unauthorized; connection already closed
     };
-    let loop_result = mirror_loop(&mut ws, state, session_id);
+    let loop_result = mirror_loop(&mut ws, state, session_id, exports);
 
     // On disconnect (including slow-consumer eviction) a controller's slot is
     // held for the reconnect grace window (§4.8) so a brief drop can reclaim it
@@ -1152,13 +2198,13 @@ impl<S: Write> Write for PrefixStream<S> {
 }
 
 /// Authenticates, assigns a session id, and sends the `hello` + `snapshot`
-/// frames. Returns the session id on success, or `None` if the client was
+/// frames. Returns the session id and export support, or `None` if the client was
 /// unauthorized (the connection is closed in that case).
 fn do_handshake<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     state: &Arc<RemoteState>,
-) -> Result<Option<u64>, String> {
-    let (resume_from, ok) = authenticate(ws, state)?;
+) -> Result<Option<(u64, bool)>, String> {
+    let (resume_from, ok, observer, exports) = authenticate(ws, state)?;
     if !ok {
         let _ = ws.close(Some(tungstenite::protocol::CloseFrame {
             code: tungstenite::protocol::frame::coding::CloseCode::Library(4401),
@@ -1176,13 +2222,7 @@ fn do_handshake<S: std::io::Read + std::io::Write>(
     // scriptability (design open-question §8, leaning auto-grant).
     let controller = {
         let mut c = state.control.lock().map_err(|e| e.to_string())?;
-        if resume_from.is_some() && c.reclaim(session_id) {
-            true
-        } else if matches!(c.holder(), Holder::Free) {
-            matches!(c.request(session_id), RequestOutcome::Granted)
-        } else {
-            c.remote_can_control(session_id)
-        }
+        initial_control(&mut c, session_id, resume_from, observer)
     };
 
     send(
@@ -1192,6 +2232,10 @@ fn do_handshake<S: std::io::Read + std::io::Write>(
             plank_version: env!("CARGO_PKG_VERSION").to_owned(),
             session_id,
             controller,
+            command_completion: true,
+            prompt_completion: true,
+            command_request_completion: true,
+            ownership_fencing: true,
         }),
     )?;
 
@@ -1210,7 +2254,7 @@ fn do_handshake<S: std::io::Read + std::io::Write>(
             highest_id,
         }),
     )?;
-    Ok(Some(session_id))
+    Ok(Some((session_id, exports)))
 }
 
 /// The post-handshake loop: pump bus events to the socket and handle inbound
@@ -1219,10 +2263,18 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     state: &Arc<RemoteState>,
     session_id: u64,
+    exports: bool,
 ) -> Result<(), String> {
     // Subscribe after the snapshot so no event is missed or duplicated.
-    let rx = state.bus.subscribe();
+    let rx = if exports {
+        MirrorReceiver::Exports(Box::new(state.bus.subscribe_exports()))
+    } else {
+        MirrorReceiver::Ordinary(state.bus.subscribe())
+    };
     let mut last_status_at: Option<std::time::Instant> = None;
+    let mut last_download_poll: Option<std::time::Instant> = None;
+    let mut last_downloads = None;
+    let mut last_host = None;
     // The role this client was last told about (the `hello` frame's value).
     // Polled rather than pushed: a `/grant` happens on the local UI thread,
     // which has no socket, and the bus carries transcript events for every
@@ -1240,6 +2292,32 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
         }
         // Pump bus → socket, coalescing status frames.
         pump_bus(ws, &rx, &mut last_status_at)?;
+        // Downloads are detached from model turns; a quiet/busy engine still
+        // delivers updates. Read one small state file per second per connection.
+        if last_download_poll.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+            if let Some(snapshot) = state.host_snapshot()
+                && last_host.as_ref() != Some(&snapshot)
+            {
+                send(
+                    ws,
+                    &ServerFrame::control(ServerMsg::Host {
+                        snapshot: snapshot.clone(),
+                    }),
+                )?;
+                last_host = Some(snapshot);
+            }
+            let snapshot = DownloadsWire::capture();
+            if last_downloads.as_ref() != Some(&snapshot) {
+                send(
+                    ws,
+                    &ServerFrame::control(ServerMsg::Downloads {
+                        snapshot: snapshot.clone(),
+                    }),
+                )?;
+                last_downloads = Some(snapshot);
+            }
+            last_download_poll = Some(std::time::Instant::now());
+        }
 
         // Tell the client when its role changed under it (`/grant`, a release,
         // a lapsed grace window). Edge-triggered: no frame while it is stable.
@@ -1274,34 +2352,59 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
     Ok(())
 }
 
-/// Reads and validates the mandatory `auth` first frame. Returns
-/// `(resume_from, authorized)`. A non-`auth` first frame is a policy violation
+/// Reads and validates the mandatory authentication frame. Returns
+/// `(resume_from, authorized, observer)`. Other first frames are policy violations
 /// (returned as unauthorized).
+fn initial_control(
+    policy: &mut ControlPolicy,
+    session: u64,
+    resume: Option<u64>,
+    observer: bool,
+) -> bool {
+    if observer {
+        return false;
+    }
+    if resume.is_some() && policy.reclaim(session) {
+        true
+    } else if matches!(policy.holder(), Holder::Free) {
+        matches!(policy.request(session), RequestOutcome::Granted)
+    } else {
+        policy.remote_can_control(session)
+    }
+}
+
 fn authenticate<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     state: &RemoteState,
-) -> Result<(Option<u64>, bool), String> {
+) -> Result<(Option<u64>, bool, bool, bool), String> {
     // Wait (bounded) for the first text frame.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if std::time::Instant::now() > deadline {
-            return Ok((None, false));
+            return Ok((None, false, false, false));
         }
         match ws.read() {
             Ok(Message::Text(txt)) => {
                 let Ok(frame) = ClientFrame::from_json(&txt) else {
-                    return Ok((None, false));
+                    return Ok((None, false, false, false));
                 };
+                let exports = frame.export_stream.unwrap_or(false);
                 return match frame.msg {
                     ClientMsg::Auth { token, resume_from } => {
                         let ok = constant_time_eq(token.as_bytes(), state.token.as_bytes());
-                        Ok((resume_from, ok))
+                        Ok((resume_from, ok, false, exports))
                     }
+                    ClientMsg::ObserveAuth { token } => Ok((
+                        None,
+                        constant_time_eq(token.as_bytes(), state.token.as_bytes()),
+                        true,
+                        exports,
+                    )),
                     // Anything but auth first is a policy violation.
-                    _ => Ok((None, false)),
+                    _ => Ok((None, false, false, false)),
                 };
             }
-            Ok(Message::Close(_)) => return Ok((None, false)),
+            Ok(Message::Close(_)) => return Ok((None, false, false, false)),
             Ok(Message::Ping(p)) => {
                 let _ = ws.send(Message::Pong(p));
             }
@@ -1313,11 +2416,25 @@ fn authenticate<S: std::io::Read + std::io::Write>(
     }
 }
 
-/// Drains available bus events to the socket. Status frames are coalesced to at
-/// most one per [`STATUS_MIN_INTERVAL`] (keep the latest, drop intermediates).
+#[derive(Debug)]
+enum MirrorReceiver {
+    Ordinary(std::sync::mpsc::Receiver<SeqEvent>),
+    Exports(Box<crate::worker::ExportReceiver>),
+}
+
+impl MirrorReceiver {
+    fn try_recv(&self) -> Result<SeqEvent, std::sync::mpsc::TryRecvError> {
+        match self {
+            Self::Ordinary(rx) => rx.try_recv(),
+            Self::Exports(rx) => rx.try_recv(),
+        }
+    }
+}
+
+/// Drains available bus events to the socket, coalescing status frames.
 fn pump_bus<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
-    rx: &std::sync::mpsc::Receiver<SeqEvent>,
+    rx: &MirrorReceiver,
     last_status_at: &mut Option<std::time::Instant>,
 ) -> Result<(), String> {
     let mut pending_status: Option<SeqEvent> = None;
@@ -1346,6 +2463,111 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
     Ok(())
 }
 
+/// Queues a controller's identified prompt or replies with a denial.
+fn queue_identified_prompt<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &Arc<RemoteState>,
+    session: u64,
+    request_id: String,
+    text: String,
+) -> Result<(), String> {
+    let result = state.enqueue_input(session, Some(request_id), text, false);
+    if let Err(reason) = result {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::ControlDenied { reason }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Queues identified controls after checking controller and remote availability.
+fn queue_identified_command<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &Arc<RemoteState>,
+    session: u64,
+    request_id: String,
+    text: String,
+) -> Result<(), String> {
+    let result = if let Some(reason) = crate::config::slash_command_remote_refusal(&text) {
+        Err(reason.into())
+    } else {
+        state.enqueue_input(session, Some(request_id), text, true)
+    };
+    if let Err(reason) = result {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::ControlDenied { reason }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Cancels a controller's identified input.
+fn cancel_identified_prompt<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &Arc<RemoteState>,
+    session: u64,
+    request_id: &str,
+) -> Result<(), String> {
+    let completion = {
+        let control = state.control.lock().map_err(|error| error.to_string())?;
+        if control.remote_can_control(session) && state.shared.cancel_prompt_request(request_id) {
+            let completion = if state.shared.is_command_request(request_id) {
+                ServerMsg::CommandRequestDone {
+                    request_id: request_id.to_owned(),
+                }
+            } else {
+                ServerMsg::PromptDone {
+                    request_id: request_id.to_owned(),
+                }
+            };
+            state.shared.finish_prompt_request(request_id);
+            Some(completion)
+        } else {
+            None
+        }
+    };
+    if let Some(completion) = completion {
+        send(ws, &ServerFrame::control(completion))?;
+    }
+    Ok(())
+}
+
+/// Queues compatible legacy input after checking control and pane availability.
+fn queue_legacy_input<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &Arc<RemoteState>,
+    session: u64,
+    text: String,
+) -> Result<(), String> {
+    if !is_controller(state, session)? {
+        return send(
+            ws,
+            &ServerFrame::control(ServerMsg::ControlDenied {
+                reason: "not the controller".into(),
+            }),
+        );
+    }
+    // Refuse host-only panes before their dispatcher could open one invisibly.
+    if let Some(reason) = crate::config::slash_command_remote_refusal(&text) {
+        return send(
+            ws,
+            &ServerFrame::control(ServerMsg::ControlDenied {
+                reason: reason.into(),
+            }),
+        );
+    }
+    let command = text.trim_start().starts_with('/');
+    match state.enqueue_input(session, None, text, command) {
+        Ok(()) => Ok(()),
+        Err(reason) => send(
+            ws,
+            &ServerFrame::control(ServerMsg::ControlDenied { reason }),
+        ),
+    }
+}
+
 /// Handles one inbound client frame. Returns `Ok(true)` to close the connection.
 fn handle_client_frame<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
@@ -1359,32 +2581,35 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
     };
     match frame.msg {
         // Re-auth mid-session is a no-op (already authenticated).
-        ClientMsg::Auth { .. } => {}
+        ClientMsg::Auth { .. } | ClientMsg::ObserveAuth { .. } => {}
         ClientMsg::Ping => send(ws, &ServerFrame::control(ServerMsg::Pong))?,
+        ClientMsg::SubmitPrompt { request_id, text } => {
+            queue_identified_prompt(ws, state, session_id, request_id, text)?;
+        }
+        ClientMsg::SubmitCommand { request_id, text } => {
+            queue_identified_command(ws, state, session_id, request_id, text)?;
+        }
+        ClientMsg::CancelPrompt { request_id } => {
+            cancel_identified_prompt(ws, state, session_id, &request_id)?;
+        }
         // `/btw` is ephemeral and allowed from mirrors (design §4.4/§7).
         ClientMsg::Btw { text } => {
             let _ = state.shared.push_btw(text);
         }
         ClientMsg::Prompt { text } | ClientMsg::Command { text } => {
-            if is_controller(state, session_id)? {
-                // A command that cannot work over the wire is refused here
-                // rather than queued: the dispatcher would otherwise open a
-                // pane on the operator's terminal, or tear down this very
-                // bridge, with the client seeing nothing either way.
-                if let Some(reason) = crate::config::slash_command_remote_refusal(&text) {
-                    send(
-                        ws,
-                        &ServerFrame::control(ServerMsg::ControlDenied {
-                            reason: reason.to_owned(),
-                        }),
-                    )?;
-                    return Ok(false);
+            queue_legacy_input(ws, state, session_id, text)?;
+        }
+        ClientMsg::Interrupt => {
+            let allowed = {
+                let control = state.control.lock().map_err(|error| error.to_string())?;
+                if control.remote_can_control(session_id) {
+                    state.shared.interrupt.store(true, Ordering::Relaxed);
+                    true
+                } else {
+                    false
                 }
-                // Both land in the shared queue the turn loop drains: `ui.rs`
-                // starts a turn when idle and routes `/`-prefixed lines (the
-                // `command` frames) through the slash dispatcher (issue #25).
-                state.shared.push_queued(text);
-            } else {
+            };
+            if !allowed {
                 send(
                     ws,
                     &ServerFrame::control(ServerMsg::ControlDenied {
@@ -1393,17 +2618,23 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
                 )?;
             }
         }
-        ClientMsg::Interrupt => {
-            if is_controller(state, session_id)? {
-                state.shared.interrupt.store(true, Ordering::Relaxed);
-            } else {
+        ClientMsg::Answer {
+            question_id,
+            answer,
+        } => {
+            if !accept_question_answer(state, session_id, &question_id, &answer)? {
                 send(
                     ws,
-                    &ServerFrame::control(ServerMsg::ControlDenied {
-                        reason: "not the controller".to_owned(),
+                    &ServerFrame::control(ServerMsg::AnswerRejected {
+                        question_id,
+                        reason: "question answer is stale, invalid, or not from the controller"
+                            .into(),
                     }),
                 )?;
             }
+        }
+        ClientMsg::Edit { document_id, text } => {
+            handle_editor_reply(ws, state, session_id, document_id, &text)?;
         }
         ClientMsg::RequestControl => {
             let outcome = state
@@ -1443,6 +2674,45 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
         }
     }
     Ok(false)
+}
+
+fn accept_question_answer(
+    state: &RemoteState,
+    session: u64,
+    id: &str,
+    answer: &str,
+) -> Result<bool, String> {
+    let control = state.control.lock().map_err(|error| error.to_string())?;
+    Ok(control.remote_can_control(session) && state.shared.questions.answer(id, answer))
+}
+
+fn handle_editor_reply<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &RemoteState,
+    session: u64,
+    id: String,
+    text: &serde_json::Value,
+) -> Result<(), String> {
+    if !accept_editor_reply(state, session, &id, text)? {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::EditRejected {
+                document_id: id,
+                reason: "document reply is stale, invalid, or not from the controller".into(),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn accept_editor_reply(
+    state: &RemoteState,
+    session: u64,
+    id: &str,
+    text: &serde_json::Value,
+) -> Result<bool, String> {
+    let control = state.control.lock().map_err(|error| error.to_string())?;
+    Ok(control.remote_can_control(session) && state.shared.editors.reply(id, text))
 }
 
 fn is_controller(state: &Arc<RemoteState>, session_id: u64) -> Result<bool, String> {
@@ -1496,7 +2766,186 @@ fn flush_ws<S: std::io::Read + std::io::Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn export_transfer_auth_opt_in_preserves_legacy_frame_bytes() {
+        let legacy = ClientFrame::new(ClientMsg::Auth {
+            token: "test".into(),
+            resume_from: None,
+        });
+        assert!(!legacy.to_json().unwrap().contains("export_stream"));
+        let modern =
+            ClientFrame::from_json(r#"{"v":1,"type":"auth","token":"test","export_stream":true}"#)
+                .unwrap();
+        assert_eq!(modern.export_stream, Some(true));
+        let legacy =
+            ClientFrame::from_json(r#"{"v":1,"type":"observe_auth","token":"test"}"#).unwrap();
+        assert_eq!(legacy.export_stream, None);
+    }
+    #[test]
+    fn gui_saved_sessions_preserve_ids_and_bound_pages() {
+        let entries: Vec<_> = (0..130)
+            .map(|index| crate::session::SessionEntry {
+                id: format!("session-{index}"),
+                title: "é\"\n".repeat(2048),
+                cwd: "界".repeat(2048),
+                tag: "tag".repeat(2048),
+                last_used: 10,
+                ..crate::session::SessionEntry::default()
+            })
+            .collect();
+        let page = super::SessionsWire::capture(&entries, 2);
+        assert_eq!(page.total, 130);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.sessions.len(), 64);
+        assert_eq!(page.sessions[0].id, "session-64");
+        assert_eq!(page.sessions[63].id, "session-127");
+        assert!(
+            page.sessions
+                .iter()
+                .all(|session| session.title.len() <= 1024
+                    && session.tag.len() <= 1024
+                    && session.cwd.len() <= 1024)
+        );
+        let frame = super::ServerFrame::seq(
+            1,
+            super::ServerMsg::from_event(&crate::worker::UiEvent::Sessions(page.clone())).unwrap(),
+        );
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        assert!(encoded.len() < 2 * 1024 * 1024);
+        let decoded: super::ServerFrame = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+        let last = super::SessionsWire::capture(&entries, usize::MAX);
+        assert_eq!(last.page, 3);
+        assert_eq!(last.sessions.len(), 2);
+        let empty = super::SessionsWire::capture(&[], 0);
+        assert_eq!(empty.page, 1);
+        assert!(empty.sessions.is_empty());
+    }
+
+    #[test]
+    fn gui_jobs_prioritize_running_rows_and_bound_escaped_wire_payloads() {
+        use crate::tools::bash::{JobRow, JobState};
+        let rows: Vec<_> = (1..=100)
+            .map(|id| JobRow {
+                id,
+                pid: 10,
+                started: std::time::Instant::now(),
+                state: if id > 80 {
+                    JobState::Running
+                } else {
+                    JobState::Done(0)
+                },
+                path: std::path::PathBuf::from("\u{1}".repeat(10_000)),
+            })
+            .collect();
+        let snapshot = super::JobsWire::capture(&rows);
+        assert_eq!(
+            (snapshot.running, snapshot.total, snapshot.jobs.len()),
+            (20, 100, 64)
+        );
+        assert!(snapshot.jobs[..20].iter().all(|job| job.state == "running"));
+        assert!(snapshot.jobs.iter().all(|job| job.path.len() <= 4096));
+        let wire = serde_json::to_string(&super::ServerMsg::Jobs { snapshot }).unwrap();
+        assert!(wire.len() < 2 * 1024 * 1024);
+        let mut unicode = rows[0].clone();
+        unicode.path = std::path::PathBuf::from("🦀".repeat(10_000));
+        let path = &super::JobsWire::capture(&[unicode]).jobs[0].path;
+        assert!(path.len() <= 4096 && path.ends_with("..."));
+    }
+    #[test]
+    fn remote_controls_never_enter_the_model_prompt_queue() {
+        let remote = RemoteState::test_bridge();
+        remote.control.lock().unwrap().grant(7);
+        for text in ["ordinary prompt", "  /usage", "/custom-skill task"] {
+            remote
+                .enqueue_input(7, None, text.into(), text.trim_start().starts_with('/'))
+                .unwrap();
+        }
+        assert!(remote.shared.take_queued().is_empty());
+        assert!(remote.shared.take_commands().is_empty());
+        let inputs = remote.shared.take_prompt_requests();
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["ordinary prompt", "  /usage", "/custom-skill task"]
+        );
+        for (id, _) in inputs {
+            assert!(remote.shared.request_owner(&id).is_some());
+            assert!(remote.shared.request_is_legacy(&id));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn ownership_fencing_rejects_prior_grants_even_after_the_same_client_reacquires() {
+        let remote = RemoteState::test_bridge();
+        remote.control.lock().unwrap().grant(7);
+        remote
+            .enqueue_input(7, Some("old".into()), "queued prompt".into(), false)
+            .unwrap();
+        {
+            let mut policy = remote.control.lock().unwrap();
+            policy.disconnect(7);
+            assert!(policy.local_input());
+            assert!(
+                !policy.reclaim(8),
+                "local takeover must retire reconnect reservation"
+            );
+            policy.grant(7);
+        }
+        let requests = remote.shared.take_prompt_requests();
+        assert!(!remote.begin_input(&requests[0].0, &requests[0].1));
+        assert!(!remote.shared.request_is_pending("old"));
+        assert!(!remote.shared.cancel_prompt_request("old"));
+        assert!(!remote.shared.interrupt.load(Ordering::Relaxed));
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, UiEvent::PromptDone {request_id} if request_id == "old")).count(), 1);
+        assert!(
+            remote
+                .enqueue_input(7, Some("old".into()), "replay".into(), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ownership_fencing_covers_legacy_and_identified_inputs_and_preserves_new_grants() {
+        let remote = RemoteState::test_bridge();
+        remote.control.lock().unwrap().grant(7);
+        remote
+            .enqueue_input(7, Some("command-old".into()), "/command".into(), true)
+            .unwrap();
+        remote
+            .enqueue_input(7, None, "/usage".into(), true)
+            .unwrap();
+        remote
+            .enqueue_input(7, None, "old legacy prompt".into(), false)
+            .unwrap();
+        remote.control.lock().unwrap().grant(8);
+        remote
+            .enqueue_input(8, Some("new".into()), "new prompt".into(), false)
+            .unwrap();
+        let requests = remote.shared.take_prompt_requests();
+        for (id, text) in &requests[..3] {
+            assert!(!remote.begin_input(id, text));
+        }
+        assert!(remote.begin_input(&requests[3].0, &requests[3].1));
+        remote.complete_input(&requests[3].0, &requests[3].1);
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event, UiEvent::CommandRequestDone {request_id} if request_id == "command-old")));
+        assert!(
+            events.iter().any(
+                |event| matches!(&event.event, UiEvent::CommandDone {text} if text == "/usage")
+            )
+        );
+        assert!(events.iter().any(
+            |event| matches!(&event.event, UiEvent::PromptDone {request_id} if request_id == "new")
+        ));
+        assert!(!remote.shared.has_prompt_requests());
+        assert!(!remote.shared.request_is_pending("new"));
+    }
 
     // --- protocol round-trip ---
 
@@ -1560,6 +3009,16 @@ mod tests {
             UiEvent::Error("e".into()),
             UiEvent::Dim("d".into()),
             UiEvent::Plain("p".into()),
+            UiEvent::CommandDone {
+                text: "/usage".into(),
+            },
+            UiEvent::Controls(serde_json::json!({"version":1,"commands":[]})),
+            UiEvent::Tasks(crate::tui::TaskView::default()),
+            UiEvent::Jobs(JobsWire::capture(&[])),
+            UiEvent::Question(serde_json::json!({"id":"q1","options":[]})),
+            UiEvent::QuestionDone { id: "q1".into() },
+            UiEvent::Editor(serde_json::json!({"id":"e1","title":"File","text":"content"})),
+            UiEvent::EditorDone { id: "e1".into() },
             UiEvent::UserEcho("u".into()),
             UiEvent::EndLine,
             UiEvent::BtwBegin,
@@ -1585,6 +3044,132 @@ mod tests {
     }
 
     #[test]
+    fn observer_auth_never_claims_or_reclaims_the_controller_slot() {
+        let frame = ClientFrame::new(ClientMsg::ObserveAuth {
+            token: "fixture".into(),
+        });
+        let json = frame.to_json().unwrap();
+        assert!(matches!(
+            ClientFrame::from_json(&json).unwrap().msg,
+            ClientMsg::ObserveAuth { .. }
+        ));
+        let mut free = ControlPolicy::new(false, true);
+        assert!(!initial_control(&mut free, 9, None, true));
+        assert_eq!(free.holder(), Holder::Free);
+        let mut local = ControlPolicy::new(true, true);
+        assert!(!initial_control(&mut local, 9, None, true));
+        assert_eq!(local.holder(), Holder::Local);
+        assert_eq!(free.request(7), RequestOutcome::Granted);
+        free.disconnect(7);
+        assert!(!initial_control(&mut free, 9, Some(10), true));
+        assert_eq!(free.holder(), Holder::Remote(7));
+        assert!(free.grace.is_some());
+        assert!(initial_control(&mut free, 9, Some(10), false));
+        assert_eq!(free.holder(), Holder::Remote(9));
+    }
+
+    #[test]
+    fn host_snapshot_tracks_grants_and_expired_reservations_without_credentials() {
+        let state = RemoteState {
+            endpoint: "ws://127.0.0.1:9000/".into(),
+            bus: Arc::new(BroadcastBus::new()),
+            shared: Arc::new(TurnShared::default()),
+            control: Mutex::new(ControlPolicy::new(true, false)),
+            token: "never-publish-this-secret".into(),
+            allowed_origins: Vec::new(),
+            queue_max: 1024,
+            session_ids: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+        };
+        let local = state.host_snapshot().unwrap();
+        assert_eq!(local.holder, "local");
+        assert!(local.controller.is_none());
+        for id in 1..=100 {
+            assert_eq!(
+                state.control.lock().unwrap().request(id),
+                RequestOutcome::NeedsLocalGrant
+            );
+        }
+        let waiting = state.host_snapshot().unwrap();
+        assert_eq!(waiting.pending_total, 100);
+        assert_eq!(waiting.pending, (1..=64).collect::<Vec<_>>());
+        assert_eq!(state.control.lock().unwrap().grant_next(), Some(1));
+        let granted = state.host_snapshot().unwrap();
+        assert_eq!(granted.controller, Some(1));
+        assert_eq!(granted.pending_total, 0);
+        assert!(
+            granted.pending.is_empty(),
+            "granting one client declines the other waiting requests"
+        );
+        state.control.lock().unwrap().disconnect(1);
+        assert!(state.host_snapshot().unwrap().reserved);
+        state.control.lock().unwrap().grace = Some((
+            1,
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        ));
+        let expired = state.host_snapshot().unwrap();
+        assert_eq!(expired.holder, "local");
+        assert!(expired.controller.is_none());
+        assert!(!expired.reserved);
+        state.bus.broadcast(UiEvent::Visible("Keep answer".into()));
+        for _ in 0..100 {
+            state.bus.broadcast(UiEvent::Host(waiting.clone()));
+        }
+        state.bus.broadcast(UiEvent::Host(granted.clone()));
+        let (tail, _) = state.bus.scrollback_since(None);
+        assert_eq!(tail.len(), 2);
+        assert!(
+            matches!(&tail[1].event, UiEvent::Host(snapshot) if snapshot.controller == Some(1))
+        );
+        let frame = ServerMsg::from_event(&UiEvent::Host(granted)).unwrap();
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(!json.contains(&state.token));
+        assert!(json.contains("\"type\":\"host\""));
+        assert_eq!(HostWire::off().holder, "off");
+    }
+
+    #[test]
+    fn remote_questions_allow_only_the_current_controller() {
+        let state = RemoteState {
+            endpoint: "ws://127.0.0.1:9000/".into(),
+            bus: Arc::new(BroadcastBus::new()),
+            shared: Arc::new(TurnShared::default()),
+            control: Mutex::new(ControlPolicy::new(false, false)),
+            token: "test".into(),
+            allowed_origins: Vec::new(),
+            queue_max: 1024,
+            session_ids: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+        };
+        assert_eq!(
+            state.control.lock().unwrap().request(7),
+            RequestOutcome::Granted
+        );
+        state.shared.questions.open(
+            "rq1",
+            crate::tools::ask::AskRequest {
+                question: "Continue?".into(),
+                header: "Confirm".into(),
+                multi: false,
+                allow_chat: false,
+                options: vec![crate::tools::ask::AskOption {
+                    label: "Yes".into(),
+                    description: String::new(),
+                }],
+            },
+        );
+        assert!(!accept_question_answer(&state, 8, "rq1", "1").unwrap());
+        assert!(!accept_question_answer(&state, 7, "old", "1").unwrap());
+        assert!(accept_question_answer(&state, 7, "rq1", "1").unwrap());
+        assert_eq!(
+            state.shared.questions.take_answer("rq1"),
+            Some(crate::tools::ask::AskOutcome::Answered(vec!["Yes".into()]))
+        );
+    }
+
+    #[test]
     fn client_frame_roundtrip() {
         let msgs = [
             ClientMsg::Auth {
@@ -1594,6 +3179,18 @@ mod tests {
             ClientMsg::Prompt { text: "hi".into() },
             ClientMsg::Btw { text: "q".into() },
             ClientMsg::Interrupt,
+            ClientMsg::Edit {
+                document_id: "e1".into(),
+                text: serde_json::Value::Null,
+            },
+            ClientMsg::Edit {
+                document_id: "e1".into(),
+                text: serde_json::json!("edited\n🦀"),
+            },
+            ClientMsg::Answer {
+                question_id: "q1".into(),
+                answer: "1".into(),
+            },
             ClientMsg::Command {
                 text: "/help".into(),
             },
@@ -1617,6 +3214,40 @@ mod tests {
                 token: "x".into(),
                 resume_from: None
             }
+        );
+    }
+
+    #[test]
+    fn remote_editors_allow_only_the_controller_and_require_explicit_content() {
+        let state = RemoteState {
+            endpoint: "ws://127.0.0.1:9000/".into(),
+            bus: Arc::new(BroadcastBus::new()),
+            shared: Arc::new(TurnShared::default()),
+            control: Mutex::new(ControlPolicy::new(false, false)),
+            token: "test".into(),
+            allowed_origins: Vec::new(),
+            queue_max: 1024,
+            session_ids: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+        };
+        assert_eq!(
+            state.control.lock().unwrap().request(7),
+            RequestOutcome::Granted
+        );
+        state.shared.editors.open("re1");
+        assert!(
+            !accept_editor_reply(&state, 8, "re1", &serde_json::json!("unauthorized")).unwrap()
+        );
+        assert!(!accept_editor_reply(&state, 7, "old", &serde_json::json!("stale")).unwrap());
+        assert!(accept_editor_reply(&state, 7, "re1", &serde_json::json!("saved")).unwrap());
+        assert_eq!(
+            state.shared.editors.take_reply("re1"),
+            Some(crate::remote::editors::EditReply::Save("saved".into()))
+        );
+        assert!(ClientFrame::from_json(r#"{"v":1,"type":"edit","document_id":"re1"}"#).is_err());
+        assert!(
+            ClientFrame::from_json(r#"{"v":1,"type":"edit","document_id":"re1","text":null}"#)
+                .is_ok()
         );
     }
 
@@ -2060,7 +3691,16 @@ mod tests {
         send_client(&mut ws, ClientMsg::Ping);
         // Wait for pong to guarantee the prompt was processed first.
         assert_eq!(read_server(&mut ws).map(|f| f.msg), Some(ServerMsg::Pong));
-        assert_eq!(server.state.shared.take_queued(), vec!["do it"]);
+        assert_eq!(
+            server
+                .state
+                .shared
+                .take_prompt_requests()
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>(),
+            vec!["do it"]
+        );
 
         send_client(&mut ws, ClientMsg::Interrupt);
         send_client(&mut ws, ClientMsg::Ping);

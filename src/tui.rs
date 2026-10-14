@@ -273,6 +273,13 @@ fn annotate_code_blocks(
 /// it has spent.
 #[derive(Debug, Default)]
 pub struct AgentRun {
+    /// Bounded rendered stream tail for graphical clients.
+    pub output: String,
+    pub output_truncated: bool,
+    /// Monotonic roster identity, retained across context resets.
+    pub id: u64,
+    /// Optional bounded report for graphical clients; independent of the log.
+    pub report: Option<String>,
     /// The sub-agent's rendered output.
     pub log: OutputLog,
     /// Scroll/follow state for `log`, independent of every other pane's.
@@ -380,6 +387,7 @@ pub const ROSTER_LINGER_MS: u64 = 60_000;
 /// in flight, and each needs its own buffer for their output to stay separable.
 #[derive(Debug, Default)]
 pub struct SubPane {
+    next_id: u64,
     /// Every run, oldest first — the order the roster draws them in.
     pub runs: Vec<AgentRun>,
     /// Index into `runs` of the run streaming right now, or the most recent one.
@@ -422,7 +430,9 @@ impl SubPane {
             self.current = self.current.saturating_sub(usize::from(i <= self.current));
             self.cursor = self.cursor.saturating_sub(usize::from(i < self.cursor));
         }
+        self.next_id = self.next_id.saturating_add(1);
         self.runs.push(AgentRun {
+            id: self.next_id,
             label,
             task: one_line(task),
             running: true,
@@ -547,7 +557,9 @@ impl SubPane {
     /// session would keep drawing (and, while `active`, would swallow the newly
     /// cleared main log) as if it belonged to the new one.
     pub fn reset(&mut self) {
+        let next_id = self.next_id;
         *self = Self::default();
+        self.next_id = next_id;
     }
 
     /// The log the user is currently looking at: this pane's while it is on
@@ -1947,6 +1959,8 @@ pub struct TaskView {
     /// The full `/tasks` text, so a click on the footer's counter can open
     /// the list mid-turn, when the UI thread has no session to render it from.
     report: String,
+    details: Vec<crate::remote::control::TaskRowWire>,
+    goal_label: Option<String>,
 }
 
 impl From<&crate::tasks::TaskList> for TaskView {
@@ -1966,6 +1980,28 @@ impl TaskView {
             total,
             rows: list.strip_rows(),
             report: list.render_list(goal),
+            details: crate::remote::control::TaskRowWire::capture(list),
+            goal_label: goal.map(|goal| {
+                let mut text = format!(
+                    "Goal: {} ({}/{}, {})",
+                    goal.objective,
+                    goal.iter,
+                    goal.max_iters,
+                    goal.status.tag()
+                )
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>();
+                if text.len() > 1024 {
+                    let mut end = 1024 - "…".len();
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    text.push('…');
+                }
+                text
+            }),
         }
     }
 
@@ -1973,6 +2009,34 @@ impl TaskView {
     #[must_use]
     pub fn report(&self) -> &str {
         &self.report
+    }
+
+    /// Returns a bounded report for GUI and remote snapshots.
+    #[must_use]
+    pub fn wire_report(&self) -> String {
+        // Matches the GUI's 256 KiB document/report limit, including the suffix.
+        const LIMIT: usize = 256 * 1024;
+        const SUFFIX: &str = "\nReport truncated; use /tasks for the full list.\n";
+        if self.report.len() <= LIMIT {
+            return self.report.clone();
+        }
+        let mut end = LIMIT - SUFFIX.len();
+        while !self.report.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{SUFFIX}", &self.report[..end])
+    }
+
+    /// Returns bounded, stable task identities and editable state.
+    #[must_use]
+    pub fn wire_rows(&self) -> &[crate::remote::control::TaskRowWire] {
+        &self.details
+    }
+
+    /// Returns a bounded goal summary alongside editable task rows.
+    #[must_use]
+    pub fn wire_goal(&self) -> Option<&str> {
+        self.goal_label.as_deref()
     }
 
     /// `(completed, total)` for the status-bar counter, or `None` when empty.
@@ -5976,6 +6040,62 @@ fn place_rotating_tip(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_controls_snapshots_prioritize_live_tasks_and_bound_unicode_labels() {
+        let mut tasks = crate::tasks::TaskList::new();
+        for _ in 0..70 {
+            let id = tasks.add("🦀".repeat(300), Some("active\nlabel".into()));
+            tasks
+                .update(id, Some(crate::tasks::TaskStatus::Completed), None, None)
+                .unwrap();
+        }
+        let pending = tasks.add("Pending review", None);
+        let active = tasks.add("Active review", None);
+        tasks
+            .update(
+                active,
+                Some(crate::tasks::TaskStatus::InProgress),
+                None,
+                None,
+            )
+            .unwrap();
+        let view = super::TaskView::from(&tasks);
+        let rows = view.wire_rows();
+        assert_eq!(rows.len(), 64);
+        assert_eq!(rows[0].id, active);
+        assert_eq!(rows[1].id, pending);
+        assert!(
+            rows.iter()
+                .all(|row| row.subject.len() <= 512 && !row.subject.chars().any(char::is_control))
+        );
+        assert_eq!(rows[2].active_form.as_deref(), Some("active label"));
+        assert_eq!(view.counter(), Some((70, 72)));
+    }
+    #[test]
+    fn gui_task_reports_preserve_goal_state_and_bound_unicode_payloads() {
+        let goal = crate::goal::GoalState {
+            objective: "Ship the interface".into(),
+            max_iters: 20,
+            iter: 3,
+            status: crate::goal::GoalStatus::Active,
+        };
+        let view = TaskView::with_goal(&crate::tasks::TaskList::default(), Some(&goal));
+        assert!(
+            view.wire_report()
+                .contains("goal: Ship the interface (iteration 3/20, active)")
+        );
+        assert_eq!(
+            view.wire_goal(),
+            Some("Goal: Ship the interface (3/20, active)")
+        );
+        let oversized = TaskView {
+            report: "🦀".repeat(100_000),
+            ..TaskView::default()
+        };
+        let report = oversized.wire_report();
+        assert!(report.len() <= 256 * 1024);
+        assert!(report.ends_with("Report truncated; use /tasks for the full list.\n"));
+    }
     use super::SubPane;
     use unicode_width::UnicodeWidthStr;
 

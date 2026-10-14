@@ -14,6 +14,9 @@ use std::fmt::Write as _;
 use crate::dsml::{DsmlParser, DsmlState, ToolCall};
 use crate::session::{Message, Role};
 
+/// Complete-file transport for graphical and remote clients.
+pub mod transfer;
+
 /// Opening marker of a DSML tool-call stanza.
 const DSML_OPEN: &str = "<｜DSML｜tool_calls>";
 /// Closing marker of a DSML tool-call stanza.

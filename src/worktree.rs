@@ -620,10 +620,20 @@ pub fn create_for_session(
     hooks: &crate::hooks::Hooks,
     opts: &CreateOptions,
 ) -> Result<WorktreeSession, String> {
+    create_for_session_interruptible(from, slug, hooks, opts, &crate::interrupt::pending)
+}
+
+pub(crate) fn create_for_session_interruptible(
+    from: &Path,
+    slug: &str,
+    hooks: &crate::hooks::Hooks,
+    opts: &CreateOptions,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<WorktreeSession, String> {
     validate_slug(slug)?;
     let root = canonical_git_root(from).or_else(|| find_git_root(from));
     if crate::hooks::has_worktree_create_hook(hooks) {
-        let path = crate::hooks::run_worktree_create_hook(hooks, slug, from)?;
+        let path = crate::hooks::run_worktree_create_interruptible(hooks, slug, from, interrupted)?;
         return Ok(WorktreeSession {
             original_cwd: from.to_path_buf(),
             repo_root: root.unwrap_or_else(|| from.to_path_buf()),
@@ -662,8 +672,21 @@ pub fn create_for_session(
 /// # Errors
 /// Returns a message when the removal command fails.
 pub fn cleanup(session: &WorktreeSession, hooks: &crate::hooks::Hooks) -> Result<(), String> {
+    cleanup_interruptible(session, hooks, &crate::interrupt::pending)
+}
+
+pub(crate) fn cleanup_interruptible(
+    session: &WorktreeSession,
+    hooks: &crate::hooks::Hooks,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<(), String> {
     if session.hook_based || crate::hooks::has_worktree_remove_hook(hooks) {
-        return crate::hooks::run_worktree_remove_hook(hooks, &session.path, &session.repo_root);
+        return crate::hooks::run_worktree_remove_interruptible(
+            hooks,
+            &session.path,
+            &session.repo_root,
+            interrupted,
+        );
     }
     let path = session.path.to_string_lossy().to_string();
     git(

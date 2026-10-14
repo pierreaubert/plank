@@ -249,8 +249,28 @@ pub fn has_worktree_remove_hook(hooks: &Hooks) -> bool {
 /// # Errors
 /// Returns a message when no hook produced a usable path.
 pub fn run_worktree_create_hook(hooks: &Hooks, slug: &str, cwd: &Path) -> Result<PathBuf, String> {
+    run_worktree_create_interruptible(hooks, slug, cwd, &crate::interrupt::pending)
+}
+
+pub(crate) fn run_worktree_create_interruptible(
+    hooks: &Hooks,
+    slug: &str,
+    cwd: &Path,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<PathBuf, String> {
     let input = lifecycle_event_input("WorktreeCreate", &[("worktree_name", slug)], cwd);
-    let out = run_event_ctx(&hooks.worktree_create, slug, &input, cwd);
+    let out = run_event_interruptible(
+        &hooks.worktree_create,
+        slug,
+        &[],
+        &input,
+        cwd,
+        true,
+        interrupted,
+    );
+    if let Some(reason) = out.stop_reason {
+        return Err(reason);
+    }
     if let Some(msg) = out.block {
         return Err(msg);
     }
@@ -269,6 +289,15 @@ pub fn run_worktree_create_hook(hooks: &Hooks, slug: &str, cwd: &Path) -> Result
 /// configured (the caller reached here only because creation was hook-based, so
 /// there is no git fallback to hand the worktree back to).
 pub fn run_worktree_remove_hook(hooks: &Hooks, worktree: &Path, cwd: &Path) -> Result<(), String> {
+    run_worktree_remove_interruptible(hooks, worktree, cwd, &crate::interrupt::pending)
+}
+
+pub(crate) fn run_worktree_remove_interruptible(
+    hooks: &Hooks,
+    worktree: &Path,
+    cwd: &Path,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<(), String> {
     // Reported rather than silently skipped: this worktree exists only because
     // a hook made it, so "hooks are off" is the whole answer to why it cannot
     // be removed, and a quiet success would claim a removal that never ran.
@@ -288,7 +317,18 @@ pub fn run_worktree_remove_hook(hooks: &Hooks, worktree: &Path, cwd: &Path) -> R
     }
     let path = worktree.to_string_lossy();
     let input = lifecycle_event_input("WorktreeRemove", &[("worktree_path", &path)], cwd);
-    let out = run_event(&hooks.worktree_remove, &path, &input, cwd);
+    let out = run_event_interruptible(
+        &hooks.worktree_remove,
+        &path,
+        &[],
+        &input,
+        cwd,
+        false,
+        interrupted,
+    );
+    if let Some(reason) = out.stop_reason {
+        return Err(reason);
+    }
     match out.block {
         Some(msg) => Err(msg),
         None => Ok(()),
@@ -511,7 +551,15 @@ pub fn lifecycle_event_input(event: &str, fields: &[(&str, &str)], cwd: &Path) -
 /// Runs one hook command with `input` on stdin; returns (exit code, stdout,
 /// stderr). A timeout or spawn failure reads as a user-visible warning (on
 /// stderr), never a block.
-fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
+fn run_hook(
+    def: &HookDef,
+    input: &str,
+    cwd: &Path,
+    interrupted: &dyn Fn() -> bool,
+) -> (i32, String, String) {
+    if interrupted() {
+        return (130, String::new(), "hook interrupted".into());
+    }
     let child = Command::new("/bin/sh")
         .arg("-c")
         .arg(&def.command)
@@ -527,9 +575,13 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
         Ok(c) => c,
         Err(e) => return (1, String::new(), format!("hook failed to start: {e}")),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input.as_bytes());
-    }
+    // A child that never reads stdin must not block cancellation or its timeout.
+    let input_writer = child.stdin.take().map(|mut stdin| {
+        let input = input.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        })
+    });
     // Drain stdout and stderr on their own threads so a hook that fills one
     // pipe buffer cannot deadlock against our wait loop.
     let stdout = child.stdout.take();
@@ -537,7 +589,13 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
     let stderr = child.stderr.take();
     let err_reader = std::thread::spawn(move || read_all(stderr));
     let deadline = Instant::now() + Duration::from_secs(def.timeout_sec);
+    let mut was_interrupted = false;
     let status = loop {
+        if interrupted() {
+            was_interrupted = true;
+            crate::tools::bash::kill_process_group(&mut child);
+            break None;
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
@@ -555,6 +613,12 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
     // partial output is abandoned along with its reader thread.
     let stdout_text = join_bounded(out_reader, Duration::from_secs(2));
     let stderr_text = join_bounded(err_reader, Duration::from_secs(2));
+    if let Some(writer) = input_writer {
+        join_bounded(writer, Duration::from_secs(2));
+    }
+    if was_interrupted {
+        return (130, stdout_text, "hook interrupted".into());
+    }
     match status {
         Some(s) => (s.code().unwrap_or(1), stdout_text, stderr_text),
         None => (
@@ -566,11 +630,11 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
 }
 
 /// Joins a reader thread, giving up (with empty output) after `limit`.
-fn join_bounded(handle: std::thread::JoinHandle<String>, limit: Duration) -> String {
+fn join_bounded<T: Default>(handle: std::thread::JoinHandle<T>, limit: Duration) -> T {
     let deadline = Instant::now() + limit;
     while !handle.is_finished() {
         if Instant::now() >= deadline {
-            return String::new();
+            return T::default();
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -642,6 +706,39 @@ pub fn run_event_ctx(groups: &[HookMatcher], target: &str, input: &str, cwd: &Pa
     run_event_inner(groups, target, &[], input, cwd, true)
 }
 
+/// Runs matching hooks with an explicit cancellation predicate.
+///
+/// Cancellation skips remaining hooks and discards context from the interrupted event.
+#[must_use]
+pub fn run_event_interruptible(
+    groups: &[HookMatcher],
+    target: &str,
+    arg_values: &[&str],
+    input: &str,
+    cwd: &Path,
+    capture_context: bool,
+    interrupted: &dyn Fn() -> bool,
+) -> HookOutcome {
+    run_event_gated(
+        enabled(),
+        groups,
+        target,
+        arg_values,
+        input,
+        cwd,
+        HookRun {
+            capture_context,
+            interrupted,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct HookRun<'a> {
+    capture_context: bool,
+    interrupted: &'a dyn Fn() -> bool,
+}
+
 fn run_event_inner(
     groups: &[HookMatcher],
     target: &str,
@@ -657,7 +754,10 @@ fn run_event_inner(
         arg_values,
         input,
         cwd,
-        capture_context,
+        HookRun {
+            capture_context,
+            interrupted: &crate::interrupt::pending,
+        },
     )
 }
 
@@ -675,7 +775,7 @@ fn run_event_gated(
     arg_values: &[&str],
     input: &str,
     cwd: &Path,
-    capture_context: bool,
+    run: HookRun<'_>,
 ) -> HookOutcome {
     if !enabled {
         return HookOutcome::default();
@@ -684,6 +784,10 @@ fn run_event_gated(
     let mut context = String::new();
     for group in groups.iter().filter(|g| g.matches(target, arg_values)) {
         for def in &group.hooks {
+            if (run.interrupted)() {
+                outcome.stop_reason = Some("hook execution interrupted".into());
+                return outcome;
+            }
             // Prompt hooks run no process: their text is injected to the model
             // as context, independent of exit-code semantics.
             if let Some(text) = &def.prompt {
@@ -700,11 +804,15 @@ fn run_event_gated(
             if def.is_async {
                 let (def, input, cwd) = (def.clone(), input.to_owned(), cwd.to_path_buf());
                 std::thread::spawn(move || {
-                    let _ = run_hook(&def, &input, &cwd);
+                    let _ = run_hook(&def, &input, &cwd, &|| false);
                 });
                 continue;
             }
-            let (code, stdout, stderr) = run_hook(def, input, cwd);
+            let (code, stdout, stderr) = run_hook(def, input, cwd, run.interrupted);
+            if (run.interrupted)() {
+                outcome.stop_reason = Some("hook execution interrupted".into());
+                return outcome;
+            }
             let stderr = stderr.trim().to_string();
             // Optional JSON response envelope on stdout. When absent, stdout is
             // plain context text and exit codes stay fully authoritative.
@@ -731,7 +839,7 @@ fn run_event_gated(
                         Some(env) => env.additional_context.clone(),
                         None => Some(stdout.trim().to_string()),
                     };
-                    if capture_context
+                    if run.capture_context
                         && !outcome.suppress_output
                         && let Some(text) = injected.filter(|t| !t.is_empty())
                     {
@@ -873,6 +981,66 @@ pub fn render_list(hooks: &Hooks) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_hook_stop_cancels_blocked_stdin_and_skips_remaining_hooks() {
+        let _guard = crate::interrupt::test_guard();
+        let (_ctx, cwd) = crate::tools::test_ctx();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let console = std::sync::Arc::new(crate::console_input::ConsoleInput::default());
+        console.attach(Some(std::sync::Arc::clone(&remote)));
+        let groups = parse_config(
+            r#"{"SessionStart":[{"hooks":[
+            {"type":"command","command":"printf 'partial context'; touch ready; sleep 30","timeout":60},
+            {"type":"prompt","prompt":"must not inject"},
+            {"type":"command","command":"touch after","async":true}
+        ]}]}"#,
+        );
+        let ready = cwd.join("ready");
+        let setter = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let started = ready.exists();
+            remote
+                .shared
+                .interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            started
+        });
+        let started = std::time::Instant::now();
+        let outcome = run_event_interruptible(
+            &groups.session_start,
+            "startup",
+            &[],
+            &"x".repeat(1024 * 1024),
+            &cwd,
+            true,
+            &|| console.interrupted(),
+        );
+        assert!(setter.join().unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            outcome.stop_reason.as_deref(),
+            Some("hook execution interrupted")
+        );
+        assert!(outcome.context.is_none());
+        assert!(!cwd.join("after").exists());
+        assert!(console.interrupted());
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn remote_hook_stop_cannot_report_worktree_removal_success() {
+        let (_ctx, cwd) = crate::tools::test_ctx();
+        let hooks = parse_config(
+            r#"{"WorktreeRemove":[{"hooks":[{"type":"command","command":"touch removed"}]}]}"#,
+        );
+        let result = run_worktree_remove_interruptible(&hooks, &cwd, &cwd, &|| true);
+        assert!(result.unwrap_err().contains("interrupted"));
+        assert!(!cwd.join("removed").exists());
+        std::fs::remove_dir_all(cwd).ok();
+    }
     use super::*;
 
     const CONFIG: &str = r#"{
@@ -1251,13 +1419,35 @@ mod tests {
         ];
         for event in KNOWN_EVENTS {
             for (shape, groups) in &shapes {
-                let off = run_event_gated(false, groups, "", &[], "{}", &cwd, true);
+                let off = run_event_gated(
+                    false,
+                    groups,
+                    "",
+                    &[],
+                    "{}",
+                    &cwd,
+                    HookRun {
+                        capture_context: true,
+                        interrupted: &|| false,
+                    },
+                );
                 assert_eq!(
                     off,
                     HookOutcome::default(),
                     "{event}/{shape} must be a clean skip when hooks are off"
                 );
-                let on = run_event_gated(true, groups, "", &[], "{}", &cwd, true);
+                let on = run_event_gated(
+                    true,
+                    groups,
+                    "",
+                    &[],
+                    "{}",
+                    &cwd,
+                    HookRun {
+                        capture_context: true,
+                        interrupted: &|| false,
+                    },
+                );
                 assert_ne!(
                     on,
                     HookOutcome::default(),

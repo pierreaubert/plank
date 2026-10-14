@@ -5,6 +5,7 @@
 //! the launch gate (`require_min_ram` in `main.rs`) read the same constants, so
 //! the menu never offers a model the load would then refuse.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::engines::{Catalog, Choice, EngineEntry};
@@ -112,6 +113,138 @@ impl EngineRow {
     pub fn selectable(&self) -> bool {
         !matches!(self.fit, Fit::Disabled { .. })
     }
+}
+
+/// Bounded engine-host catalog page for graphical clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EngineInventory {
+    pub page: usize,
+    pub total: usize,
+    pub current: Option<String>,
+    pub ram: Option<u64>,
+    pub free_disk: Option<u64>,
+    pub ds4: bool,
+    pub gemma: bool,
+    pub engines: Vec<InventoryEntry>,
+}
+
+/// A catalog entry and the host's authoritative availability decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InventoryEntry {
+    pub name: String,
+    pub version: u32,
+    pub notes: String,
+    pub state: String,
+    pub detail: String,
+    pub missing_bytes: Option<u64>,
+}
+
+impl EngineInventory {
+    /// Captures availability using the same rules as the startup chooser.
+    #[must_use]
+    pub fn capture(page: usize) -> Self {
+        let root = crate::manifest::plank_dir();
+        let catalog = crate::engines::load_in(&root, &mut Vec::new());
+        let machine = machine(&root);
+        let downloading = crate::download::downloading_in(&root, &catalog);
+        let rows = evaluate(
+            &root,
+            &catalog,
+            &machine,
+            &|path| path.exists(),
+            downloading
+                .as_ref()
+                .map(|(name, percent)| (name.as_str(), *percent)),
+            &|name| {
+                crate::manifest::EngineId::new(name)
+                    .is_some_and(|id| crate::downloader::is_staged_in(&root, id))
+            },
+        );
+        Self::from_rows(
+            &catalog,
+            &machine,
+            &rows,
+            crate::engines::active_id().map(|id| id.to_string()),
+            page,
+        )
+    }
+
+    fn from_rows(
+        catalog: &Catalog,
+        machine: &Machine,
+        rows: &[EngineRow],
+        current: Option<String>,
+        page: usize,
+    ) -> Self {
+        // 32 rows keep wire payloads bounded while covering custom local catalogs.
+        const PAGE_SIZE: usize = 32;
+        let total = catalog.engines.len();
+        let page = page.clamp(1, total.div_ceil(PAGE_SIZE).max(1));
+        let engines = catalog
+            .engines
+            .values()
+            .enumerate()
+            .skip((page - 1) * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .map(|(index, entry)| {
+                let fit = rows
+                    .iter()
+                    .find(|row| row.name == entry.name)
+                    .map(|row| &row.fit);
+                let state = match fit {
+                    Some(Fit::Installed) => "installed",
+                    Some(Fit::Download { .. }) => "download",
+                    Some(Fit::Downloading { .. }) => "downloading",
+                    Some(Fit::Staged) => "staged",
+                    Some(Fit::Disabled { .. }) | None => "disabled",
+                };
+                InventoryEntry {
+                    name: if entry.name.len() > 128 {
+                        // This is a display label; the chooser retains the complete name.
+                        format!("{}… [{index}]", bounded_label(&entry.name, 96))
+                    } else {
+                        entry.name.clone()
+                    },
+                    version: entry.version,
+                    notes: bounded_label(&raw_str(entry, "notes").unwrap_or_default(), 1024),
+                    state: state.into(),
+                    detail: bounded_label(
+                        &fit.map_or_else(
+                            || "Catalog entry cannot be resolved".into(),
+                            crate::enginepick::state_label,
+                        ),
+                        512,
+                    ),
+                    missing_bytes: match fit {
+                        Some(Fit::Download { bytes }) => *bytes,
+                        _ => None,
+                    },
+                }
+            })
+            .collect();
+        Self {
+            page,
+            total,
+            current: current.map(|name| bounded_label(&name, 128)),
+            ram: machine.ram,
+            free_disk: machine.free_disk,
+            ds4: machine.caps.ds4,
+            gemma: machine.caps.gemma,
+            engines,
+        }
+    }
+}
+
+fn bounded_label(text: &str, limit: usize) -> String {
+    let mut text = text.replace(char::is_control, " ");
+    if text.len() > limit {
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// The KV a Gemma engine needs at the smallest window it opens by default:
@@ -342,6 +475,56 @@ mod tests {
     fn catalog() -> Catalog {
         let mut w = Vec::new();
         parse(CATALOG, Layer::Published, &mut w).expect("parses")
+    }
+
+    #[test]
+    fn engine_inventory_pages_preserve_availability_and_bound_descriptions() {
+        let mut catalog = catalog();
+        let mut template = catalog.engines["gemma4-e4b"].clone();
+        template.raw = serde_json::json!({"notes":"é".repeat(2000)}).to_string();
+        catalog.engines.clear();
+        for index in 0..65 {
+            let mut entry = template.clone();
+            entry.name = format!("engine-{index:03}");
+            catalog.engines.insert(entry.name.clone(), entry);
+        }
+        let rows = vec![
+            EngineRow {
+                name: "engine-000".into(),
+                notes: String::new(),
+                fit: Fit::Installed,
+            },
+            EngineRow {
+                name: "engine-001".into(),
+                notes: String::new(),
+                fit: Fit::Download { bytes: Some(42) },
+            },
+            EngineRow {
+                name: "engine-002".into(),
+                notes: String::new(),
+                fit: Fit::Disabled {
+                    reason: "requires another build".into(),
+                },
+            },
+        ];
+        let first = EngineInventory::from_rows(
+            &catalog,
+            &machine(Some(64), Some(500)),
+            &rows,
+            Some("engine-000".into()),
+            0,
+        );
+        assert_eq!((first.page, first.total, first.engines.len()), (1, 65, 32));
+        assert_eq!(first.engines[0].state, "installed");
+        assert_eq!(first.engines[1].missing_bytes, Some(42));
+        assert_eq!(first.engines[2].detail, "requires another build");
+        assert_eq!(first.engines[3].state, "disabled");
+        assert!(first.engines.iter().all(|row| row.notes.len() <= 1024));
+        assert!(serde_json::to_vec(&first).unwrap().len() < 64 * 1024);
+        let last =
+            EngineInventory::from_rows(&catalog, &machine(None, None), &rows, None, usize::MAX);
+        assert_eq!((last.page, last.engines.len()), (3, 1));
+        assert_eq!(last.engines[0].name, "engine-064");
     }
 
     fn machine(ram_gib: Option<u64>, free_gib: Option<u64>) -> Machine {

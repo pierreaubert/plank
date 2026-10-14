@@ -5,6 +5,7 @@
 //! saved-session metadata `/insights` already caches. Every number is
 //! deterministic; the model is never involved.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::insights::SessionMeta;
@@ -162,6 +163,24 @@ pub struct Stats {
     rows: Vec<Row>,
 }
 
+/// Portable calendar and scoped figures for graphical clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivitySnapshot {
+    pub scope: String,
+    /// Monday-first weeks, oldest first; future days have no intensity.
+    pub days: Vec<ActivityDay>,
+    pub summary: Vec<String>,
+}
+
+/// One host-local calendar day and its approximate transcript token count.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityDay {
+    pub date: String,
+    pub tokens: u64,
+    /// Zero is empty; one through four match the terminal's ranked shades.
+    pub level: Option<u8>,
+}
+
 /// Approx tokens of a transcript: four bytes per token, the usual rule of thumb.
 fn approx_tokens(bytes: u64) -> u64 {
     bytes / 4
@@ -185,6 +204,73 @@ fn model_name(entry: &SessionEntry) -> String {
 }
 
 impl Stats {
+    /// Captures the calendar and eight figures without terminal formatting.
+    #[must_use]
+    pub fn activity_snapshot(&self, scope: Scope) -> ActivitySnapshot {
+        let mut distinct = self
+            .grid
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|value| *value > 0)
+            .collect::<Vec<_>>();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let days = self
+            .grid
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, tokens)| {
+                let day = self.grid_start + i64::try_from(index).unwrap_or(0);
+                let (year, month, date) = civil(day);
+                ActivityDay {
+                    date: format!("{year:04}-{month:02}-{date:02}"),
+                    tokens: *tokens,
+                    level: (day <= self.today).then(|| {
+                        if *tokens == 0 {
+                            0
+                        } else {
+                            u8::try_from(shade_for(*tokens, &distinct) + 1).unwrap_or(4)
+                        }
+                    }),
+                }
+            })
+            .collect();
+        let figures = self.figures(scope);
+        ActivitySnapshot {
+            scope: match scope {
+                Scope::AllTime => "all",
+                Scope::Last7 => "7",
+                Scope::Last30 => "30",
+            }
+            .into(),
+            days,
+            summary: vec![
+                format!(
+                    "Favorite model: {}",
+                    figures.favorite_model.as_deref().unwrap_or("-")
+                ),
+                format!("Total tokens: {}", fmt_count(figures.approx_tokens)),
+                format!("Sessions: {}", figures.sessions),
+                format!(
+                    "Longest span: {}",
+                    fmt_duration(figures.longest_session_secs)
+                ),
+                format!(
+                    "Days started: {}/{}",
+                    figures.active_days, figures.span_days
+                ),
+                format!("Longest streak: {} days", figures.longest_streak),
+                format!(
+                    "Most active day: {}",
+                    figures.most_active_day.map_or_else(|| "-".into(), fmt_day)
+                ),
+                format!("Current streak: {} days", figures.current_streak),
+            ],
+        }
+    }
+
     #[must_use]
     pub fn build(
         metas: &[SessionMeta],
@@ -625,6 +711,47 @@ mod tests {
         assert_eq!(day_of(0, 0), 0);
         assert_eq!(weekday_mon0(0), 3);
         assert_eq!(weekday_mon0(4), 0); // 1970-01-05 was a Monday
+    }
+
+    #[test]
+    fn activity_snapshots_preserve_calendar_ranks_and_scope_figures() {
+        let today = 20_713 * DAY;
+        let metas = (0..4)
+            .map(|offset| {
+                meta(
+                    &format!("session-{offset}"),
+                    today - offset * DAY,
+                    (offset + 1) * 400,
+                    60,
+                )
+            })
+            .collect::<Vec<_>>();
+        let stats = Stats::build(&metas, &[], today, 0);
+        let all = stats.activity_snapshot(Scope::AllTime);
+        let week = stats.activity_snapshot(Scope::Last7);
+        assert_eq!(all.days.len(), WEEKS * 7);
+        assert_eq!(all.days, week.days);
+        assert_eq!(week.scope, "7");
+        assert_eq!(all.summary.len(), 8);
+        assert!(all.summary.iter().any(|line| line == "Sessions: 4"));
+        let ranks = all
+            .days
+            .iter()
+            .filter_map(|day| day.level)
+            .filter(|level| *level > 0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ranks, BTreeSet::from([1, 2, 3, 4]));
+        for (index, day) in all.days.iter().enumerate() {
+            assert_eq!(day.tokens, stats.grid[index / 7][index % 7]);
+            assert_eq!(
+                day.level.is_none(),
+                stats.grid_start + i64::try_from(index).unwrap() > stats.today
+            );
+        }
+        assert!(all.days.iter().any(|day| day.date == "2026-09-17"));
+        let encoded = serde_json::to_string(&all).unwrap();
+        assert!(encoded.len() < 32 * 1024);
+        assert!(!encoded.contains("\\u001b"));
     }
 
     #[test]

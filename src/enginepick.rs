@@ -96,12 +96,77 @@ pub fn state_label(fit: &Fit) -> String {
 /// # Errors
 /// When the terminal cannot be drawn to or read.
 pub fn run(rows: &[EngineRow], current: Option<&str>) -> Result<Option<String>, String> {
+    if crate::ui::gui_protocol_enabled() {
+        return Ok(run_gui(rows, current));
+    }
     let mut state = ListState::default();
     state.select(initial_cursor(rows, current));
     let mut terminal = ratatui::init();
     let result = menu_loop(&mut terminal, rows, &mut state);
     ratatui::restore();
     result
+}
+
+/// Uses the GUI's existing compact answer controls without initializing a terminal.
+fn run_gui(rows: &[EngineRow], current: Option<&str>) -> Option<String> {
+    // Two slots remain for page navigation below the GUI's 32-choice limit.
+    const PAGE_SIZE: usize = 28;
+    let choices = gui_choices(rows, current);
+    if choices.is_empty() {
+        println!("No available engine fits this machine");
+        return None;
+    }
+    let mut page = 0;
+    loop {
+        let start = page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(choices.len());
+        let mut options = choices[start..end]
+            .iter()
+            .map(|(_, option)| option.clone())
+            .collect::<Vec<_>>();
+        let next = (end < choices.len()).then(|| {
+            options.push(serde_json::json!({"label":"Next page"}));
+            options.len()
+        });
+        let previous = (page > 0).then(|| {
+            options.push(serde_json::json!({"label":"Previous page"}));
+            options.len()
+        });
+        let unavailable = rows
+            .iter()
+            .filter(|row| !row.selectable())
+            .map(|row| format!("{}: {}", row.name, state_label(&row.fit)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let question = format!(
+            "Choose an engine. Missing models download before switching; your saved conversation is restored when its family matches.\nPage {} of {}.\n{}",
+            page + 1,
+            choices.len().div_ceil(PAGE_SIZE),
+            unavailable
+        );
+        let answer = crate::ui::gui_question(&question, "Engine", &options, false)?;
+        let index = answer.parse::<usize>().ok()?;
+        if Some(index) == next {
+            page += 1;
+        } else if Some(index) == previous {
+            page -= 1;
+        } else {
+            return index
+                .checked_sub(1)
+                .filter(|index| *index < end - start)
+                .map(|index| choices[start + index].0.clone());
+        }
+    }
+}
+
+/// Only selectable engines become answer choices; unavailable engines remain explanatory text.
+fn gui_choices(rows: &[EngineRow], current: Option<&str>) -> Vec<(String, serde_json::Value)> {
+    rows.iter().filter(|row| row.selectable()).map(|row| {
+        (row.name.clone(), serde_json::json!({
+            "label": format!("{}{}", row.name, if current == Some(row.name.as_str()) { " · current" } else { "" }),
+            "description": format!("{} {}", state_label(&row.fit), row.notes),
+        }))
+    }).collect()
 }
 
 fn menu_loop(
@@ -185,6 +250,20 @@ fn draw(frame: &mut Frame, rows: &[EngineRow], state: &mut ListState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gui_engine_choices_exclude_disabled_rows_and_describe_current_state() {
+        let choices = super::gui_choices(&rows(), Some("d"));
+        assert!(choices.iter().all(|(name, _)| name != "a" && name != "c"));
+        let current = choices.iter().find(|(name, _)| name == "d").unwrap();
+        assert!(current.1["label"].as_str().unwrap().contains("current"));
+        assert!(
+            current.1["description"]
+                .as_str()
+                .unwrap()
+                .contains("installed")
+        );
+    }
+
     use super::*;
     use crate::enginefit::{EngineRow, Fit};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

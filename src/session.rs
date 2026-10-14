@@ -651,6 +651,22 @@ pub struct SessionStore {
     dir: PathBuf,
 }
 
+fn title_for_session(session: &Session) -> String {
+    let title = title_from_transcript(&session.transcript, 0);
+    if matches!(title.as_str(), "(no user prompt)" | "(empty user prompt)")
+        && let Some(task) = session.tasks.tasks().first()
+    {
+        // Task-only sessions have no prompt from which to derive a title.
+        return task
+            .subject
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(80)
+            .collect();
+    }
+    title
+}
+
 impl SessionStore {
     /// Opens (creating if needed) a session store at `dir`.
     ///
@@ -1343,11 +1359,11 @@ impl SessionStore {
     ///
     /// # Errors
     ///
-    /// Returns "nothing to save" for a transcript with no user turn, or an
+    /// Returns "nothing to save" when there are neither user turns nor tasks, or an
     /// I/O error if the file cannot be written.
     #[allow(clippy::too_many_lines)]
     pub fn save(&self, session: &mut Session) -> Result<String> {
-        if !session.transcript.iter().any(|m| m.role == Role::User) {
+        if !session.transcript.iter().any(|m| m.role == Role::User) && session.tasks.is_empty() {
             return Err(SessionError::new("nothing to save"));
         }
         // C parity: "sessions containing images cannot be saved yet". The
@@ -1362,7 +1378,7 @@ impl SessionStore {
             .map_err(|_| SessionError::new(format!("failed to create {}", self.dir.display())))?;
 
         if session.title.is_empty() {
-            session.title = title_from_transcript(&session.transcript, 0);
+            session.title = title_for_session(session);
         }
         let now = unix_now();
         if session.created_at == 0 {
@@ -1519,7 +1535,7 @@ impl SessionStore {
             let Ok(session) = read_session_file(&path) else {
                 continue;
             };
-            let title = title_from_transcript(&session.transcript, 0);
+            let title = title_for_session(&session);
             let Ok(body) = fs::read(&path) else { continue };
             let Some(spliced) = replace_title_record(&body, &title) else {
                 continue;

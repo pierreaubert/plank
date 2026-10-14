@@ -457,6 +457,7 @@ struct StdioTransport {
     stderr_tail: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
+#[derive(Clone)]
 struct HttpTransport {
     url: String,
     headers: Vec<(String, String)>,
@@ -480,12 +481,12 @@ pub struct McpServer {
     transport: Transport,
     alive: bool,
     next_id: i64,
-    /// The config a stdio server was started from, kept so a server that
-    /// stops answering can be started again ([`McpServer::revive`]). `None`
-    /// for HTTP servers and offline shadows, which have no process to restart.
+    /// Launch/connection configuration for a fresh handshake after failure.
+    /// Offline shadows have no configuration and cannot be restarted.
     config: Option<McpServerConfig>,
     /// Why the last request failed, for the error a failed restart reports.
     last_error: Option<String>,
+    input: Option<std::sync::Arc<crate::console_input::ConsoleInput>>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -516,6 +517,17 @@ impl Drop for McpServer {
 }
 
 impl McpServer {
+    pub(crate) fn attach_input(
+        &mut self,
+        input: std::sync::Arc<crate::console_input::ConsoleInput>,
+    ) {
+        self.input = Some(input);
+    }
+
+    fn interrupted(&self) -> bool {
+        crate::interrupt::pending() || self.input.as_ref().is_some_and(|input| input.interrupted())
+    }
+
     /// Connects to the server: spawns the subprocess for a `command` config
     /// (stdin/stdout piped, stderr dropped), or sets up a Streamable HTTP
     /// client for a `url` config. No I/O happens for HTTP until
@@ -538,6 +550,10 @@ impl McpServer {
                 .spawn()
                 .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
             let stdin = child.stdin.take().ok_or("no stdin pipe")?;
+            if let Err(error) = nonblocking_pipe(&stdin) {
+                crate::tools::bash::kill_process_group(&mut child);
+                return Err(error);
+            }
             let stdout = child.stdout.take().ok_or("no stdout pipe")?;
             let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             if let Some(mut err) = child.stderr.take() {
@@ -585,7 +601,7 @@ impl McpServer {
                 agent,
             })
         };
-        let config = matches!(transport, Transport::Stdio(_)).then(|| cfg.clone());
+        let config = Some(cfg.clone());
         Ok(Self {
             name: cfg.name.clone(),
             tools: Vec::new(),
@@ -596,6 +612,7 @@ impl McpServer {
             next_id: 0,
             config,
             last_error: None,
+            input: None,
         })
     }
 
@@ -608,8 +625,11 @@ impl McpServer {
     ///
     /// # Errors
     /// A message naming the server, why it stopped, and why the restart
-    /// failed; or that it cannot be restarted (HTTP, offline shadow).
+    /// failed; or that an offline shadow cannot be restarted.
     fn revive(&mut self) -> Result<(), String> {
+        if self.interrupted() {
+            return Err("MCP request interrupted".into());
+        }
         let why = self
             .last_error
             .clone()
@@ -617,7 +637,7 @@ impl McpServer {
         let Some(cfg) = self.config.clone() else {
             return Err(format!("mcp server {} is not running ({why})", self.name));
         };
-        match spawn_and_handshake(&cfg) {
+        match spawn_and_handshake_with_input(&cfg, self.input.clone()) {
             Ok(fresh) => {
                 *self = fresh;
                 Ok(())
@@ -648,6 +668,7 @@ impl McpServer {
             next_id: 0,
             config: None,
             last_error: None,
+            input: None,
         }
     }
 
@@ -688,6 +709,13 @@ impl McpServer {
     /// # Errors
     /// Returns a message on transport failure or a JSON-RPC `error` reply.
     fn request(&mut self, method: &str, params_json: &str) -> Result<Json, String> {
+        if self.interrupted() {
+            return Err("MCP request interrupted".into());
+        }
+        let input = self.input.clone();
+        let interrupted = || {
+            crate::interrupt::pending() || input.as_ref().is_some_and(|input| input.interrupted())
+        };
         // Bound before the match: the match mutably borrows `self.transport`,
         // so `self.name` is not readable inside an arm.
         let name = self.name.clone();
@@ -700,23 +728,45 @@ impl McpServer {
         req.push('}');
         match &mut self.transport {
             Transport::Stdio(t) => {
-                let resp = t.round_trip(&req, id);
+                let resp = t.round_trip(&req, id, &interrupted);
                 if let Err(e) = &resp {
                     self.alive = false;
                     self.last_error = Some(e.clone());
+                    if interrupted() {
+                        crate::tools::bash::kill_process_group(&mut t.child);
+                    }
                 }
                 resp
             }
-            Transport::Http(t) => t.round_trip(&req, Some(id)),
+            Transport::Http(t) => {
+                let result = t.round_trip_interruptible(&req, Some(id), &interrupted);
+                if interrupted() {
+                    self.alive = false;
+                    self.last_error =
+                        Some("MCP request interrupted; remote effects may be uncertain".into());
+                }
+                result
+            }
             Transport::Offline => Err(offline_error(&name)),
         }
     }
 
     fn notify(&mut self, method: &str) -> bool {
+        if self.interrupted() {
+            return false;
+        }
+        let input = self.input.clone();
+        let interrupted = || {
+            crate::interrupt::pending() || input.as_ref().is_some_and(|input| input.interrupted())
+        };
         let body = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{{}}}}");
         match &mut self.transport {
             Transport::Stdio(t) => {
-                let ok = t.write_line(&body);
+                let ok = t.write_line_interruptible(
+                    &body,
+                    Instant::now() + Duration::from_secs(mcp_timeout_sec()),
+                    &interrupted,
+                );
                 if !ok {
                     self.alive = false;
                 }
@@ -724,7 +774,9 @@ impl McpServer {
             }
             // Streamable HTTP: a notification is a plain POST the server
             // acknowledges with 202 Accepted; any reply body is ignored.
-            Transport::Http(t) => t.round_trip(&body, None).is_ok(),
+            Transport::Http(t) => t
+                .round_trip_interruptible(&body, None, &interrupted)
+                .is_ok(),
             Transport::Offline => false,
         }
     }
@@ -837,8 +889,20 @@ impl StdioTransport {
     ///
     /// Returns `None` on timeout, EOF, or error (the caller marks the server
     /// dead).
+    #[cfg(test)]
     fn read_line(&mut self, deadline: Instant) -> Option<String> {
+        self.read_line_interruptible(deadline, &crate::interrupt::pending)
+    }
+
+    fn read_line_interruptible(
+        &mut self,
+        deadline: Instant,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Option<String> {
         loop {
+            if interrupted() {
+                return None;
+            }
             if let Some(nl) = self.rbuf.iter().position(|&b| b == b'\n') {
                 let line = String::from_utf8_lossy(&self.rbuf[..nl]).into_owned();
                 self.rbuf.drain(..=nl);
@@ -850,10 +914,19 @@ impl StdioTransport {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            #[allow(clippy::cast_possible_truncation)]
-            let timeout_ms = (remaining.as_millis() as libc::c_int).saturating_add(1);
+            // Short polls keep cancellation responsive even when the server is silent.
+            let timeout_ms = i32::try_from(remaining.as_millis().min(20))
+                .unwrap_or(20)
+                .max(1);
+            // SAFETY: pfd is initialized and remains valid for this one-element poll.
             let pr = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-            if pr <= 0 {
+            if pr == 0 {
+                continue;
+            }
+            if pr < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
                 return None;
             }
             let mut chunk = [0u8; 4096];
@@ -865,24 +938,55 @@ impl StdioTransport {
         }
     }
 
-    fn write_line(&mut self, line: &str) -> bool {
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .is_ok()
+    fn write_line_interruptible(
+        &mut self,
+        line: &str,
+        deadline: Instant,
+        interrupted: &dyn Fn() -> bool,
+    ) -> bool {
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if interrupted() || Instant::now() >= deadline {
+                return false;
+            }
+            match self.stdin.write(&bytes[offset..]) {
+                Ok(0) => return false,
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return false,
+            }
+        }
+        true
     }
 
     /// Writes one request and reads replies until the one matching `id`.
-    fn round_trip(&mut self, req: &str, id: i64) -> Result<Json, String> {
-        if !self.write_line(req) {
-            return Err("failed to write to server".to_string());
-        }
+    fn round_trip(
+        &mut self,
+        req: &str,
+        id: i64,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Json, String> {
         // The deadline covers the whole exchange, not each line: a server
         // that streams notifications forever must still answer in time.
         let deadline = Instant::now() + Duration::from_secs(mcp_timeout_sec());
+        if !self.write_line_interruptible(req, deadline, interrupted) {
+            return Err(if interrupted() {
+                "MCP request interrupted"
+            } else {
+                "failed to write to server"
+            }
+            .into());
+        }
         loop {
-            let Some(line) = self.read_line(deadline) else {
+            let Some(line) = self.read_line_interruptible(deadline, interrupted) else {
+                if interrupted() {
+                    return Err("MCP request interrupted".into());
+                }
                 return Err(self.failure_reason());
             };
             // Ignore unparsable/log lines on stdout.
@@ -911,7 +1015,67 @@ fn extract_reply(resp: &Json, id: i64) -> Result<Option<Json>, String> {
     Ok(Some(resp.get("result").cloned().unwrap_or(Json::Null)))
 }
 
+fn nonblocking_pipe(pipe: &ChildStdin) -> Result<(), String> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the borrowed ChildStdin keeps fd open; F_GETFL takes no argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: fd remains open, and F_SETFL takes this integer flag mask.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+type HttpReply = (Result<Json, String>, Option<String>);
+
 impl HttpTransport {
+    fn round_trip_interruptible(
+        &mut self,
+        body: &str,
+        id: Option<i64>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Json, String> {
+        if interrupted() {
+            return Err("MCP request interrupted".into());
+        }
+        let mut worker = self.clone();
+        let body = body.to_owned();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = worker.round_trip(&body, id);
+            let _ = sender.send((result, worker.session_id));
+        });
+        self.await_reply(&receiver, interrupted)
+    }
+
+    fn await_reply(
+        &mut self,
+        receiver: &std::sync::mpsc::Receiver<HttpReply>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Json, String> {
+        loop {
+            if interrupted() {
+                return Err("MCP request interrupted".into());
+            }
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok((result, session_id)) => {
+                    if interrupted() {
+                        return Err("MCP request interrupted".into());
+                    }
+                    self.session_id = session_id;
+                    return result;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("MCP HTTP request worker stopped".into());
+                }
+            }
+        }
+    }
+
     /// One Streamable HTTP exchange: POST the JSON-RPC message, then decode
     /// the reply as plain JSON or as a short SSE stream, whichever the server
     /// chose. `id` is `None` for notifications (expects 202 Accepted, ignores
@@ -1302,7 +1466,15 @@ fn prune_records(root: &Path, keep: Option<&[String]>) {
 /// exercise the same startup path: duplicating it would let a change here go
 /// unnoticed by every test that starts a server.
 fn spawn_and_handshake(cfg: &McpServerConfig) -> Result<McpServer, String> {
+    spawn_and_handshake_with_input(cfg, None)
+}
+
+fn spawn_and_handshake_with_input(
+    cfg: &McpServerConfig,
+    input: Option<std::sync::Arc<crate::console_input::ConsoleInput>>,
+) -> Result<McpServer, String> {
     let mut s = McpServer::spawn(cfg)?;
+    s.input = input;
     s.handshake(cfg.primary_tools.as_deref())?;
     Ok(s)
 }
@@ -2023,6 +2195,103 @@ pub fn tool_mcp_read_resource(servers: &mut [McpServer], call: &ToolCall) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_mcp_stop_interrupts_silent_reads_and_blocked_request_writes() {
+        let _guard = crate::interrupt::test_guard();
+        for reads_input in [false, true] {
+            let (_ctx, cwd) = crate::tools::test_ctx();
+            let remote = crate::remote::control::RemoteState::test_bridge();
+            let input = std::sync::Arc::new(crate::console_input::ConsoleInput::default());
+            input.attach(Some(std::sync::Arc::clone(&remote)));
+            let cfg = McpServerConfig {
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    if reads_input {
+                        "read request; touch \"$READY\"; sleep 30"
+                    } else {
+                        "touch \"$READY\"; sleep 30"
+                    }
+                    .into(),
+                ],
+                env: vec![(
+                    "READY".into(),
+                    cwd.join("ready").to_string_lossy().into_owned(),
+                )],
+                ..cfg_named("silent")
+            };
+            let mut server = McpServer::spawn(&cfg).unwrap();
+            server.attach_input(input);
+            let ready = cwd.join("ready");
+            let setter = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ready.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let started = ready.exists();
+                remote
+                    .shared
+                    .interrupt
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                started
+            });
+            let started = Instant::now();
+            let params = if reads_input {
+                "{}".into()
+            } else {
+                format!("{{\"input\":\"{}\"}}", "x".repeat(1024 * 1024))
+            };
+            let error = server.request("tools/call", &params).unwrap_err();
+            assert!(setter.join().unwrap());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(error.contains("interrupted"), "{error}");
+            assert!(!server.alive);
+            let Transport::Stdio(transport) = &mut server.transport else {
+                panic!("stdio server")
+            };
+            assert!(transport.child.try_wait().unwrap().is_some());
+            std::fs::remove_dir_all(cwd).ok();
+        }
+    }
+
+    #[test]
+    fn remote_mcp_stop_discards_late_http_replies_and_session_updates() {
+        let _guard = crate::interrupt::test_guard();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let input = std::sync::Arc::new(crate::console_input::ConsoleInput::default());
+        input.attach(Some(std::sync::Arc::clone(&remote)));
+        let mut transport = HttpTransport {
+            url: "https://example.invalid/mcp".into(),
+            headers: Vec::new(),
+            session_id: Some("original".into()),
+            agent: ureq::Agent::config_builder().build().into(),
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            remote
+                .shared
+                .interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(150));
+            sender.send((Ok(Json::Null), Some("late".into()))).is_err()
+        });
+        let error = transport
+            .await_reply(&receiver, &|| input.interrupted())
+            .unwrap_err();
+        assert!(error.contains("interrupted"));
+        assert_eq!(transport.session_id.as_deref(), Some("original"));
+        drop(receiver);
+        assert!(worker.join().unwrap());
+        let cfg = McpServerConfig {
+            url: "https://example.invalid/mcp".into(),
+            ..cfg_named("http")
+        };
+        let mut server = McpServer::spawn(&cfg).unwrap();
+        server.attach_input(input);
+        assert_eq!(server.config.as_ref().unwrap().url, cfg.url);
+        assert!(server.revive().unwrap_err().contains("interrupted"));
+    }
     use super::*;
     use crate::dsml::ToolArg;
 

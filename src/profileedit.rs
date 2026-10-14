@@ -411,10 +411,10 @@ pub fn apply(plugin: &Plugin, spec: &ProfileSpec, edited: &str) -> Result<Applie
 
 /// The directory plank was launched from and its arguments, recorded before
 /// `--chdir` or `--worktree` moves the process.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Launch {
     dir: PathBuf,
-    args: Vec<String>,
+    args: std::sync::Mutex<Vec<String>>,
 }
 
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
@@ -422,7 +422,72 @@ static LAUNCH: OnceLock<Launch> = OnceLock::new();
 /// Records the launch directory and arguments (without `argv[0]`). Call once,
 /// first thing in `main`; later calls are ignored.
 pub fn record_launch(dir: PathBuf, args: Vec<String>) {
-    let _ = LAUNCH.set(Launch { dir, args });
+    let _ = LAUNCH.set(Launch {
+        dir,
+        args: std::sync::Mutex::new(args),
+    });
+}
+
+/// Records resolved GUI launch settings for subsequent profile and engine restarts.
+pub fn record_gui_launch(args: &[String]) {
+    if let Some(launch) = LAUNCH.get() {
+        let mut effective = args.to_vec();
+        effective.extend(["--ui".to_owned(), "console".to_owned()]);
+        *launch
+            .args
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = effective;
+    }
+}
+
+/// Removes transient protocol and resume options before persisting GUI launch settings.
+#[must_use]
+pub fn gui_launch_args(original: &[String], model: Option<&str>, named: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < original.len() {
+        match original[index].as_str() {
+            "--ui"
+            | "-p"
+            | "--prompt"
+            | "--pick-engine-resume"
+            | "--model"
+            | "-m"
+            | "--worktree"
+            | "--worktree-pr"
+            | "--chdir" => index += 1,
+            "/resume" => {
+                if original
+                    .get(index + 1)
+                    .is_some_and(|arg| !arg.starts_with('-'))
+                {
+                    index += 1;
+                }
+            }
+            "--pick-engine" => {}
+            arg if arg.starts_with("--model:") || arg.starts_with("--ui=") => {}
+            arg => out.push(arg.to_owned()),
+        }
+        index += 1;
+    }
+    if let Some(model) = model {
+        if named {
+            out.push(format!("--model:{model}"));
+        } else {
+            out.extend(["--model".to_owned(), model.to_owned()]);
+        }
+    }
+    out
+}
+
+/// Keeps the current CLI engine as the cancellation fallback for a GUI picker restart.
+#[must_use]
+pub fn gui_restart_args(original: &[String], session: &str, cwd: &Path) -> Vec<String> {
+    let mut args = restart_args_for(original, session, cwd, false);
+    let resume_at = args.len() - 2;
+    args[resume_at] = "--pick-engine-resume".into();
+    args.push("--pick-engine".into());
+    args
 }
 
 /// A restart the user asked for: the saved session to resume and the
@@ -575,12 +640,21 @@ pub fn exec_restart(restart: &Restart) -> String {
     if let Err(e) = std::env::set_current_dir(&launch.dir) {
         return format!("cannot return to {}: {e}", launch.dir.display());
     }
-    let mut args = restart_args_for(
-        &launch.args,
-        &restart.session,
-        &restart.cwd,
-        restart.pick_engine,
-    );
+    let original = launch
+        .args
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut args = if restart.pick_engine && crate::ui::gui_protocol_enabled() {
+        gui_restart_args(&original, &restart.session, &restart.cwd)
+    } else {
+        restart_args_for(
+            &original,
+            &restart.session,
+            &restart.cwd,
+            restart.pick_engine,
+        )
+    };
     if let Some(switch) = &restart.steering {
         args = switch_steering(&args, switch);
     }
@@ -592,6 +666,38 @@ pub fn exec_restart(restart: &Restart) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gui_engine_restart_preserves_current_model_but_persisted_launch_uses_the_new_choice() {
+        let original = args(&[
+            "--profile",
+            "hal",
+            "--model:old-engine",
+            "--ui",
+            "console",
+            "/resume",
+            "old-session",
+        ]);
+        let restarted = gui_restart_args(&original, "saved-session", Path::new("/repo"));
+        assert!(restarted.iter().any(|arg| arg == "--model:old-engine"));
+        assert!(restarted.iter().any(|arg| arg == "--pick-engine"));
+        assert!(
+            restarted
+                .windows(2)
+                .any(|pair| pair == ["--pick-engine-resume", "saved-session"])
+        );
+        assert!(!restarted.iter().any(|arg| arg == "/resume"));
+        let launch = gui_launch_args(&restarted, Some("new-engine"), true);
+        assert!(launch.iter().any(|arg| arg == "--model:new-engine"));
+        assert!(!launch.iter().any(|arg| arg == "--model:old-engine"
+            || arg == "--ui"
+            || arg == "--pick-engine"
+            || arg == "--pick-engine-resume"
+            || arg == "saved-session"));
+        assert!(launch.windows(2).any(|pair| pair == ["--profile", "hal"]));
+        let fresh_restart = restart_args(&launch, "saved-session", Path::new("/repo"));
+        assert!(fresh_restart.iter().any(|arg| arg == "--model:new-engine"));
+    }
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {

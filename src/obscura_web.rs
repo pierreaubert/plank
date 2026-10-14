@@ -35,11 +35,33 @@ static BROWSER: Mutex<Option<obscura::Browser>> = Mutex::new(None);
 ///
 /// Panics if the internal browser cache mutex is poisoned.
 pub fn fetch(url: &str) -> Result<String, String> {
+    fetch_interruptible(url, &crate::interrupt::pending)
+}
+
+/// Fetches a page while polling cancellation during lock and navigation waits.
+///
+/// # Errors
+/// Returns a message on cancellation or browser failure.
+///
+/// # Panics
+/// Panics if the browser cache mutex is poisoned.
+pub fn fetch_interruptible(url: &str, interrupted: &dyn Fn() -> bool) -> Result<String, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("failed to start async runtime: {e}"))?;
-    let mut guard = BROWSER.lock().expect("obscura browser mutex poisoned");
+    let mut guard = loop {
+        if interrupted() {
+            return Err("web request interrupted".into());
+        }
+        match BROWSER.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("obscura browser mutex poisoned"),
+        }
+    };
     if guard.is_none() {
         *guard = Some(
             obscura::Browser::builder()
@@ -50,14 +72,34 @@ pub fn fetch(url: &str) -> Result<String, String> {
     }
     let browser = guard.as_ref().expect("browser was just set");
     rt.block_on(async {
-        let mut page = browser
-            .new_page()
-            .await
-            .map_err(|e| format!("failed to open page: {e}"))?;
-        page.goto(url)
-            .await
-            .map_err(|e| format!("failed to load {url}: {e}"))?;
-        page.settle(SETTLE_MS).await;
-        Ok(page.content())
+        let fetch = async {
+            let mut page = browser
+                .new_page()
+                .await
+                .map_err(|e| format!("failed to open page: {e}"))?;
+            page.goto(url)
+                .await
+                .map_err(|e| format!("failed to load {url}: {e}"))?;
+            page.settle(SETTLE_MS).await;
+            Ok(page.content())
+        };
+        let cancelled = async {
+            loop {
+                if interrupted() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            result = fetch => {
+                if interrupted() {
+                    Err("web request interrupted".into())
+                } else {
+                    result
+                }
+            },
+            () = cancelled => Err("web request interrupted".into()),
+        }
     })
 }

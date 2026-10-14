@@ -42,6 +42,8 @@ pub mod limits;
 // #26 share the one `remote` module. Re-exported at the module root so callers
 // keep using `crate::remote::{RemoteServer, generate_token}`.
 pub mod control;
+pub(crate) mod editors;
+pub(crate) mod questions;
 pub use control::{RemoteServer, generate_token};
 
 /// Bind address for a `/remote-control` activation: loopback, ephemeral port.

@@ -622,8 +622,8 @@ pub enum Scan {
 /// first run can show movement. Sessions that fail to load are skipped: one
 /// corrupt file must not cost the user the whole report.
 ///
-/// `cancel` is polled once per session so a long first run over a large
-/// history can be abandoned; it returns [`Scan::Cancelled`] rather than an
+/// `cancel` is polled before listing, per session, and after progress callbacks
+/// so even the final callback can stop a scan. It returns [`Scan::Cancelled`] rather than an
 /// error, since a user who asked to stop has not hit a failure.
 ///
 /// # Errors
@@ -635,6 +635,9 @@ pub fn collect_metas(
     progress: &mut dyn FnMut(usize, usize),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Scan, String> {
+    if cancel() {
+        return Ok(Scan::Cancelled);
+    }
     let entries = store.list().map_err(|e| e.to_string())?;
     let total = entries.len();
     let mut out = Vec::with_capacity(total);
@@ -643,6 +646,9 @@ pub fn collect_metas(
             return Ok(Scan::Cancelled);
         }
         progress(i, total);
+        if cancel() {
+            return Ok(Scan::Cancelled);
+        }
         let mtime = mtime_secs(&entry.path);
         let cache = meta_cache_path(root, &entry.id);
         let cached = std::fs::read_to_string(&cache)
@@ -663,6 +669,9 @@ pub fn collect_metas(
         out.push(meta);
     }
     progress(total, total);
+    if cancel() {
+        return Ok(Scan::Cancelled);
+    }
     Ok(Scan::Done(out, entries))
 }
 
@@ -3071,8 +3080,196 @@ pub fn write_report(
     Ok(path)
 }
 
+/// Renders bounded statistics and narrative for native and browser clients.
+///
+/// Lists show at most 32 entries; the complete standalone report remains on disk.
+/// UTF-8 text is bounded to 64 KiB, including an explicit truncation notice.
+#[must_use]
+pub fn render_client_report(agg: &Aggregated, narrative: &Narrative, tz: i64, at: u64) -> String {
+    use std::fmt::Write as _;
+    const NOTICE: &str =
+        "\n\n[Report truncated. See the standalone HTML report for the complete results.]\n";
+    const LIMIT: usize = 64 * 1024;
+    let mut out = String::from("# Your Plank insights\n\n");
+    for line in render_summary(agg, narrative, tz, at) {
+        let _ = writeln!(out, "- {}", report_text(&line));
+    }
+    for (heading, rows) in [
+        ("Tools you use", &agg.tools),
+        ("Languages", &agg.languages),
+        ("Projects", &agg.projects),
+        ("Sources of friction", &agg.errors),
+        ("Tool failures", &agg.error_tools),
+        ("Reply times", &agg.response_histogram),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "\n## {heading}\n\n| Category | Count |\n| --- | ---: |"
+        );
+        for (label, count) in rows.iter().take(32) {
+            let _ = writeln!(out, "| {} | {count} |", report_text(label));
+        }
+        if rows.len() > 32 {
+            out.push_str("\nMore entries are available in the standalone report.\n");
+        }
+    }
+    if !agg.error_rates.is_empty() {
+        out.push_str("\n## Tool failure rates\n\n| Tool | Failed |\n| --- | ---: |\n");
+        for (label, rate) in agg.error_rates.iter().take(32) {
+            let _ = writeln!(out, "| {} | {rate:.1}% |", report_text(label));
+        }
+    }
+    if agg.timing_is_representative() {
+        out.push_str("\n## Prompts by hour\n\n| Host-local hour | Prompts |\n| --- | ---: |\n");
+        for (hour, count) in agg.by_hour.iter().enumerate() {
+            let _ = writeln!(out, "| {hour:02}:00 | {count} |");
+        }
+    } else {
+        out.push_str("\nTiming coverage is insufficient to describe the full history.\n");
+    }
+    for section in SECTIONS {
+        if let Some(value) = narrative.get(section.key) {
+            let _ = writeln!(out, "\n## {}\n", section.heading);
+            report_narrative(&mut out, value, 0);
+        }
+    }
+    if out.len() > LIMIT {
+        let mut end = LIMIT - NOTICE.len();
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str(NOTICE);
+    }
+    out
+}
+
+fn report_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .flat_map(|c| {
+            let escape = matches!(
+                c,
+                '\\' | '|' | '*' | '_' | '[' | ']' | '<' | '>' | '`' | '#'
+            );
+            escape.then_some('\\').into_iter().chain(std::iter::once(c))
+        })
+        .collect()
+}
+
+fn report_narrative(out: &mut String, value: &serde_json::Value, depth: usize) {
+    use std::fmt::Write as _;
+    // Narrative is model-authored; limit both nesting and the number of entries.
+    if depth > 8 {
+        return;
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            let _ = writeln!(out, "{}\n", report_text(text));
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter().take(32) {
+                report_narrative(out, item, depth + 1);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields.iter().take(32) {
+                if matches!(key.as_str(), "snippet" | "prompt") {
+                    if let Some(text) = value.as_str() {
+                        for line in text.lines() {
+                            let _ = writeln!(
+                                out,
+                                "    {}",
+                                line.chars()
+                                    .filter(|c| !c.is_control() || *c == '\t')
+                                    .collect::<String>()
+                            );
+                        }
+                        out.push('\n');
+                    }
+                    continue;
+                }
+                if !matches!(
+                    key.as_str(),
+                    "items" | "paragraphs" | "features" | "prompts"
+                ) {
+                    let _ = writeln!(out, "**{}**\n", report_text(&key.replace('_', " ")));
+                }
+                report_narrative(out, value, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_insights_stop_after_empty_scan_progress_is_not_a_completed_scan() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-empty-insights-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::session::SessionStore::open(dir.join("sessions")).unwrap();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let result = super::collect_metas(
+            &store,
+            &dir.join("reports"),
+            &mut |done, total| {
+                assert_eq!((done, total), (0, 0));
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+            &|| stopped.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap();
+        assert!(matches!(result, super::Scan::Cancelled));
+        std::fs::remove_dir_all(dir).ok();
+    }
+    #[test]
+    fn client_insights_report_preserves_statistics_prose_and_code_and_bounds_unicode() {
+        let agg = super::Aggregated {
+            sessions_scanned: 2,
+            sessions_counted: 2,
+            human_messages: 40,
+            tools: vec![("read".into(), 7)],
+            ..super::Aggregated::default()
+        };
+        let narrative = super::Narrative::from([
+            (
+                "how_you_work".into(),
+                serde_json::json!({"paragraphs":["Check <results> before proceeding."]}),
+            ),
+            (
+                "suggestions".into(),
+                serde_json::json!({"prompts":[{"title":"Review", "prompt":"first line\nsecond line"}]}),
+            ),
+        ]);
+        let report = super::render_client_report(&agg, &narrative, 0, 0);
+        assert!(report.contains("40 prompts"));
+        assert!(report.contains("| read | 7 |"));
+        assert!(report.contains("## How you work"));
+        assert!(report.contains("Check \\<results\\> before proceeding."));
+        assert!(report.contains("    first line\n    second line"));
+        assert!(!report.contains("{\"paragraphs\""));
+        let large = super::Narrative::from([(
+            "how_you_work".into(),
+            serde_json::json!({"paragraphs":["é".repeat(40_000)]}),
+        )]);
+        let bounded = super::render_client_report(&agg, &large, 0, 0);
+        assert!(bounded.len() <= 64 * 1024);
+        assert!(bounded.ends_with("complete results.]\n"));
+        assert!(
+            super::render_client_report(
+                &super::Aggregated::default(),
+                &super::Narrative::new(),
+                0,
+                0
+            )
+            .contains("No sessions substantial enough")
+        );
+    }
 
     /// `repro-loop-1789554852`: a 20-byte bullet repeated 11 times fired the
     /// stop rung on a direct four-copy match, and the dump printed `cycle: -`

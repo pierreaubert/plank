@@ -474,6 +474,10 @@ function handleServerMsg(f) {
     case "end_line":  mdFlush(); break;
     case "btw_begin": line("[btw]", "dim"); break;
     case "btw_end":   break;
+    case "aside":
+      if (f.role === "answer") { line("[btw]", "dim"); append(f.text); }
+      else append(f.text, f.role === "error" ? "error" : "dim");
+      break;
     case "main_checkpoint": break;
     case "main_rollback": break;
     case "status": {

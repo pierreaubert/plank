@@ -86,6 +86,8 @@ pub type StatusSinkFn = Box<dyn Fn(&str) + Send>;
 /// Mutable state shared by all tools of one agent worker.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ToolContext {
+    /// Owned GUI input; shared with the ask front end without global stdin state.
+    pub(crate) console: std::sync::Arc<crate::console_input::ConsoleInput>,
     /// Working directory relative paths are resolved against.
     pub cwd: PathBuf,
     /// Continuation state for the `more` tool, if a read was truncated.
@@ -366,6 +368,7 @@ impl ToolContext {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
+            console: std::sync::Arc::default(),
             more: None,
             spill: None,
             session_id: String::new(),
@@ -557,12 +560,14 @@ pub(crate) fn precheck_pre_tool_use(
         None,
         &ctx.cwd,
     );
-    let pre = crate::hooks::run_event_args(
+    let pre = crate::hooks::run_event_interruptible(
         &ctx.hooks.pre_tool_use,
         &call.name,
         arg_values,
         &input,
         &ctx.cwd,
+        false,
+        &|| ctx.console.interrupted(),
     );
     ctx.hook_warnings.extend(pre.warnings);
     ctx.hook_warnings.extend(pre.system_messages);
@@ -575,6 +580,12 @@ pub(crate) fn precheck_pre_tool_use(
 
 #[allow(clippy::too_many_lines)]
 pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
+    if ctx.console.interrupted() {
+        return ToolResult::from_output("Tool error: interrupted before dispatch\n".into());
+    }
+    for server in &mut ctx.mcp {
+        server.attach_input(std::sync::Arc::clone(&ctx.console));
+    }
     if call.name.is_empty() {
         return ToolResult::from_output("Tool error: missing tool name\n".to_string());
     }
@@ -649,6 +660,9 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     } else {
         None
     };
+    if ctx.console.interrupted() {
+        return ToolResult::from_output("Tool error: interrupted before dispatch\n".into());
+    }
     let output = match call.name.as_str() {
         "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
         "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
@@ -737,12 +751,14 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             Some(&output),
             &ctx.cwd,
         );
-        let post = crate::hooks::run_event_args(
+        let post = crate::hooks::run_event_interruptible(
             &ctx.hooks.post_tool_use,
             &call.name,
             &arg_values,
             &input,
             &ctx.cwd,
+            false,
+            &|| ctx.console.interrupted(),
         );
         ctx.hook_warnings.extend(post.warnings);
         ctx.hook_warnings.extend(post.system_messages);
@@ -840,12 +856,14 @@ fn fire_post_tool_failure(
         &ctx.cwd,
     );
     let input = format!("{},\"is_interrupt\":false}}", &base[..base.len() - 1]);
-    let fail = crate::hooks::run_event_args(
+    let fail = crate::hooks::run_event_interruptible(
         &ctx.hooks.post_tool_use_failure,
         &call.name,
         arg_values,
         &input,
         &ctx.cwd,
+        false,
+        &|| ctx.console.interrupted(),
     );
     ctx.hook_warnings.extend(fail.warnings);
     ctx.hook_warnings.extend(fail.system_messages);
@@ -1799,6 +1817,60 @@ mod tests {
             "Tool error: empty tool call block\n"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_hook_stop_interrupts_tool_hooks_without_starting_later_hooks() {
+        let _guard = crate::interrupt::test_guard();
+        for phase in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let (mut ctx, cwd) = test_ctx();
+            let remote = crate::remote::control::RemoteState::test_bridge();
+            ctx.console.attach(Some(std::sync::Arc::clone(&remote)));
+            let mut config = serde_json::Map::new();
+            config.insert(
+                phase.into(),
+                serde_json::json!([{"hooks":[
+                    {"type":"command","command":"touch ready; sleep 30","timeout":60},
+                    {"type":"command","command":"touch after"}
+                ]}]),
+            );
+            ctx.hooks = crate::hooks::parse_config(&serde_json::Value::Object(config).to_string());
+            let ready = cwd.join("ready");
+            let setter = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !ready.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let started = ready.exists();
+                remote
+                    .shared
+                    .interrupt
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                started
+            });
+            let started = std::time::Instant::now();
+            let call = if phase == "PostToolUseFailure" {
+                test_call("read", &[("path", "missing")])
+            } else {
+                test_call("write", &[("path", "file.txt"), ("content", "written")])
+            };
+            let result = dispatch(&call, &mut ctx);
+            assert!(setter.join().unwrap(), "{phase} hook started");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert!(!cwd.join("after").exists());
+            assert!(ctx.console.interrupted());
+            if phase == "PreToolUse" {
+                assert!(result.is_error);
+                assert!(!cwd.join("file.txt").exists());
+            }
+            if phase == "PostToolUse" {
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join("file.txt")).unwrap(),
+                    "written"
+                );
+            }
+            std::fs::remove_dir_all(cwd).ok();
+        }
     }
 
     #[test]

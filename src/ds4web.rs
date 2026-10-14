@@ -30,6 +30,8 @@ pub struct WebBrowser {
     // Keeps the home-dir C string alive for the lifetime of `raw`; the C side
     // copies it in `ds4_web_create`, but holding it is harmless and explicit.
     _home: CString,
+    // Keeps the cancellation callback's userdata allocation alive until destroy.
+    _input: Option<std::sync::Arc<crate::console_input::ConsoleInput>>,
 }
 
 // The handle is a plain owned pointer into C state that is only ever touched
@@ -47,6 +49,18 @@ unsafe extern "C" fn always_confirm(
     1
 }
 
+unsafe extern "C" fn web_cancelled(privdata: *mut c_void) -> bool {
+    if crate::interrupt::pending() {
+        return true;
+    }
+    if privdata.is_null() {
+        return false;
+    }
+    // SAFETY: WebBrowser retains the Arc allocation until after ds4_web_free.
+    let input = unsafe { &*privdata.cast::<crate::console_input::ConsoleInput>() };
+    input.interrupted()
+}
+
 impl WebBrowser {
     /// Creates a browser subsystem rooted at `home` (its profile lives under
     /// `<home>/.ds4/browser`). Chrome itself is not spawned until the first
@@ -55,6 +69,20 @@ impl WebBrowser {
     /// # Errors
     /// Returns a message if the C subsystem could not be allocated.
     pub fn new(home: &Path) -> Result<Self, String> {
+        Self::create(home, None)
+    }
+
+    pub(crate) fn with_input(
+        home: &Path,
+        input: std::sync::Arc<crate::console_input::ConsoleInput>,
+    ) -> Result<Self, String> {
+        Self::create(home, Some(input))
+    }
+
+    fn create(
+        home: &Path,
+        input: Option<std::sync::Arc<crate::console_input::ConsoleInput>>,
+    ) -> Result<Self, String> {
         let home_c = CString::new(home.to_string_lossy().as_bytes())
             .map_err(|_| "home path contains a NUL byte".to_string())?;
         let cfg = ffi::Ds4WebConfig {
@@ -64,8 +92,10 @@ impl WebBrowser {
             confirm_privdata: std::ptr::null_mut(),
             log: None,
             log_privdata: std::ptr::null_mut(),
-            cancel: None,
-            cancel_privdata: std::ptr::null_mut(),
+            cancel: Some(web_cancelled),
+            cancel_privdata: input.as_ref().map_or(std::ptr::null_mut(), |input| {
+                std::sync::Arc::as_ptr(input).cast_mut().cast()
+            }),
         };
         // SAFETY: `cfg` is a valid, fully-initialized config; the C side copies
         // the fields it keeps.
@@ -73,7 +103,11 @@ impl WebBrowser {
         if raw.is_null() {
             return Err("failed to initialize the web subsystem".to_string());
         }
-        Ok(Self { raw, _home: home_c })
+        Ok(Self {
+            raw,
+            _home: home_c,
+            _input: input,
+        })
     }
 
     /// Runs a Google search through the live browser, returning the Markdown
@@ -140,6 +174,27 @@ impl Drop for WebBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_web_stop_callback_tracks_the_owning_console_without_consuming_stop() {
+        let _guard = crate::interrupt::test_guard();
+        let (ctx, dir) = crate::tools::test_ctx();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        ctx.console.attach(Some(std::sync::Arc::clone(&remote)));
+        let browser = WebBrowser::with_input(&dir, std::sync::Arc::clone(&ctx.console)).unwrap();
+        let userdata = std::sync::Arc::as_ptr(&ctx.console).cast_mut().cast();
+        // SAFETY: ctx and browser retain the ConsoleInput allocation through both calls.
+        assert!(!unsafe { web_cancelled(userdata) });
+        remote
+            .shared
+            .interrupt
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the same allocation remains alive, and callback reads thread-safe state.
+        assert!(unsafe { web_cancelled(userdata) });
+        assert!(ctx.console.interrupted());
+        drop(browser);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     /// Exercises the FFI linkage and `ds4_web_config` layout: create allocates
     /// the subsystem (Chrome is not spawned until a search/visit), then drop

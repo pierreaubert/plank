@@ -41,6 +41,8 @@ use crate::viz::{RenderSink, StreamRenderer};
 use crate::worker::{self, BroadcastBus, ChannelSink, TurnShared, UiEvent};
 use trace_stream::TerminalSink;
 
+type ConsoleStream = StreamRenderer<worker::MirrorSink<TerminalSink<FlushingStdout>>>;
+
 /// UI-thread state for `--ui-remote` remote control.
 ///
 /// Owns the listener handle, the queue of keys injected by remote clients,
@@ -1198,6 +1200,29 @@ fn pressure_tick(
     stopping
 }
 
+/// Combines console generation stops with the existing memory-pressure hook.
+fn console_generation_stop(
+    sensor: &crate::mempressure::PressureSensor,
+    gate: PressureGate,
+    preflight: &AtomicBool,
+    remote: Option<&RemoteState>,
+) -> bool {
+    // A remote user stop must win over an automatic memory-pressure yield.
+    console_remote_interrupted(remote)
+        || pressure_tick(
+            sensor,
+            gate,
+            preflight.load(Ordering::Relaxed) || crate::interrupt::pending(),
+        )
+}
+
+/// Reads remote cancellation without consuming another front end's signal.
+fn console_remote_interrupted(remote: Option<&RemoteState>) -> bool {
+    remote.is_some_and(|remote| {
+        remote.shared.interrupt.load(Ordering::Relaxed) || remote.shared.prompt_batch_cancelled()
+    })
+}
+
 /// Whether a pressure decision should be acted on now.
 ///
 /// Two suppressions. Before the first turn finishes there is no session worth
@@ -1458,6 +1483,23 @@ fn fanout_slot_result(
     (("agent".to_string(), out), dump)
 }
 
+/// Gives concurrent tasks separate labels without changing their agent definitions.
+fn unique_subagent_labels<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut used = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut label = name.to_owned();
+            let mut suffix = 2;
+            while !used.insert(label.clone()) {
+                label = format!("{name} #{suffix}");
+                suffix += 1;
+            }
+            label
+        })
+        .collect()
+}
+
 /// What a finished serial sub-agent hands back for its `/repro` dump.
 #[derive(Debug, Clone, Copy)]
 struct SubagentDone {
@@ -1633,6 +1675,79 @@ fn remote_lines_gate(frame: Option<bool>, queued: bool) -> RemoteLines {
 /// The dim line a remote controller gets when its queued lines are held
 /// behind an open frame, so a prompt sent from elsewhere does not look lost.
 const REMOTE_WAIT_NOTICE: &str = "waiting for the frame to close";
+
+/// Mirrors reports and non-streaming command acknowledgments to attached clients.
+fn remote_command_output(
+    bus: &crate::worker::BroadcastBus,
+    log: &OutputLog,
+    before: usize,
+    sequence: Option<u64>,
+    report: Option<tui::ReportPanel>,
+) {
+    let (events, _) = bus.scrollback_since(sequence);
+    // A model-generating command already mirrors its output while streaming.
+    let streamed = events.iter().any(|event| {
+        matches!(
+            event.event,
+            UiEvent::Visible(_) | UiEvent::Think(_) | UiEvent::Tool(_) | UiEvent::Plain(_)
+        )
+    });
+    if let Some(report) = report {
+        bus.broadcast(UiEvent::Plain(format!(
+            "{}\n{}",
+            report.title(),
+            report.text()
+        )));
+    }
+    if streamed {
+        return;
+    }
+    let text = log
+        .to_text()
+        .lines
+        .into_iter()
+        .skip(before)
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        bus.broadcast(UiEvent::Plain(text));
+    }
+}
+
+#[cfg(test)]
+mod remote_command_output_tests {
+    use super::{OutputLog, UiEvent, remote_command_output, tui};
+    use crate::worker::BroadcastBus;
+
+    #[test]
+    fn reports_and_static_acknowledgments_cross_the_wire_without_stream_duplicates() {
+        let bus = BroadcastBus::new();
+        let mut log = OutputLog::new();
+        log.push_plain("old transcript");
+        let before = log.line_count();
+        log.push_plain("saved session test");
+        remote_command_output(
+            &bus,
+            &log,
+            before,
+            None,
+            Some(tui::ReportPanel::new("usage", "42 tokens")),
+        );
+        let (events, sequence) = bus.scrollback_since(None);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0].event, UiEvent::Plain(text) if text == "usage\n42 tokens"));
+        assert!(matches!(&events[1].event, UiEvent::Plain(text) if text == "saved session test"));
+        bus.broadcast(UiEvent::Visible("streamed reply".into()));
+        remote_command_output(&bus, &log, before, sequence, None);
+        assert_eq!(bus.scrollback_since(sequence).0.len(), 1);
+    }
+}
 
 /// Whether to broadcast [`REMOTE_WAIT_NOTICE`] now: when the gate holds
 /// lines that are queued, once per wait. `noticed` carries "already said"
@@ -1899,6 +2014,7 @@ fn generate_fanout_round(
     width: usize,
     ctx: &PassCtx<'_>,
     cwd: &std::path::Path,
+    console: &Arc<crate::console_input::ConsoleInput>,
 ) -> Vec<Option<Result<QuietPass, QuietAbort>>> {
     let mut passes: Vec<Option<Result<QuietPass, QuietAbort>>> = Vec::new();
     for (slot_chunk, prep_chunk) in slots.chunks_mut(width).zip(prepared.chunks(width)) {
@@ -1937,6 +2053,8 @@ fn generate_fanout_round(
                 let collected = sink.clone();
                 // `edit_preflight` is not `Clone`, so build one per slot.
                 let preflight = edit_preflight_cwd(cwd, edit_upto_for(slot.engine.as_ref()));
+                let progress =
+                    console.progress(&slot.label, gui_protocol_enabled(), ctx.remote.clone());
                 // Split the slot's two borrows apart explicitly: `engine` is
                 // taken mutably while `mirror` is only read, and destructuring
                 // is what lets the borrow checker see they are disjoint fields.
@@ -1956,6 +2074,7 @@ fn generate_fanout_round(
                             prompt,
                             bufs.as_ref(),
                             ctx,
+                            progress,
                             Box::new(sink),
                             preflight,
                         )
@@ -2365,6 +2484,43 @@ const ANSI_RESET: &str = "\x1b[0m";
 /// way; this constant kills every runtime path: clipboard probing, paste
 /// capture, and attachment injection.
 const IMAGES_ENABLED: bool = cfg!(feature = "images");
+
+/// Applies a cache mutation after checking the requested file's current identity.
+fn mutate_cache_blob(
+    verb: &str,
+    path: &std::path::Path,
+    meta: &crate::kvmeta::KvMeta,
+    expected: &str,
+) -> Result<String, String> {
+    if meta.fingerprint != expected {
+        return Err("cache identity changed; refresh /kvcache".into());
+    }
+    if !path.exists() {
+        return Err("cache entry vanished from disk".into());
+    }
+    // Refresh hits and age as well as identity before changing the sidecar.
+    let mut fresh = crate::kvmeta::load(path).unwrap_or_else(|| meta.clone());
+    if fresh.fingerprint != expected {
+        return Err("cache identity changed; refresh /kvcache".into());
+    }
+    match verb {
+        "rm" => {
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+            let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(path));
+            Ok(format!(
+                "kvcache: removed {} ({})",
+                expected,
+                crate::kvpane::human_bytes(fresh.bytes)
+            ))
+        }
+        verb @ ("pin" | "unpin") => {
+            fresh.pinned = verb == "pin";
+            crate::kvmeta::store(path, &fresh).map_err(|error| error.to_string())?;
+            Ok(format!("kvcache: {verb}ned {expected}"))
+        }
+        _ => Err(format!("unknown cache action {verb:?}")),
+    }
+}
 
 /// Renders the `/mcp` server report following Claude Code's layout: a header
 /// with the server count, then one `name · status · N tools` line each.
@@ -3848,7 +4004,7 @@ impl Agent<'_> {
 
     /// The plain REPL's stream renderer: a colorized stdout sink, configured
     /// exactly as every other pass on this path configures it.
-    fn plain_stream(&mut self) -> StreamRenderer<TerminalSink<FlushingStdout>> {
+    fn plain_stream(&mut self) -> ConsoleStream {
         let sink = TerminalSink::new(TokenRenderer::new(
             FlushingStdout,
             RenderOptions {
@@ -3857,6 +4013,15 @@ impl Agent<'_> {
                 format_markdown: true,
             },
         ));
+        let sink = worker::MirrorSink {
+            inner: sink,
+            bus: self.remote.as_ref().map(|remote| Arc::clone(&remote.bus)),
+            activity: self.subagent_progress().map(|progress| progress.output()),
+            suppress_primary: gui_protocol_enabled()
+                && (self.tool_ctx.subagent_label.is_some() || self.tool_ctx.console.is_aside()),
+            aside: self.tool_ctx.console.is_aside(),
+            gui: gui_protocol_enabled(),
+        };
         let mut stream = StreamRenderer::with_syntax(sink, self.tool_syntax());
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
@@ -3880,14 +4045,7 @@ impl Agent<'_> {
         &mut self,
         prompt_text: &str,
         turn_start: Instant,
-    ) -> Result<
-        (
-            StreamRenderer<TerminalSink<FlushingStdout>>,
-            String,
-            crate::engine::GenerationStats,
-        ),
-        String,
-    > {
+    ) -> Result<(ConsoleStream, String, crate::engine::GenerationStats), String> {
         // See the matching guard in `worker_generate_kind`: the plain REPL has
         // no blinking brain to drive, but the flag is process-global and a
         // remote client attached to this session renders off it.
@@ -3958,65 +4116,66 @@ impl Agent<'_> {
         self.rescue_prefix_before_rebuild(prompt_text);
         // The plain REPL has no `LiveStatus`, so it samples `/toks` itself.
         let mut toks = crate::toks::Sampler::default();
-        let pressure = self.sensor.clone();
-        let gate = self.pressure_gate();
+        let (pressure, gate) = (self.sensor.clone(), self.pressure_gate());
+        let console_remote = self.remote.clone();
+        // Tokenize categories once per pass; live resident counts use status frames.
+        self.publish_metrics("context");
+        let mut gui_live =
+            GuiTelemetry::new(ctx_size, prompt_tokens, think).with_remote(self.remote.clone());
+        gui_live.progress = self.subagent_progress();
+        let gui_bash = &mut self.tool_ctx.bash;
         let result = self.engine.generate(
             prompt,
             &pass_opts,
             &|| {
-                pressure_tick(
-                    &pressure,
-                    gate,
-                    preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-                )
+                console_generation_stop(&pressure, gate, &preflight_stop, console_remote.as_deref())
             },
             &|| greedy.load(Ordering::Relaxed),
-            &mut |ev| match ev {
-                EngineEvent::Text(t) => {
-                    // Model output has started: drop the prefill bar so the
-                    // text streams cleanly from column zero.
-                    bar.clear();
-                    toks.note_token();
-                    assistant_text.push_str(&t);
-                    stream.push(&t);
-                    // Tee the exact bytes the local renderer sees to the
-                    // debug console; a no-op unless showThinking is off
-                    // and a console is connected.
-                    crate::debugmirror::push(&t);
-                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
-                        preflight_stop.store(true, Ordering::Relaxed);
+            &mut |ev| {
+                gui_live.event_with_jobs(&ev, gui_bash);
+                match ev {
+                    EngineEvent::Text(t) => {
+                        // Model output has started: drop the prefill bar so the
+                        // text streams cleanly from column zero.
+                        bar.clear();
+                        toks.note_token();
+                        assistant_text.push_str(&t);
+                        stream.push(&t);
+                        // Tee the exact bytes the local renderer sees to the
+                        // debug console; a no-op unless showThinking is off
+                        // and a console is connected.
+                        crate::debugmirror::push(&t);
+                        if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
+                            preflight_stop.store(true, Ordering::Relaxed);
+                        }
                     }
+                    EngineEvent::Prefill(p) => {
+                        note_prefill_event(&model_name, &p);
+                        bar.show(&Status {
+                            // A finished prefill means the engine is sampling,
+                            // not prefilling. Saying "prefilling" through the
+                            // whole time-to-first-token reads as a hang, and a
+                            // fully cached turn has no further event coming to
+                            // correct it (#64 follow-up).
+                            state: prefill_state(&p),
+                            prefill_done: p.done,
+                            prefill_total: p.total,
+                            prefill_label: verb,
+                            thinking: stream.in_think(),
+                            prefill_tps: p.tps,
+                            elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                            ctx_used: prompt_tokens,
+                            ctx_size,
+                            power_percent: power,
+                            think,
+                            ..Status::default()
+                        });
+                    }
+                    // Notices are a warm-up-only signal, never emitted mid-turn;
+                    // Spec counters reach this front-end's status line through
+                    // `stats` below, since the plain REPL has no live footer.
+                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 }
-                EngineEvent::Prefill(p) => {
-                    note_prefill_event(&model_name, &p);
-                    bar.show(&Status {
-                        // A finished prefill means the engine is sampling,
-                        // not prefilling. Saying "prefilling" through the
-                        // whole time-to-first-token reads as a hang, and a
-                        // fully cached turn has no further event coming to
-                        // correct it (#64 follow-up).
-                        state: if p.is_complete() {
-                            WorkerState::Generating
-                        } else {
-                            WorkerState::Prefill
-                        },
-                        prefill_done: p.done,
-                        prefill_total: p.total,
-                        prefill_label: verb,
-                        thinking: stream.in_think(),
-                        prefill_tps: p.tps,
-                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                        ctx_used: prompt_tokens,
-                        ctx_size,
-                        power_percent: power,
-                        think,
-                        ..Status::default()
-                    });
-                }
-                // Notices are a warm-up-only signal, never emitted mid-turn;
-                // Spec counters reach this front-end's status line through
-                // `stats` below, since the plain REPL has no live footer.
-                EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
             },
         );
         self.note_pressure_stop();
@@ -4061,6 +4220,19 @@ impl Agent<'_> {
     /// for zero behavioral change; the special path only engages when the model
     /// actually delegates.
     fn run_tool_calls(&mut self, calls: &[ToolCall]) -> String {
+        self.tool_ctx.console.attach(self.remote.clone());
+        if !calls.is_empty() && self.tool_ctx.console.interrupted() {
+            let results = calls
+                .iter()
+                .map(|call| {
+                    (
+                        call.name.clone(),
+                        "Tool error: interrupted before dispatch\n".into(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            return format_tool_results(&results);
+        }
         // Charged to whichever engine is driving this turn — during a sidechain
         // that is the alt engine, same rule as the token tally.
         let _tool_clock = ToolClock::start(self.engine.model_name());
@@ -4162,7 +4334,9 @@ impl Agent<'_> {
             self.tool_ctx.edit_previews.clear();
             let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
             for (i, call) in calls.iter().enumerate() {
-                let out = if let crate::guard::Nudge::Block(text) = &nudges[i] {
+                let out = if self.tool_ctx.console.interrupted() {
+                    "Tool error: interrupted before dispatch\n".into()
+                } else if let crate::guard::Nudge::Block(text) = &nudges[i] {
                     format!("Tool error: refused by loop guard — {text}\n")
                 } else if call.name == "agent" {
                     self.run_agent_tool(call)
@@ -4208,7 +4382,9 @@ impl Agent<'_> {
             self.tool_ctx.edit_previews.clear();
             let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
             for call in calls {
-                let out = if let Some(msg) =
+                let out = if self.tool_ctx.console.interrupted() {
+                    "Tool error: interrupted before dispatch\n".into()
+                } else if let Some(msg) =
                     crate::tools::withheld_before_dispatch(&self.tool_ctx.wasm, &call.name)
                 {
                     msg
@@ -4232,6 +4408,10 @@ impl Agent<'_> {
     /// or before it when the model sent it with `suspend_model`. Anything
     /// else returns the dispatch result untouched.
     fn dispatch_tool(&mut self, call: &ToolCall) -> String {
+        self.tool_ctx.console.attach(self.remote.clone());
+        if self.tool_ctx.console.interrupted() {
+            return "Tool error: interrupted before dispatch\n".into();
+        }
         // Asked of the engine generating now, which a sub-agent may have
         // swapped in, like `tool_syntax`.
         self.tool_ctx.edit_upto = edit_upto_for(self.engine.as_ref());
@@ -4683,9 +4863,144 @@ impl Agent<'_> {
     /// sent here lands in the main log *and* on the remote bus, while the
     /// sub-agent variants stay local to the pane.
     fn emit_sub(&self, ev: crate::worker::UiEvent) {
+        if let UiEvent::Sub(inner) = &ev {
+            self.subagent_notice(inner);
+        }
+        self.publish_subagent_event(&ev);
         if let SubSinkTarget::Events(tx) = &self.sub_sink {
             let _ = tx.send(ev);
         }
+    }
+
+    fn subagent_progress(&self) -> Option<crate::console_input::SubagentProgress> {
+        if self.extract_state.is_running() {
+            return None;
+        }
+        let label = self.tool_ctx.subagent_label.as_deref()?;
+        self.tool_ctx
+            .console
+            .progress(label, gui_protocol_enabled(), self.remote.clone())
+    }
+
+    /// Mirrors post-tool notices, leaving generated chunks to their render sink.
+    fn subagent_notice(&self, event: &UiEvent) -> bool {
+        let text = match event {
+            UiEvent::Dim(text) | UiEvent::Markdown(text) | UiEvent::SystemStatus(text) => {
+                text.clone()
+            }
+            UiEvent::EditCard(preview) => preview.to_ansi(false),
+            _ => return false,
+        };
+        let Some(progress) = self.subagent_progress() else {
+            return false;
+        };
+        progress.output().visible_text(&format!("\n{text}\n"));
+        true
+    }
+
+    fn subagent_tool_sink(&self, markdown: bool) -> Option<crate::tools::StatusSinkFn> {
+        let tx = match &self.sub_sink {
+            SubSinkTarget::Events(tx) => Some(tx.clone()),
+            _ => None,
+        };
+        let output = self
+            .subagent_progress()
+            .map(|progress| std::sync::Mutex::new(progress.output()));
+        if tx.is_none() && output.is_none() {
+            return None;
+        }
+        Some(Box::new(move |text: &str| {
+            if let Some(tx) = &tx {
+                let event = if markdown {
+                    UiEvent::Markdown(text.into())
+                } else {
+                    UiEvent::SystemStatus(text.into())
+                };
+                let _ = tx.send(UiEvent::Sub(Box::new(event)));
+            }
+            if let Some(output) = &output
+                && let Ok(mut output) = output.lock()
+            {
+                output.visible_text(&format!("\n{text}\n"));
+            }
+        }))
+    }
+
+    fn emit_subagent_tool_notices(&mut self, calls: &[ToolCall]) {
+        if let Some(line) = self.tool_activity_line(calls) {
+            self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(line))));
+        }
+        for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+            self.emit_sub(UiEvent::Sub(Box::new(UiEvent::EditCard(preview))));
+        }
+        for line in std::mem::take(&mut self.tool_ctx.task_completions) {
+            self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(format!("✓ {line}")))));
+        }
+        for warning in std::mem::take(&mut self.tool_ctx.hook_warnings) {
+            self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(warning))));
+        }
+    }
+
+    fn subagent_tool_batch(&mut self, calls: &[ToolCall], label: &str, task: &str) -> String {
+        let previous_label = self.tool_ctx.subagent_label.replace(label.into());
+        self.emit_sub(UiEvent::SubStart {
+            label: label.into(),
+            task: task.into(),
+        });
+        let previous_sinks = if self.subagent_progress().is_some()
+            || matches!(&self.sub_sink, SubSinkTarget::Events(_))
+        {
+            let previous = (
+                self.tool_ctx.status_sink.take(),
+                self.tool_ctx.markdown_sink.take(),
+            );
+            self.tool_ctx.status_sink = self.subagent_tool_sink(false);
+            self.tool_ctx.markdown_sink = self.subagent_tool_sink(true);
+            Some(previous)
+        } else {
+            None
+        };
+        let observations = self.run_tool_calls(calls);
+        self.sync_tasks_after_dispatch();
+        self.emit_subagent_tool_notices(calls);
+        if let Some((status, markdown)) = previous_sinks {
+            self.tool_ctx.status_sink = status;
+            self.tool_ctx.markdown_sink = markdown;
+        }
+        self.tool_ctx.subagent_label = previous_label;
+        observations
+    }
+
+    fn publish_subagent_event(&self, ev: &crate::worker::UiEvent) {
+        if (gui_protocol_enabled() || self.remote.is_some())
+            && let Some(snapshot) = self.tool_ctx.console.subagent_event(ev)
+        {
+            self.publish_metrics_snapshot(snapshot);
+        }
+    }
+
+    fn publish_subagent_report(&self, label: &str, text: &str) {
+        if (gui_protocol_enabled() || self.remote.is_some())
+            && let Some(snapshot) = self.tool_ctx.console.subagent_report(label, text)
+        {
+            self.publish_metrics_snapshot(snapshot);
+        }
+    }
+
+    fn finish_subagent_activity(&self, label: &str, fork_at: usize, error: Option<&str>) {
+        self.publish_subagent_event(&UiEvent::SubStart {
+            label: label.into(),
+            task: String::new(),
+        });
+        self.publish_subagent_event(&UiEvent::SubEnd);
+        let report =
+            last_assistant_text(self.session.transcript.get(fork_at..).unwrap_or_default())
+                .unwrap_or_else(|| "No final report was produced.".into());
+        let report = error.map_or_else(
+            || report.clone(),
+            |error| format!("Run ended with error: {error}\n\n{report}"),
+        );
+        self.publish_subagent_report(label, &report);
     }
 
     /// Runs the model-invocable `agent` tool: delegates `task` to a fresh scoped
@@ -4783,6 +5098,15 @@ impl Agent<'_> {
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
         let report = self.end_subagent_fork(fork_at, &label, &task, done);
+        match &result {
+            Err(error) => {
+                self.publish_subagent_report(&label, &format!("Subagent failed: {error}"));
+            }
+            Ok(()) => self.publish_subagent_report(
+                &label,
+                report.as_deref().unwrap_or("No final report was produced."),
+            ),
+        }
         if let Err(e) = &result {
             self.note_sidechain_outcome(&format!("failed: {e}"));
         }
@@ -4917,31 +5241,11 @@ impl Agent<'_> {
         // the parent's screen — routed into the pane when there is one, dropped
         // otherwise — and restore the parent's sink on every exit path.
         let parent_sink = self.tool_ctx.status_sink.take();
-        self.tool_ctx.status_sink = match &self.sub_sink {
-            SubSinkTarget::Events(tx) => {
-                let tx = tx.clone();
-                Some(Box::new(move |msg: &str| {
-                    let _ = tx.send(crate::worker::UiEvent::Sub(Box::new(
-                        crate::worker::UiEvent::SystemStatus(msg.to_owned()),
-                    )));
-                }))
-            }
-            SubSinkTarget::Null | SubSinkTarget::Stdout => None,
-        };
+        self.tool_ctx.status_sink = self.subagent_tool_sink(false);
         // The plan a sub-agent puts up follows its status lines into the pane
         // (or nowhere), on the same restore-on-every-exit-path discipline.
         let parent_md = self.tool_ctx.markdown_sink.take();
-        self.tool_ctx.markdown_sink = match &self.sub_sink {
-            SubSinkTarget::Events(tx) => {
-                let tx = tx.clone();
-                Some(Box::new(move |doc: &str| {
-                    let _ = tx.send(crate::worker::UiEvent::Sub(Box::new(
-                        crate::worker::UiEvent::Markdown(doc.to_owned()),
-                    )));
-                }))
-            }
-            SubSinkTarget::Null | SubSinkTarget::Stdout => None,
-        };
+        self.tool_ctx.markdown_sink = self.subagent_tool_sink(true);
         // Its own console window, on the same restore-on-every-exit-path
         // discipline as the status sink above. The guard is scoped to the
         // rounds, so nesting works for free: guards stack LIFO, matching
@@ -5048,18 +5352,7 @@ impl Agent<'_> {
             // the sub-agent pane when there is one (`emit_sub` drops them
             // otherwise), and never onto the parent turn's screen. Without the
             // card the pane's only trace of an edit was the raw streamed markup.
-            if let Some(line) = self.tool_activity_line(&pass.calls) {
-                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(line))));
-            }
-            for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
-                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::EditCard(preview))));
-            }
-            for line in std::mem::take(&mut self.tool_ctx.task_completions) {
-                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(format!("✓ {line}")))));
-            }
-            for warning in std::mem::take(&mut self.tool_ctx.hook_warnings) {
-                self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(warning))));
-            }
+            self.emit_subagent_tool_notices(&pass.calls);
             let images = std::mem::take(&mut self.pending_images);
             self.session.push(
                 Message::user(format!("<tool_result>{observations}</tool_result>"))
@@ -5100,6 +5393,9 @@ impl Agent<'_> {
         _turn_start: Instant,
         live_opts: &crate::engine::GenerationOptions,
     ) -> Result<QuietPass, QuietAbort> {
+        if self.console_remote_interrupted() {
+            return Err(QuietAbort::new(QUIET_ABORT_INTERRUPTED));
+        }
         // A console that appeared since the last pass: pick it up here too, so
         // a sub-agent's window is backfilled with its own slice.
         let reconciled = crate::debugmirror::reconcile();
@@ -5111,6 +5407,7 @@ impl Agent<'_> {
             .then(|| self.build_structured_for(&recovery_session(&self.session), prompt_text));
         let ctx = PassCtx {
             opts: live_opts,
+            remote: self.remote.clone(),
             think_off: matches!(live_opts.think_mode, crate::engine::ThinkMode::Off),
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
@@ -5135,11 +5432,13 @@ impl Agent<'_> {
         // recovery pass after a reasoning-cycle stop, whose stubbed `<think>`
         // block diverges from the KV the stopped pass left behind.
         self.rescue_prefix_before_rebuild(prompt_text);
+        let progress = self.subagent_progress();
         let pass = generate_pass(
             self.engine.as_mut(),
             prompt_text,
             bufs.as_ref(),
             &ctx,
+            progress,
             sink,
             preflight,
         )?;
@@ -5188,6 +5487,7 @@ impl Agent<'_> {
         match &self.sub_sink {
             SubSinkTarget::Null => Box::new(NullSink),
             SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
+            SubSinkTarget::Stdout if gui_protocol_enabled() => Box::new(NullSink),
             SubSinkTarget::Stdout => Box::new(TerminalSink::new(TokenRenderer::new(
                 FlushingStdout,
                 RenderOptions {
@@ -5230,6 +5530,21 @@ struct QuietAbort {
 }
 
 impl QuietAbort {
+    fn from_engine(
+        error: &crate::engine::EngineError,
+        partial: String,
+        remote: Option<&RemoteState>,
+    ) -> Self {
+        Self {
+            error: if console_remote_interrupted(remote) {
+                QUIET_ABORT_INTERRUPTED.into()
+            } else {
+                error.to_string()
+            },
+            partial,
+        }
+    }
+
     fn new(error: impl Into<String>) -> Self {
         Self {
             error: error.into(),
@@ -5242,6 +5557,8 @@ impl QuietAbort {
 /// the pass itself borrows nothing from `self` and can run on a spawned thread.
 struct PassCtx<'a> {
     opts: &'a crate::engine::GenerationOptions,
+    /// Shared with all passes; read without clearing the controller's stop.
+    remote: Option<Arc<RemoteState>>,
     think_off: bool,
     thinking_tool_calls: bool,
     /// What the pass's renderer shows, read on the main thread like the other
@@ -5412,6 +5729,7 @@ struct LiveStatus {
     /// Prompt tokens already in context; generated tokens add onto this so the
     /// ctx gauge moves while the model streams.
     prompt_tokens: i32,
+    metrics_last: Option<Instant>,
     gen_count: i32,
     /// The first token out and the count then, so the live decode rate is
     /// measured over the decode phase alone (`crate::engine::rate_since`).
@@ -5450,6 +5768,7 @@ impl LiveStatus {
     ) -> Self {
         Self {
             prompt_tokens,
+            metrics_last: None,
             gen_count: 0,
             gen_mark: None,
             toks: crate::toks::Sampler::default(),
@@ -5466,6 +5785,28 @@ impl LiveStatus {
             running_jobs,
             memory_pass: false,
             memory_queue: 0,
+        }
+    }
+
+    /// Samples process-wide speed rings at most once per second.
+    fn speed_snapshot(&mut self) -> Option<crate::remote::control::MetricsWire> {
+        if self
+            .metrics_last
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return None;
+        }
+        self.metrics_last = Some(Instant::now());
+        Some(crate::remote::control::MetricsWire::Throughput {
+            generation: crate::toks::snapshot(),
+            prefill: crate::toks::prefill_snapshot(),
+        })
+    }
+
+    fn publish_status(&mut self, status: Status, tx: &Sender<UiEvent>) {
+        let _ = tx.send(UiEvent::Status(status));
+        if let Some(snapshot) = self.speed_snapshot() {
+            let _ = tx.send(UiEvent::Metrics(snapshot));
         }
     }
 
@@ -5560,16 +5901,20 @@ fn generate_pass(
     prompt_text: &str,
     bufs: Option<&StructuredBufs>,
     ctx: &PassCtx<'_>,
+    mut progress: Option<crate::console_input::SubagentProgress>,
     sink: Box<dyn crate::viz::RenderSink + Send>,
     preflight: impl FnMut(&ToolCall) -> Result<(), String> + 'static,
 ) -> Result<QuietPass, QuietAbort> {
+    if console_remote_interrupted(ctx.remote.as_deref()) {
+        return Err(QuietAbort::new(QUIET_ABORT_INTERRUPTED));
+    }
     // Held for the whole pass, so the status bar's brain blinks while *this*
     // engine works — and stops when the pass ends, however it ends. A sidechain
     // on a `provider: local` definition swaps the engine before getting here, so
     // this reports the engine actually generating rather than the session's.
     let _local = engine.is_local().then(crate::status::LocalPass::begin);
     let mut stream = StreamRenderer::with_syntax(
-        sink,
+        crate::console_input::output::mirror_sink(sink, progress.as_ref()),
         crate::sysprompt::ToolSyntax::for_model_name(&engine.model_name()),
     );
     stream.set_freeze_on_error(true);
@@ -5622,9 +5967,14 @@ fn generate_pass(
     let stats = engine.generate(
         prompt,
         ctx.opts,
-        &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+        &|| {
+            preflight_stop.load(Ordering::Relaxed)
+                || crate::interrupt::pending()
+                || console_remote_interrupted(ctx.remote.as_deref())
+        },
         &|| greedy.load(Ordering::Relaxed),
         &mut |ev| {
+            crate::console_input::note_subagent_progress(&mut progress, &ev);
             if let EngineEvent::Text(t) = &ev {
                 assistant_text.push_str(t);
                 stream.push(t);
@@ -5644,22 +5994,29 @@ fn generate_pass(
                     repeat.repeating(),
                 )
             {
-                let _ = sc.tx.send(UiEvent::Status(status));
+                live.publish_status(status, &sc.tx);
             }
         },
     );
     let stats = match stats {
         Ok(stats) => stats,
         Err(e) => {
-            return Err(QuietAbort {
-                error: e.to_string(),
-                partial: assistant_text,
-            });
+            return Err(QuietAbort::from_engine(
+                &e,
+                assistant_text,
+                ctx.remote.as_deref(),
+            ));
         }
     };
     stream.finish();
     crate::debugmirror::flush();
-    finish_quiet_pass(&stream, assistant_text, stats, repeat.snapshot())
+    finish_quiet_pass(
+        &stream,
+        assistant_text,
+        stats,
+        repeat.snapshot(),
+        console_remote_interrupted(ctx.remote.as_deref()),
+    )
 }
 
 /// Shapes a finished quiet pass into what the sub-agent loops act on: an
@@ -5685,7 +6042,14 @@ fn finish_quiet_pass<S: RenderSink>(
     mut assistant_text: String,
     stats: crate::engine::GenerationStats,
     guard: crate::insights::GuardSnapshot,
+    remote_interrupted: bool,
 ) -> Result<QuietPass, QuietAbort> {
+    if remote_interrupted {
+        return Err(QuietAbort {
+            error: QUIET_ABORT_INTERRUPTED.into(),
+            partial: assistant_text,
+        });
+    }
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stopped_by_user(
         stats.interrupted,
@@ -5744,6 +6108,10 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
+        if self.console_remote_interrupted() {
+            self.last_turn_interrupted = true;
+            return Ok(());
+        }
         self.refuse_oversized_prompt()?;
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
@@ -5855,7 +6223,7 @@ impl Agent<'_> {
             let finished = stream.finished();
             let real_interrupt = stopped_by_user(
                 stats.interrupted,
-                crate::interrupt::pending(),
+                crate::interrupt::pending() || self.console_remote_interrupted(),
                 stream.tool_stanza_complete(),
             ) && preflight_error.is_none();
             if cut_calls < MAX_CUT_TOOL_CALLS
@@ -6023,7 +6391,7 @@ impl Agent<'_> {
             };
             if real_interrupt {
                 crate::interrupt::clear();
-                let mut renderer = stream.into_sink().into_renderer();
+                let mut renderer = stream.into_sink().inner.into_renderer();
                 renderer.finish();
                 if !renderer.last_output_newline() {
                     println!();
@@ -6073,10 +6441,14 @@ impl Agent<'_> {
                 let calls = finished.calls.to_vec();
                 let observations = self.run_tool_calls(&calls);
                 self.sync_tasks_after_dispatch();
-                let mut renderer = stream.into_sink().into_renderer();
+                self.publish_console_tasks();
+                let mut renderer = stream.into_sink().inner.into_renderer();
                 renderer.finish();
                 if let Some(line) = self.tool_activity_line(&calls) {
-                    println!("{}", self.debug_line(&line));
+                    let captured = self.subagent_notice(&UiEvent::Dim(line.clone()));
+                    if !(captured && gui_protocol_enabled()) {
+                        println!("{}", self.debug_line(&line));
+                    }
                 }
                 // `last_written` is set by `write` and `edit` only after the
                 // file operation succeeds, and `touched_tree` only when an
@@ -6094,12 +6466,24 @@ impl Agent<'_> {
                     self.tool_ctx.last_written.take(),
                 );
                 for preview in previews {
-                    print!("{}", preview.to_ansi(self.color));
+                    let captured = self.subagent_notice(&UiEvent::EditCard(preview.clone()));
+                    if !(captured && gui_protocol_enabled()) {
+                        print!("{}", preview.to_ansi(self.color));
+                    }
                 }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
-                    println!("{}", self.debug_line(&format!("✓ {line}")));
+                    let captured = self.subagent_notice(&UiEvent::Dim(format!("✓ {line}")));
+                    if !(captured && gui_protocol_enabled()) {
+                        println!("{}", self.debug_line(&format!("✓ {line}")));
+                    }
                 }
-                for warning in self.tool_ctx.hook_warnings.drain(..) {
+                gui_tasks(&self.session);
+                gui_jobs(&self.tool_ctx.bash.rows());
+                for warning in std::mem::take(&mut self.tool_ctx.hook_warnings) {
+                    let captured = self.subagent_notice(&UiEvent::Dim(warning.clone()));
+                    if captured && gui_protocol_enabled() {
+                        continue;
+                    }
                     let line = if self.color {
                         format!("\x1b[38;5;238m{warning}{ANSI_RESET}")
                     } else {
@@ -6118,7 +6502,10 @@ impl Agent<'_> {
                 );
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    println!("{}", self.debug_line(&format!("halted: {reason}")));
+                    let captured = self.subagent_notice(&UiEvent::Dim(format!("halted: {reason}")));
+                    if !(captured && gui_protocol_enabled()) {
+                        println!("{}", self.debug_line(&format!("halted: {reason}")));
+                    }
                     return Ok(());
                 }
                 if self.loop_guard.tripped() {
@@ -6141,7 +6528,7 @@ impl Agent<'_> {
                 self.print_job_wake(woke);
                 continue;
             }
-            let mut renderer = stream.into_sink().into_renderer();
+            let mut renderer = stream.into_sink().inner.into_renderer();
             renderer.finish();
             if !renderer.last_output_newline() {
                 println!();
@@ -6297,6 +6684,7 @@ impl Agent<'_> {
             if let Some(g) = self.session.goal.as_mut() {
                 g.iter = iter;
             }
+            gui_tasks(&self.session);
             println!("{}", self.debug_line(&crate::goal::banner(iter, max)));
             self.run_turn()?;
             if self.last_turn_interrupted || crate::interrupt::pending() {
@@ -6343,8 +6731,7 @@ impl Agent<'_> {
             return None;
         }
         let input = crate::hooks::tool_event_input("Stop", "", "{}", None, &self.tool_ctx.cwd);
-        let out =
-            crate::hooks::run_event(&self.tool_ctx.hooks.stop, "", &input, &self.tool_ctx.cwd);
+        let out = self.run_hook_event(&self.tool_ctx.hooks.stop, "", &input, false);
         for w in out.warnings.into_iter().chain(out.system_messages) {
             warn(w);
         }
@@ -6356,6 +6743,24 @@ impl Agent<'_> {
         // A Stop `prompt` hook's text is fed to the model just like exit-2
         // feedback, so a prompt hook can steer the model to keep working.
         out.block.or(out.context)
+    }
+
+    fn run_hook_event(
+        &self,
+        groups: &[crate::hooks::HookMatcher],
+        target: &str,
+        input: &str,
+        capture_context: bool,
+    ) -> crate::hooks::HookOutcome {
+        crate::hooks::run_event_interruptible(
+            groups,
+            target,
+            &[],
+            input,
+            &self.tool_ctx.cwd,
+            capture_context,
+            &|| crate::interrupt::pending() || self.console_remote_interrupted(),
+        )
     }
 
     /// Fires the `UserPromptSubmit` hooks for the turn's triggering prompt (the
@@ -6382,12 +6787,8 @@ impl Agent<'_> {
                 &[("prompt", &prompt)],
                 &self.tool_ctx.cwd,
             );
-            let out = crate::hooks::run_event_ctx(
-                &self.tool_ctx.hooks.user_prompt_submit,
-                "",
-                &input,
-                &self.tool_ctx.cwd,
-            );
+            let out =
+                self.run_hook_event(&self.tool_ctx.hooks.user_prompt_submit, "", &input, true);
             for w in out.warnings.into_iter().chain(out.system_messages) {
                 warn(w);
             }
@@ -6454,12 +6855,7 @@ impl Agent<'_> {
             &[("source", source)],
             &self.tool_ctx.cwd,
         );
-        let out = crate::hooks::run_event_ctx(
-            &self.tool_ctx.hooks.session_start,
-            source,
-            &input,
-            &self.tool_ctx.cwd,
-        );
+        let out = self.run_hook_event(&self.tool_ctx.hooks.session_start, source, &input, true);
         for w in out.warnings.into_iter().chain(out.system_messages) {
             warn(w);
         }
@@ -6573,12 +6969,7 @@ impl Agent<'_> {
             &[("reason", reason)],
             &self.tool_ctx.cwd,
         );
-        let out = crate::hooks::run_event(
-            &self.tool_ctx.hooks.session_end,
-            reason,
-            &input,
-            &self.tool_ctx.cwd,
-        );
+        let out = self.run_hook_event(&self.tool_ctx.hooks.session_end, reason, &input, false);
         for w in out
             .warnings
             .into_iter()
@@ -7061,12 +7452,7 @@ impl Agent<'_> {
             &[("trigger", trigger)],
             &self.tool_ctx.cwd,
         );
-        let out = crate::hooks::run_event_ctx(
-            &self.tool_ctx.hooks.pre_compact,
-            trigger,
-            &input,
-            &self.tool_ctx.cwd,
-        );
+        let out = self.run_hook_event(&self.tool_ctx.hooks.pre_compact, trigger, &input, true);
         for w in out.warnings.into_iter().chain(out.system_messages) {
             note(w);
         }
@@ -7097,12 +7483,7 @@ impl Agent<'_> {
             &[("trigger", trigger), ("summary", summary)],
             &self.tool_ctx.cwd,
         );
-        let out = crate::hooks::run_event_ctx(
-            &self.tool_ctx.hooks.post_compact,
-            trigger,
-            &input,
-            &self.tool_ctx.cwd,
-        );
+        let out = self.run_hook_event(&self.tool_ctx.hooks.post_compact, trigger, &input, true);
         for w in out.warnings.into_iter().chain(out.system_messages) {
             note(w);
         }
@@ -7506,6 +7887,15 @@ impl Agent<'_> {
                 prefill: u64::try_from(input.max(0)).unwrap_or(0),
                 generated: u64::try_from(output.max(0)).unwrap_or(0),
             });
+        } else if let Some(label) = &self.tool_ctx.subagent_label {
+            // Explicit /subagent turns credit their own passes, excluding child
+            // delegations and the parent's continuation. Completion never adds
+            // the same token totals a second time.
+            self.publish_subagent_event(&UiEvent::SubTokens {
+                label: Some(label.clone()),
+                prefill: u64::try_from(input.max(0)).unwrap_or(0),
+                generated: u64::try_from(output.max(0)).unwrap_or(0),
+            });
         }
     }
 
@@ -7563,6 +7953,10 @@ impl Agent<'_> {
             now_secs(),
             crate::insights::local_utc_offset(),
         );
+        let snapshot = crate::remote::control::MetricsWire::Activity {
+            snapshot: stats.activity_snapshot(scope),
+        };
+        self.publish_metrics_snapshot(snapshot);
         Ok(crate::stats::render(&stats, scope, color, hint))
     }
 
@@ -7804,7 +8198,6 @@ impl Agent<'_> {
         // ... and a new log deserves a fresh alphabet: the next unnamed
         // sub-agent is `alpha` again.
         self.unnamed_subagents = 0;
-        self.broadcast_session_reset(None);
         self.reminder = SystemPromptReminder::new();
         // Same merged roster the launch path advertises, so /clear
         // cannot silently drop plugin-contributed agents from it.
@@ -7816,6 +8209,7 @@ impl Agent<'_> {
         self.last_ctx_used = 0;
         self.checkpoints.clear();
         self.usage = SessionUsage::default();
+        self.broadcast_session_reset(None);
     }
 
     /// Plain-REPL `/clear`: reset the session and reinstate the warm prefix.
@@ -8018,9 +8412,686 @@ impl Agent<'_> {
         log.push_plain("started a new session");
     }
 
+    /// Describes the commands loaded by this engine without exposing credentials.
+    fn gui_control_requirement(&self, name: &str) -> Option<&'static str> {
+        match name {
+            "/mtp" if !self.engine.spec_capable() => {
+                Some("Enabling requires a loaded draft model; status and off still work.")
+            }
+            "/steer" if self.engine.steering_ffn().is_none() => {
+                Some("No steering vector is currently loaded.")
+            }
+            "/frame" if !cfg!(feature = "plugins") => {
+                Some("This engine build does not include the WASM runtime.")
+            }
+            "/frame" => Some("Interactive frames currently require the engine's terminal UI."),
+            "/buddy" => Some("Buddy animation lives in the engine's terminal UI."),
+            "/remote-control" | "/rc" if gui_protocol_enabled() => {
+                Some("Starting a host currently requires Plank's terminal UI; status still works.")
+            }
+            "/grant" if self.remote.is_none() => Some("No remote-control server is running."),
+            "/resume" | "/kvcache" if self.remote.is_some() => {
+                Some("Remote clients must supply an argument instead of opening the host pane.")
+            }
+            _ => None,
+        }
+    }
+
+    fn gui_controls(&self) -> serde_json::Value {
+        let catalog = crate::slashmenu::catalog(
+            &self.skills,
+            &self.templates,
+            &self.tool_ctx.wasm.registry.commands(),
+        );
+        let mut commands = catalog.iter().map(|command| serde_json::json!({
+            "name": command.name, "args": command.args, "description": command.desc,
+            "source": if command.source.tag().is_empty() { "builtin" } else { command.source.tag() },
+            "requirement": if command.source.tag().is_empty() { self.gui_control_requirement(&command.name) } else { None },
+            "parameters": self.templates.iter().find(|template| command.source.tag() == "template" && command.name == format!("/{}", template.name))
+                .map(|template| crate::templates::variables(&template.body))
+                .filter(|parameters| parameters.len() <= 32 && parameters.iter().all(|name| name.len() <= 64)),
+        })).collect::<Vec<_>>();
+        for agent in &self.agents {
+            let name = format!("/subagent:{}", agent.name);
+            if !commands.iter().any(|command| command["name"] == name) {
+                commands.push(serde_json::json!({"name": name, "args": "<task>", "description": agent.description, "source": "agent"}));
+            }
+        }
+        let features: Vec<_> = [
+            ("wasm", "WASM runtime", cfg!(feature = "plugins"), "Compiled support for WASM plugin components."),
+            ("terminal_editor", "Terminal editor", cfg!(feature = "builtin_editor"), "Compiled terminal editor; GUI text editing uses its own bridge."),
+            ("documents", "Document parsing", cfg!(feature = "docparse"), "Compiled document extraction support."),
+            ("images", "Image attachments", cfg!(feature = "images"), "Compiled image attachment support; model vision is a separate capability."),
+            ("speculation", "Draft model", self.engine.spec_capable(), "A loaded engine can perform speculative decoding."),
+            ("steering", "Steering vector", self.engine.steering_ffn().is_some(), "A steering vector is currently loaded."),
+            ("vision", "Model vision", self.engine.has_vision(), "The loaded backend accepts image embeddings; attachment build support is separate."),
+            ("structured", "Structured conversations", self.engine.wants_structured(), "The backend accepts structured messages and tool schemas instead of only a flat transcript."),
+            ("aside", "Tool-free asides", self.engine.supports_aside(), "The backend implements its tool-free aside method; other front-end fallback paths are separate."),
+            ("forked_aside", "Forked asides", self.engine.supports_forked_aside(), "A side answer can run on a fork without modifying the main engine session."),
+            ("multiplexing", "Interleaved generation", self.engine.supports_multiplexing(), "The backend can interleave independent generation streams; this is separate from parallel agent dispatch."),
+            ("decisions", "Probabilistic decisions", self.engine.supports_decide(), "The loaded backend can answer System-1 questions from answer-letter probabilities."),
+            ("gpu_release", "GPU release", self.engine.can_release_gpu(), "Dropping the current engine can free its exclusive GPU resources."),
+            ("gpu_restore", "GPU suspend and restore", self.engine.can_release_gpu() && self.gpu_yield.reopen.is_some(), "The agent has both releasable GPU ownership and a launch recipe for reopening the model."),
+            ("exact_kv", "Exact KV truncation", self.engine.kv_truncates_exactly(), "The engine can reconcile an earlier token prefix without requiring a fork snapshot."),
+            ("parallel_backend", "Concurrent backend sessions", self.engine.max_parallel() > 1, "The current backend permits concurrent sessions; configured budgets and subagent engine choices still apply."),
+            ("local_inference", "Local model execution", self.engine.is_local(), "The current engine executes local model weights rather than delegating inference to another host."),
+        ].into_iter().map(|(name, label, available, detail)| serde_json::json!({"name":name, "label":label, "available":available, "detail":detail})).collect();
+        serde_json::json!({"version": 1, "commands": commands, "features":features, "settings": {
+            "model": self.engine.model_name(),
+            "temperature": self.gen_opts.temperature,
+            "power_percent": self.power_percent,
+            "speculative": self.mtp_on(),
+            "speculation_available": self.engine.spec_capable(),
+            "micro_compaction": crate::settings::active().context.microcompact,
+            "loop_guard": crate::settings::loop_guards_effective(),
+            "steering": self.engine.steering_ffn(),
+        }})
+    }
+
+    fn publish_saved_sessions<'a>(
+        &self,
+        entries: &'a [crate::session::SessionEntry],
+        arg: &str,
+    ) -> &'a [crate::session::SessionEntry] {
+        let snapshot =
+            crate::remote::control::SessionsWire::capture(entries, arg.parse().unwrap_or(1));
+        self.tool_ctx.console.set_saved_page(snapshot.page);
+        let start = (snapshot.page - 1) * 64;
+        let end = (start + 64).min(entries.len());
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"sessions", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Sessions(snapshot));
+        }
+        if arg.is_empty() {
+            entries
+        } else {
+            &entries[start..end]
+        }
+    }
+
+    /// Refreshes an opened saved-session monitor without injecting a command.
+    fn refresh_saved_sessions(&self) {
+        if (!gui_protocol_enabled() && self.remote.is_none()) || self.in_sidechain() {
+            return;
+        }
+        let Some(page) = self.tool_ctx.console.saved_page() else {
+            return;
+        };
+        match self.store.list() {
+            Ok(entries) => {
+                self.publish_saved_sessions(&entries, &page.to_string());
+            }
+            Err(error) => {
+                let message = format!("Saved-session refresh failed: {error}");
+                if gui_protocol_enabled() {
+                    eprintln!("{message}");
+                }
+                if let Some(remote) = &self.remote {
+                    remote.bus.broadcast(UiEvent::Dim(message));
+                }
+            }
+        }
+    }
+
+    fn history_snapshot(
+        &self,
+        checkpoints: bool,
+        requested_page: usize,
+    ) -> crate::remote::control::HistoryWire {
+        use crate::remote::control::{HistoryRowWire, HistoryWire};
+        let clip = |text: &str, limit: usize| {
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_owned()
+        };
+        let tree = (!checkpoints).then(|| self.session.tree());
+        let points = tree
+            .as_ref()
+            .map(crate::branch::BranchTree::fork_points)
+            .unwrap_or_default();
+        let total = if checkpoints {
+            self.checkpoints.len()
+        } else {
+            points.len()
+        };
+        let page = requested_page.clamp(1, total.div_ceil(32).max(1));
+        let start = (page - 1) * 32;
+        let rows = if checkpoints {
+            self.checkpoints
+                .list()
+                .iter()
+                .skip(start)
+                .take(32)
+                .map(|checkpoint| HistoryRowWire {
+                    key: (!checkpoint.name.is_empty()
+                        && checkpoint.name.trim() == checkpoint.name
+                        && checkpoint.name.len() <= 4096
+                        && !checkpoint.name.chars().any(char::is_control))
+                    .then(|| checkpoint.name.clone()),
+                    label: clip(&checkpoint.name, 256),
+                    detail: format!(
+                        "{} · {} messages{}",
+                        clip(&checkpoint.summary, 512),
+                        checkpoint.transcript.len(),
+                        if checkpoint.kv.is_some() {
+                            " · engine cache"
+                        } else {
+                            ""
+                        }
+                    ),
+                })
+                .collect()
+        } else {
+            points
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(32)
+                .map(|(index, node)| {
+                    let summary = tree
+                        .as_ref()
+                        .and_then(|tree| tree.node(*node))
+                        .map_or("", |node| node.message.text.as_str());
+                    HistoryRowWire {
+                        key: Some((index + 1).to_string()),
+                        label: format!("Point {}", index + 1),
+                        detail: clip(summary, 512),
+                    }
+                })
+                .collect()
+        };
+        let mut report = tree
+            .as_ref()
+            .map(|tree| crate::branch::render_tree(tree, false))
+            .unwrap_or_default();
+        // Keeps worst-case JSON escaping within the client's 2 MiB frame ceiling.
+        if report.len() > 128 * 1024 {
+            report = clip(&report, 128 * 1024);
+            report.push_str("\nTree truncated; use /tree for the complete report.");
+        }
+        HistoryWire {
+            kind: if checkpoints { "checkpoints" } else { "forks" }.into(),
+            total,
+            page,
+            rows,
+            report,
+        }
+    }
+
+    fn extensions_snapshot(&self, kind: &str) -> Option<crate::remote::control::ExtensionsWire> {
+        let (report, enabled) = match kind {
+            "plugins" => (
+                format!(
+                    "{}{}",
+                    crate::plugins::render_list(&self.tool_ctx.plugins),
+                    crate::wasmreg::render_held(&self.tool_ctx.wasm.registry)
+                ),
+                None,
+            ),
+            "skills" => (
+                crate::skills::render_list(&self.skills),
+                Some(crate::skills::enabled()),
+            ),
+            "templates" => (crate::templates::render_list(&self.templates), None),
+            "hooks" => (
+                crate::hooks::render_list(&self.tool_ctx.hooks),
+                Some(crate::hooks::enabled()),
+            ),
+            "mcp" => {
+                use std::fmt::Write as _;
+                let mut report = render_mcp_report(&self.tool_ctx.mcp, false);
+                for server in &self.tool_ctx.mcp {
+                    for tool in &server.tools {
+                        let _ = writeln!(
+                            report,
+                            "  {} / {} · {}",
+                            server.name, tool.name, tool.description
+                        );
+                    }
+                }
+                (report, None)
+            }
+            "agents" => (crate::agents::render_list(&self.agents), None),
+            _ => return None,
+        };
+        Some(crate::remote::control::ExtensionsWire::capture(
+            kind, &report, enabled,
+        ))
+    }
+
+    fn publish_extensions(&self, kind: &str) {
+        // Inventory is requested explicitly, never scanned by idle catalog polling.
+        if !gui_protocol_enabled() && self.remote.is_none() {
+            return;
+        }
+        let Some(snapshot) = self.extensions_snapshot(kind) else {
+            return;
+        };
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"extensions", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Extensions(snapshot));
+        }
+    }
+
+    fn publish_history(&self, checkpoints: bool, page: usize) {
+        if (!gui_protocol_enabled() && self.remote.is_none()) || self.in_sidechain() {
+            return;
+        }
+        let snapshot = self.history_snapshot(checkpoints, page);
+        self.tool_ctx
+            .console
+            .set_history_page(checkpoints, snapshot.page);
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"history", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::History(snapshot));
+        }
+    }
+
+    /// Refreshes only history categories previously opened by a client.
+    fn refresh_history(&self) {
+        if (!gui_protocol_enabled() && self.remote.is_none()) || self.in_sidechain() {
+            return;
+        }
+        for checkpoints in [true, false] {
+            if let Some(page) = self.tool_ctx.console.history_page(checkpoints) {
+                self.publish_history(checkpoints, page);
+            }
+        }
+    }
+
+    /// Preserves an opened category's page while making a new mutation visible.
+    fn publish_history_change(&self, checkpoints: bool, default_page: usize) {
+        self.publish_history(
+            checkpoints,
+            self.tool_ctx
+                .console
+                .history_page(checkpoints)
+                .unwrap_or(default_page),
+        );
+    }
+
+    fn config_snapshot(
+        &self,
+        page: usize,
+        key: Option<&str>,
+    ) -> crate::remote::control::ConfigWire {
+        Self::config_snapshot_with_options(
+            page,
+            key,
+            &self.tool_ctx.wasm.registry.declared_config(),
+        )
+    }
+
+    fn config_snapshot_with_options(
+        page: usize,
+        key: Option<&str>,
+        declared: &[(String, crate::wasmreg::ConfigOption)],
+    ) -> crate::remote::control::ConfigWire {
+        use crate::remote::control::{ConfigFieldWire, ConfigWire};
+        let settings = crate::settings::active();
+        let mut fields: Vec<_> = crate::configform::FIELDS
+            .iter()
+            .map(|field| {
+                let shown = crate::configform::display(settings, field.id);
+                ConfigFieldWire {
+                    path: format!("{}.{}", field.section, field.key),
+                    label: field.label.into(),
+                    value: match shown.as_str() {
+                        "(unset)" => String::new(),
+                        "(default)" => "default".to_owned(),
+                        _ => shown,
+                    },
+                    hint: match field.id {
+                        crate::configform::FieldId::UiNotifications => "always, unfocused or never",
+                        crate::configform::FieldId::UiScreensaver => "duration or off",
+                        crate::configform::FieldId::UiScreensaverFace => {
+                            "matrix, starfield, minions, random or plugin:face"
+                        }
+                        _ => match field.kind {
+                            crate::configform::Kind::Bool => "true or false",
+                            crate::configform::Kind::Tri => "default, true or false",
+                            crate::configform::Kind::Count => "whole number",
+                            crate::configform::Kind::OptInt => "whole number; empty clears",
+                            crate::configform::Kind::OptText => "text; empty clears",
+                        },
+                    }
+                    .to_owned(),
+                    editable: true,
+                }
+            })
+            .collect();
+        for (id, option) in declared {
+            let path = format!("{id}.{}", option.name);
+            let value = settings
+                .plugin_config
+                .get(&path)
+                .filter(|value| option.accepts(value))
+                .cloned()
+                .unwrap_or_else(|| option.default.clone());
+            fields.push(ConfigFieldWire {
+                path: format!("pluginConfig.{path}"),
+                label: option.name.clone(),
+                value,
+                hint: match &option.kind {
+                    crate::wasmreg::ConfigKind::Enum(values) => values.join(", "),
+                    crate::wasmreg::ConfigKind::Bool => "true or false".to_owned(),
+                    crate::wasmreg::ConfigKind::Int { min, max } => format!("{min}..{max}"),
+                    crate::wasmreg::ConfigKind::Text => "text".to_owned(),
+                },
+                editable: true,
+            });
+        }
+        let pages = fields.len().div_ceil(32).max(1);
+        let page = key
+            .and_then(|key| fields.iter().position(|field| field.path == key))
+            .map_or(page, |index| index / 32 + 1)
+            .clamp(1, pages);
+        let total = fields.len();
+        let mut fields: Vec<_> = fields.into_iter().skip((page - 1) * 32).take(32).collect();
+        for field in &mut fields {
+            field.editable = field.value.len() <= 4096;
+            for (text, limit) in [
+                (&mut field.value, 4096),
+                (&mut field.label, 256),
+                (&mut field.hint, 256),
+            ] {
+                if text.len() > limit {
+                    let mut end = limit;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
+            }
+        }
+        ConfigWire {
+            total,
+            page,
+            fields,
+        }
+    }
+
+    fn publish_config(&self, page: usize, key: Option<&str>) {
+        let snapshot = self.config_snapshot(page, key);
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"config", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Config(snapshot));
+        }
+    }
+
+    /// Dispatches console input without interpreting control commands as prompts.
+    fn console_input(&mut self, input: &str) -> Result<bool, String> {
+        self.tool_ctx.console.attach(self.remote.clone());
+        if !self.turn_from_remote
+            && console_input_claims_control(input)
+            && let Some(remote) = &self.remote
+        {
+            let mut policy = remote
+                .control
+                .lock()
+                .map_err(|_| "control policy poisoned")?;
+            policy.local_input();
+            remote.shared.interrupt.store(false, Ordering::Relaxed);
+            // Ingress takes policy before queue, so a previous controller cannot
+            // enqueue between local takeover and detaching its waiting inputs.
+            let rejected = remote.shared.take_remote_requests();
+            drop(policy);
+            for (id, text) in rejected {
+                remote.reject_input(&id, &text);
+            }
+            self.publish_host();
+        }
+        let result = if input.trim_start().starts_with('/') {
+            self.slash(input.trim())
+        } else {
+            if !self.turn_from_remote
+                && let Some(remote) = &self.remote
+            {
+                remote
+                    .bus
+                    .broadcast(UiEvent::UserEcho(input.trim_end().into()));
+            }
+            self.session.push(Message::user(input.trim_end()));
+            self.run_turn().map(|()| true)
+        };
+        self.finish_console_dispatch();
+        result
+    }
+
+    /// Retires interruption after automatic console turns as well as submitted input.
+    fn console_turn(&mut self) -> Result<(), String> {
+        let result = self.run_turn();
+        self.finish_console_dispatch();
+        result
+    }
+
+    fn finish_console_dispatch(&self) {
+        // Include failures and early cancellation: stale interruption must not
+        // stop a later local prompt or another background-job notification.
+        if let Some(remote) = &self.remote {
+            if console_remote_interrupted(Some(remote)) {
+                // Retire a coincident local stop once all child passes have returned.
+                crate::interrupt::clear();
+            }
+            remote.shared.interrupt.store(false, Ordering::Relaxed);
+        }
+        self.tool_ctx.console.attach(self.remote.clone());
+    }
+
+    fn publish_console_tasks(&self) {
+        if gui_protocol_enabled() {
+            gui_tasks(&self.session);
+        }
+        if let Some(remote) = &self.remote {
+            remote
+                .bus
+                .broadcast(UiEvent::Tasks(tui::TaskView::with_goal(
+                    &self.session.tasks,
+                    self.session.goal.as_ref(),
+                )));
+        }
+    }
+
+    fn publish_console_jobs(&mut self) {
+        self.tool_ctx.bash.sweep();
+        let rows = self.tool_ctx.bash.rows();
+        if gui_protocol_enabled() {
+            gui_jobs(&rows);
+        }
+        if let Some(remote) = &self.remote {
+            remote.shared.set_jobs(rows.clone());
+            remote
+                .bus
+                .broadcast(UiEvent::Jobs(crate::remote::control::JobsWire::capture(
+                    &rows,
+                )));
+        }
+    }
+
+    fn publish_console_idle(&mut self) {
+        let status = self.idle_status();
+        self.publish_idle_metrics(&status);
+        if gui_protocol_enabled() {
+            gui_status(&status);
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Status(status));
+        }
+        self.publish_console_tasks();
+        self.publish_console_jobs();
+    }
+
+    /// Refreshes detailed measurements at an idle boundary without a user command.
+    fn publish_idle_metrics(&self, status: &Status) {
+        if !gui_protocol_enabled() && self.remote.is_none() {
+            return;
+        }
+        let mut context = self.metrics_snapshot("context");
+        if let crate::remote::control::MetricsWire::Context { used, .. } = &mut context {
+            *used = u64::try_from(status.ctx_used.max(0)).unwrap_or(0);
+        }
+        self.publish_metrics_snapshot(context);
+        self.publish_metrics("usage");
+        self.publish_metrics("throughput");
+        self.refresh_history();
+    }
+
+    /// Checks console cancellation without consuming another front end's signal.
+    fn console_remote_interrupted(&self) -> bool {
+        console_remote_interrupted(self.remote.as_deref())
+    }
+
+    /// Drains one idle snapshot of remote console inputs.
+    ///
+    /// Each identified input completes after its own dispatch returns. Inputs
+    /// arriving during a turn remain queued for the next idle snapshot.
+    fn console_remote_inputs(&mut self) -> bool {
+        self.tool_ctx.console.attach(self.remote.clone());
+        let Some(remote) = self.remote.clone() else {
+            return false;
+        };
+        let queued = remote
+            .shared
+            .take_commands()
+            .into_iter()
+            .chain(remote.shared.take_queued())
+            .map(|text| (None, text))
+            .chain(
+                remote
+                    .shared
+                    .take_prompt_requests()
+                    .into_iter()
+                    .map(|(id, text)| (Some(id), text)),
+            )
+            .collect::<Vec<_>>();
+        let processed = !queued.is_empty();
+        if processed && gui_protocol_enabled() {
+            // The local GUI did not submit these inputs. Stop it treating the
+            // console as ready while a remote turn may open a question/editor.
+            eprintln!("+PLANK_BUSY");
+        }
+        for (request_id, text) in queued {
+            if let Some(id) = &request_id
+                && !remote.begin_input(id, &text)
+            {
+                // Cancellation already acknowledged and retired this request.
+                continue;
+            }
+            let command = text.trim_start().starts_with('/');
+            let refusal = crate::config::slash_command_remote_refusal(&text);
+            let result = if let Some(reason) = refusal {
+                Err(reason.to_owned())
+            } else {
+                if !command && !text.trim().is_empty() {
+                    remote
+                        .bus
+                        .broadcast(UiEvent::UserEcho(text.trim_end().into()));
+                }
+                self.with_turn_from_remote(|agent| agent.console_input(&text))
+            };
+            if let Err(error) = result {
+                // An input failure must not strand its submitting client or
+                // terminate the host's other queued inputs.
+                remote.bus.broadcast(UiEvent::Error(format!("{error}\n")));
+                eprintln!("{error}");
+            }
+            remote.bus.broadcast(UiEvent::Controls(self.gui_controls()));
+            remote.bus.broadcast(UiEvent::Status(self.idle_status()));
+            remote
+                .bus
+                .broadcast(UiEvent::Tasks(tui::TaskView::with_goal(
+                    &self.session.tasks,
+                    self.session.goal.as_ref(),
+                )));
+            match request_id {
+                Some(request_id) => {
+                    remote.complete_input(&request_id, &text);
+                }
+                None if command => {
+                    remote.bus.broadcast(UiEvent::CommandDone { text });
+                }
+                None => {}
+            }
+        }
+        processed
+    }
+
+    /// Shares explicit document replies with the attached controller.
+    fn console_edit(&self, title: &str, text: &str) -> Option<String> {
+        self.tool_ctx.console.attach(self.remote.clone());
+        match self.tool_ctx.console.edit(
+            &gui_request_id("e"),
+            title,
+            text,
+            true,
+            console_dialog_poll,
+        ) {
+            Ok(edited) => edited,
+            Err(error) => {
+                println!("Editor: {error}; nothing written");
+                if let Some(remote) = &self.remote {
+                    remote.bus.broadcast(UiEvent::Error(format!(
+                        "Editor: {error}; nothing written\n"
+                    )));
+                }
+                None
+            }
+        }
+    }
+
+    /// Keeps confirmation replies separate from queued user prompts.
+    fn console_confirm(&self, question: &str, prompt: &str) -> bool {
+        self.tool_ctx.console.attach(self.remote.clone());
+        console_confirm_input(&self.tool_ctx.console, question, prompt)
+    }
+
     /// Handles a slash command; returns false when the REPL should exit.
     #[allow(clippy::too_many_lines)]
     fn slash(&mut self, input: &str) -> Result<bool, String> {
+        // Keep control reports on stdout and mirror the same bytes to attached
+        // clients. Capture the bus before dispatch so formatting can freely
+        // borrow/mutate the agent; no process-wide stdout redirection is used.
+        let console_bus = self.remote.as_ref().map(|remote| Arc::clone(&remote.bus));
+        macro_rules! print {
+            ($($args:tt)*) => {{
+                let text = format!($($args)*);
+                std::print!("{text}");
+                if let Some(bus) = &console_bus { bus.broadcast(UiEvent::Plain(text)); }
+            }};
+        }
+        macro_rules! println {
+            () => {{
+                std::println!();
+                if let Some(bus) = &console_bus { bus.broadcast(UiEvent::Plain("\n".into())); }
+            }};
+            ($($args:tt)*) => {{
+                let text = format!($($args)*);
+                std::println!("{text}");
+                if let Some(bus) = &console_bus { bus.broadcast(UiEvent::Plain(format!("{text}\n"))); }
+            }};
+        }
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(input);
         let arg = parts.next().unwrap_or("").trim();
@@ -8034,6 +9105,24 @@ impl Agent<'_> {
                 self.clear_session_plain();
             }
             "/help" => print!("{}", crate::config::usage()),
+            "/command" | "/commands" => {
+                let controls = self.gui_controls();
+                if gui_protocol_enabled() {
+                    println!(
+                        "Loaded {} engine controls",
+                        controls["commands"].as_array().map_or(0, Vec::len)
+                    );
+                } else {
+                    for command in controls["commands"].as_array().into_iter().flatten() {
+                        println!(
+                            "{} {} — {}",
+                            command["name"].as_str().unwrap_or(""),
+                            command["args"].as_str().unwrap_or(""),
+                            command["description"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+            }
             "/version" => println!("plank {}", crate::logo::version_label()),
             // Easter eggs. `anim.rs` keeps motion in the Ratatui front-end, so
             // the games decline here rather than growing a second game loop
@@ -8042,7 +9131,13 @@ impl Agent<'_> {
                 println!("{cmd} needs the full-screen UI — run plank in a terminal");
             }
             "/checkpoint" => {
-                if arg.is_empty() {
+                if let Some(page) = arg
+                    .strip_prefix("--page ")
+                    .and_then(|page| page.parse().ok())
+                {
+                    self.publish_history(true, page);
+                } else if arg.is_empty() {
+                    self.publish_history(true, 1);
                     print!(
                         "{}",
                         crate::checkpoint::render_list(&self.checkpoints, now_secs(), self.color)
@@ -8056,18 +9151,32 @@ impl Agent<'_> {
                     println!("usage: /rollback <name> (see /checkpoint for the list)");
                 } else {
                     match self.rollback_to(arg) {
-                        Ok(msg) => println!("{msg}"),
+                        Ok(msg) => {
+                            println!("{msg}");
+                        }
                         Err(e) => println!("{e}"),
                     }
                 }
             }
-            "/tree" => print!("{}", self.tree_view(self.color)),
+            "/tree" => {
+                self.publish_history(
+                    false,
+                    arg.strip_prefix("--page ")
+                        .and_then(|page| page.parse().ok())
+                        .unwrap_or(1),
+                );
+                print!("{}", self.tree_view(self.color));
+            }
             "/fork" => match self.fork_branch(arg, self.color) {
-                Ok(msg) => println!("{msg}"),
+                Ok(msg) => {
+                    println!("{msg}");
+                }
                 Err(e) => println!("{e}"),
             },
             "/clone" => match self.clone_branch() {
-                Ok(msg) => println!("{msg}"),
+                Ok(msg) => {
+                    println!("{msg}");
+                }
                 Err(e) => println!("{e}"),
             },
             "/save" => match self.save_session() {
@@ -8079,15 +9188,25 @@ impl Agent<'_> {
                 }
                 Err(e) => println!("save failed: {e}"),
             },
-            "/rename" => match self.rename_session(arg, &mut confirm_on_stdin) {
-                Ok(msg) => println!("{msg}"),
-                Err(e) => println!("rename failed: {e}"),
-            },
+            "/rename" => {
+                let console = Arc::clone(&self.tool_ctx.console);
+                console.attach(self.remote.clone());
+                let mut confirm = |question: &str| {
+                    console_confirm_input(&console, question, "overwrite it? [y/N] ")
+                };
+                match self.rename_session(arg, &mut confirm) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => println!("rename failed: {e}"),
+                }
+            }
             "/list" => match self.store.list() {
-                Ok(entries) => print!(
-                    "{}",
-                    crate::session::render_session_list(&entries, now_secs(), self.color)
-                ),
+                Ok(entries) => {
+                    let entries = self.publish_saved_sessions(&entries, arg);
+                    print!(
+                        "{}",
+                        crate::session::render_session_list(entries, now_secs(), self.color)
+                    );
+                }
                 Err(e) => println!("list failed: {e}"),
             },
             "/switch" => match self
@@ -8106,7 +9225,10 @@ impl Agent<'_> {
                 Err(e) => println!("switch failed: {e}"),
             },
             "/del" => match self.store.delete(arg) {
-                Ok(id) => println!("deleted session {}", crate::session::display_id(&id)),
+                Ok(id) => {
+                    self.refresh_saved_sessions();
+                    println!("deleted session {}", crate::session::display_id(&id));
+                }
                 Err(e) => println!("delete failed: {e}"),
             },
             "/retitle" => println!("{}", self.retitle_sessions()),
@@ -8161,16 +9283,17 @@ impl Agent<'_> {
                     crate::session::render_history(&self.session.transcript, turns, self.color)
                 );
             }
-            "/power" => match crate::config::parse_power_percent(arg) {
-                Some(power) => {
+            "/power" => {
+                if let Some(power) = crate::config::parse_power_percent(arg) {
                     // No GPU backend yet: record and show it in the footer,
                     // like the C's deferred worker_request_power.
                     self.power_percent = power;
                     crate::status::set_local_power(power);
                     println!("power limit set to {power}%");
+                } else {
+                    println!("usage: /power <1..100>");
                 }
-                None => println!("usage: /power <1..100>"),
-            },
+            }
             "/mtp" => println!("{}", self.mtp_command(arg)),
             "/temp" => println!("{}", self.temp_command(arg)),
             "/steer" => {
@@ -8186,7 +9309,7 @@ impl Agent<'_> {
             "/buddy" => println!(
                 "/buddy: the buddy stands on the TUI's prompt rule; this front end has none"
             ),
-            "/jobs" => println!("{}", self.jobs_command()),
+            "/jobs" => println!("{}", self.jobs_action(arg)),
             "/think" => {
                 // A level change that moves the effort preamble re-warms the KV
                 // before returning. The plain REPL has no persistent prompt to
@@ -8237,14 +9360,24 @@ impl Agent<'_> {
                 }
             }
             "/kvcache" => println!("{}", self.kvcache_text_command(arg)),
-            "/model" => println!("{}", Self::model_text_command(arg)),
+            "/model" => {
+                println!("{}", Self::model_text_command(arg));
+                self.publish_downloads();
+            }
             "/config" => {
-                if arg == "--resolved" {
+                if let Some(page) = arg
+                    .strip_prefix("--page ")
+                    .and_then(|page| page.parse::<usize>().ok())
+                {
+                    self.publish_config(page, None);
+                    println!("Settings page requested");
+                } else if arg == "--resolved" {
                     print!(
                         "{}",
                         crate::provenance::render_resolved(crate::settings::active(), self.cfg)
                     );
                 } else if arg.is_empty() {
+                    self.publish_config(1, None);
                     print!(
                         "{}",
                         crate::configform::render_text_list(crate::settings::active())
@@ -8260,32 +9393,49 @@ impl Agent<'_> {
                     );
                 } else {
                     println!("{}", self.config_set_command(arg));
+                    self.publish_config(1, arg.split_whitespace().next());
                 }
             }
-            "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
-            "/context" => print!("{}", self.render_context_report(self.color)),
-            "/usage" => print!("{}", self.render_usage_report(self.color)),
-            "/toks" => print!("{}", toks_report(self.color)),
-            "/stats" => match crate::stats::Scope::parse(arg) {
-                Some(scope) => match self.stats_report(scope, self.color, false) {
-                    Ok(text) => print!("{text}"),
-                    Err(e) => println!("stats failed: {e}"),
-                },
-                None => println!("usage: /stats [7|30|all]"),
-            },
+            "/mcp" => {
+                print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color));
+                self.publish_extensions("mcp");
+            }
+            "/context" => {
+                print!("{}", self.render_context_report(self.color));
+                self.publish_metrics("context");
+            }
+            "/usage" => {
+                print!("{}", self.render_usage_report(self.color));
+                self.publish_metrics("usage");
+            }
+            "/toks" => {
+                print!("{}", toks_report(self.color));
+                self.publish_metrics("throughput");
+            }
+            "/stats" => {
+                if let Some(scope) = crate::stats::Scope::parse(arg) {
+                    match self.stats_report(scope, self.color, false) {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => println!("stats failed: {e}"),
+                    }
+                } else {
+                    println!("usage: /stats [7|30|all]");
+                }
+            }
             "/goal" => {
                 let arg = arg.trim();
                 if arg.is_empty() {
                     // No argument: print the durable goal and its progress.
-                    match &self.session.goal {
-                        Some(g) => println!(
+                    if let Some(g) = &self.session.goal {
+                        println!(
                             "goal: {} (iteration {}/{}, {})",
                             g.objective,
                             g.iter,
                             g.max_iters,
                             g.status.tag()
-                        ),
-                        None => println!("no goal set"),
+                        );
+                    } else {
+                        println!("no goal set");
                     }
                 } else if arg == "clear" {
                     // `/goal clear` drops the durable goal outright: a cleared
@@ -8307,16 +9457,50 @@ impl Agent<'_> {
                 // pass. The interrupted case already printed its own notice.
                 self.compact("user request", arg)?;
             }
-            "/skills" => print!("{}", self.skills_command(arg)),
+            "/skills" => {
+                print!("{}", self.skills_command(arg));
+                self.publish_extensions("skills");
+            }
             "/frame" => println!(
                 "/frame needs the full-screen TUI — a piped session has no screen to give a \
                  component\n{}",
                 self.frame_command("")
             ),
-            "/plugins" => print!("{}", self.plugins_command(arg)),
+            "/plugins" => {
+                print!("{}", self.plugins_command(arg));
+                self.publish_extensions("plugins");
+            }
             "/install-claude-plugin" => print!("{}", self.install_claude_plugin_command(arg)),
             "/install-profile" => print!("{}", self.install_profile_command(arg)),
             "/engines" => {
+                if !arg.trim().is_empty() {
+                    println!("{}", self.engines_report(arg));
+                    return Ok(true);
+                }
+                if gui_protocol_enabled() {
+                    if self.cfg.remote_url.is_some() || self.cfg.provider.is_some() {
+                        println!(
+                            "This agent uses a remote inference engine or provider; select its model in the launch settings"
+                        );
+                        return Ok(true);
+                    }
+                    match self.save_session() {
+                        Ok(session) => {
+                            crate::profileedit::request_restart(crate::profileedit::Restart {
+                                session,
+                                cwd: self.tool_ctx.cwd.clone(),
+                                pick_engine: true,
+                                steering: None,
+                            });
+                            eprintln!("+PLANK_RESTARTING");
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            println!("Cannot save session before switching engines: {error}");
+                        }
+                    }
+                    return Ok(true);
+                }
                 let root = crate::manifest::plank_dir();
                 let catalog = crate::engines::load_in(&root, &mut Vec::new());
                 let downloading = crate::download::downloading_in(&root, &catalog);
@@ -8338,6 +9522,57 @@ impl Agent<'_> {
             }
             "/edit-profile" => match self.active_profile_plugin() {
                 None => println!("{NO_ACTIVE_PROFILE}"),
+                Some((plugin, spec)) if gui_protocol_enabled() => {
+                    let initial = match crate::profileedit::render(&plugin, &spec) {
+                        Ok(initial) => initial,
+                        Err(error) => {
+                            println!("/edit-profile: {error}; nothing written");
+                            return Ok(true);
+                        }
+                    };
+                    if let Some(edited) = self.console_edit("Profile", &initial) {
+                        if crate::profileedit::render(&plugin, &spec).as_ref() == Ok(&initial) {
+                            match crate::profileedit::apply(&plugin, &spec, &edited) {
+                                Ok(applied) => {
+                                    for line in applied.lines {
+                                        println!("[profile] {line}");
+                                    }
+                                    if applied.changed {
+                                        if self.console_confirm(
+                                            "Restart this engine to apply the saved profile?",
+                                            "restart? [y/N] ",
+                                        ) {
+                                            match self.save_session() {
+                                                Ok(session) => {
+                                                    crate::profileedit::request_restart(
+                                                        crate::profileedit::Restart {
+                                                            session,
+                                                            cwd: self.tool_ctx.cwd.clone(),
+                                                            pick_engine: false,
+                                                            steering: None,
+                                                        },
+                                                    );
+                                                    eprintln!("+PLANK_RESTARTING");
+                                                    return Ok(false);
+                                                }
+                                                Err(error) => println!(
+                                                    "Cannot save session before restarting: {error}"
+                                                ),
+                                            }
+                                        } else {
+                                            println!(
+                                                "Saved profile applies on the next engine restart"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => println!("/edit-profile: {error}; nothing written"),
+                            }
+                        } else {
+                            println!("Profile changed on disk; reopen /edit-profile before saving");
+                        }
+                    }
+                }
                 Some((plugin, spec)) => {
                     match crate::profileedit::render(&plugin, &spec) {
                         Ok(text) => print!("{text}"),
@@ -8346,17 +9581,35 @@ impl Agent<'_> {
                     println!("/edit-profile editing requires the interactive TUI");
                 }
             },
-            "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
-            "/tasks" => print!(
-                "{}",
-                self.session.tasks.render_list(self.session.goal.as_ref())
-            ),
-            "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
-            "/hooks" => print!("{}", self.hooks_command(arg)),
+            "/templates" => {
+                print!("{}", crate::templates::render_list(&self.templates));
+                self.publish_extensions("templates");
+            }
+            "/tasks" => print!("{}", self.tasks_command(arg)),
+            "/agent" => {
+                print!("{}", crate::agents::render_list(&self.agents));
+                self.publish_extensions("agents");
+            }
+            "/hooks" => {
+                print!("{}", self.hooks_command(arg));
+                self.publish_extensions("hooks");
+            }
             "/remote-control" | "/rc" => {
-                println!(
-                    "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
-                );
+                if arg.eq_ignore_ascii_case("status") {
+                    println!(
+                        "{}",
+                        if self.remote.is_some() {
+                            "Remote host status requested"
+                        } else {
+                            "Remote control is off"
+                        }
+                    );
+                    self.publish_host();
+                } else {
+                    println!(
+                        "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
+                    );
+                }
             }
             // Reachable but always empty-handed here: a bridge can only be
             // started from the TUI, so nothing can be waiting for a grant.
@@ -8364,6 +9617,7 @@ impl Agent<'_> {
                 for line in self.grant_lines(arg) {
                     println!("{line}");
                 }
+                self.publish_host();
             }
             "/btw" => {
                 if arg.is_empty() {
@@ -8394,7 +9648,7 @@ impl Agent<'_> {
                         for h in &hits {
                             println!("  {h}");
                         }
-                        if ask_yes_no_on_stdin(
+                        if self.console_confirm(
                             &format!(
                                 "remove {} matching {pattern:?}?",
                                 if hits.len() == 1 {
@@ -8440,6 +9694,25 @@ impl Agent<'_> {
                 }
             }
             "/memory" => {
+                if gui_protocol_enabled() {
+                    let sources = crate::memory::sources_for(&self.tool_ctx.cwd);
+                    let initial = crate::memory::combine(&sources);
+                    if let Some(edited) = self.console_edit("Project and user memory", &initial) {
+                        if crate::memory::combine(&sources) == initial {
+                            match crate::memory::apply(&sources, &edited) {
+                                Ok(lines) => {
+                                    for line in lines {
+                                        println!("[memory] {line}");
+                                    }
+                                }
+                                Err(error) => println!("/memory: {error}; nothing written"),
+                            }
+                        } else {
+                            println!("Memory changed on disk; reopen /memory before saving");
+                        }
+                    }
+                    return Ok(true);
+                }
                 print!(
                     "{}",
                     crate::memory::combine(&crate::memory::sources_for(&self.tool_ctx.cwd))
@@ -8477,6 +9750,23 @@ impl Agent<'_> {
                             println!("{}", crate::openfile::opened_in_browser_message(&display));
                         }
                         Err(e) => println!("{e}"),
+                    }
+                    self.last_edited = Some(path);
+                }
+                Ok(path) if gui_protocol_enabled() => {
+                    match crate::openfile::load(&path) {
+                        Ok(initial) => {
+                            if let Some(edited) =
+                                self.console_edit(&path.display().to_string(), &initial)
+                            {
+                                match apply_gui_file_edit(&path, &initial, &edited) {
+                                    Ok(true) => println!("Saved {}", path.display()),
+                                    Ok(false) => println!("File unchanged"),
+                                    Err(error) => println!("/open: {error}; nothing written"),
+                                }
+                            }
+                        }
+                        Err(error) => println!("/open: {error}; nothing written"),
                     }
                     self.last_edited = Some(path);
                 }
@@ -8569,10 +9859,38 @@ impl Agent<'_> {
                     let fork_at =
                         self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     // Restore the transcript even when the turn errored.
+                    let label = crate::agents::command_name(c)
+                        .map_or_else(|| self.next_unnamed_subagent_label(), str::to_owned);
+                    self.publish_subagent_event(&UiEvent::SubStart {
+                        label: label.clone(),
+                        task: task.clone(),
+                    });
+                    let previous_label = self.tool_ctx.subagent_label.replace(label.clone());
+                    let previous_sinks = if self.subagent_progress().is_some() {
+                        let previous = (
+                            self.tool_ctx.status_sink.take(),
+                            self.tool_ctx.markdown_sink.take(),
+                        );
+                        self.tool_ctx.status_sink = self.subagent_tool_sink(false);
+                        self.tool_ctx.markdown_sink = self.subagent_tool_sink(true);
+                        Some(previous)
+                    } else {
+                        None
+                    };
                     let turn = match alt {
                         None => self.run_turn(),
                         Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_turn),
                     };
+                    if let Some((status, markdown)) = previous_sinks {
+                        self.tool_ctx.status_sink = status;
+                        self.tool_ctx.markdown_sink = markdown;
+                    }
+                    self.tool_ctx.subagent_label = previous_label;
+                    self.finish_subagent_activity(
+                        &label,
+                        fork_at,
+                        turn.as_ref().err().map(String::as_str),
+                    );
                     let reported = self.finish_subagent_fork(fork_at, &task);
                     turn?;
                     if reported {
@@ -8847,6 +10165,7 @@ impl Agent<'_> {
         let kv = self.engine.get_kv();
         let had_kv = kv.is_some();
         let replaced = self.checkpoints.save(name, &self.session, kv);
+        self.publish_history_change(true, self.checkpoints.len().div_ceil(32));
         let verb = if replaced { "updated" } else { "saved" };
         let note = if had_kv {
             " (with engine KV)"
@@ -8885,6 +10204,8 @@ impl Agent<'_> {
             }
             _ => " (transcript restored, re-prefill on next turn)",
         };
+        self.publish_history_change(true, self.checkpoints.len().div_ceil(32));
+        self.publish_history_change(false, 1);
         Ok(format!(
             "rolled back to {name}{note}; tail saved as \"{PRE_ROLLBACK_CHECKPOINT}\""
         ))
@@ -8914,6 +10235,7 @@ impl Agent<'_> {
             return Err("nothing to fork from yet; send a prompt first".to_owned());
         }
         if arg.is_empty() {
+            self.publish_history_change(false, 1);
             return Ok(self.tree_view(color).trim_end().to_owned());
         }
         let n: usize = arg
@@ -8936,6 +10258,7 @@ impl Agent<'_> {
         // signed over the full old transcript and must be rewritten.
         self.truncate_ladder_to(kept);
         self.payload_dirty = true;
+        self.publish_history_change(false, 1);
         Ok(format!(
             "forked at fork point {n}: {kept} of {before} messages kept (cached prefix reused); \
 the previous branch is still in /tree"
@@ -8954,6 +10277,7 @@ the previous branch is still in /tree"
         }
         self.session.set_tree(&tree);
         let n = self.session.transcript.len();
+        self.publish_history_change(false, 1);
         Ok(format!(
             "cloned the active branch ({n} messages, cached prefix reused in full); \
 the original is frozen and listed in /tree"
@@ -9477,13 +10801,185 @@ the original is frozen and listed in /tree"
         let mut words = arg.split_whitespace();
         let verb = words.next().unwrap_or("");
         let fp = words.next().unwrap_or("");
-        match verb {
+        let output = match verb {
             "" => crate::kvpane::render_text(&self.kvcache_pane()),
+            "--page" => {
+                let Ok(page) = fp.parse::<usize>() else {
+                    return "usage: /kvcache --page N".into();
+                };
+                let snapshot = self.cache_snapshot(page);
+                let mut output = format!("{} · page {}\n", snapshot.summary, snapshot.page);
+                for row in &snapshot.rows {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        output,
+                        "{}{} · {}\n{}",
+                        "  ".repeat(row.depth.min(16)),
+                        row.label,
+                        row.status,
+                        row.detail
+                    );
+                }
+                self.publish_cache_snapshot(snapshot);
+                return output;
+            }
             "gc" => self.kvcache_sweep(),
+            "pin" | "unpin" | "rm" if fp == "--entry" => {
+                let handle = words.next().unwrap_or("");
+                let expected = words.next().unwrap_or("");
+                if words.next().is_some() || expected.is_empty() {
+                    return "usage: /kvcache <pin|unpin|rm> --entry <handle> <fingerprint>".into();
+                }
+                self.kvcache_apply_entry(verb, handle, expected)
+                    .unwrap_or_else(|error| format!("kvcache: {error}"))
+            }
             "pin" | "unpin" | "rm" => self.kvcache_apply(verb, fp),
             other => {
                 format!("usage: /kvcache [gc|pin <fp>|unpin <fp>|rm <fp>] (got {other:?})")
             }
+        };
+        self.publish_cache(1);
+        output
+    }
+
+    fn cache_snapshot(&self, page: usize) -> crate::remote::control::CacheWire {
+        // One scan provides both lineage indexes and stable file handles.
+        let entries = self.store.kv_blob_nodes();
+        let view =
+            self.kvcache_pane_from_nodes(entries.iter().map(|(_, meta)| meta.clone()).collect());
+        crate::remote::control::CacheWire::capture_with_entries(&view, page, &entries)
+    }
+
+    fn kvcache_apply_entry(
+        &self,
+        verb: &str,
+        handle: &str,
+        fingerprint: &str,
+    ) -> Result<String, String> {
+        if handle.len() != 40
+            || !handle
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("invalid cache entry handle".into());
+        }
+        let entries = self.store.kv_blob_nodes();
+        let matches: Vec<_> = entries
+            .iter()
+            .filter(|(path, _)| crate::remote::control::cache_entry_handle(path) == handle)
+            .collect();
+        match matches.as_slice() {
+            [(path, meta)] => mutate_cache_blob(verb, path, meta, fingerprint),
+            [] => Err("cache entry vanished from disk; refresh /kvcache".into()),
+            _ => Err("ambiguous cache entry handle; no changes made".into()),
+        }
+    }
+
+    fn metrics_snapshot(&self, kind: &str) -> crate::remote::control::MetricsWire {
+        use crate::remote::control::MetricsWire;
+        let count = |value: i32| u64::try_from(value.max(0)).unwrap_or(0);
+        // A bounded display label never becomes a command argument.
+        let model = self
+            .engine
+            .model_name()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(64)
+            .collect();
+        match kind {
+            "context" => context_metrics(&self.context_breakdown(), self.last_ctx_used),
+            "usage" => MetricsWire::Usage {
+                model,
+                input: self.stats.input_tokens,
+                output: self.stats.output_tokens,
+                cache_read: count(self.usage.total.cache_read_tokens),
+                cache_write: count(self.usage.total.cache_write_tokens),
+                provider_passes: self.cfg.provider.map(|_| u64::from(self.usage.turns)),
+                wall_secs: self.session_start.elapsed().as_secs_f64(),
+            },
+            _ => {
+                let samples = |values: Vec<f64>| {
+                    values
+                        .into_iter()
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .collect()
+                };
+                MetricsWire::Throughput {
+                    generation: samples(crate::toks::snapshot()),
+                    prefill: samples(crate::toks::prefill_snapshot()),
+                }
+            }
+        }
+    }
+
+    fn publish_host(&self) {
+        let snapshot = match &self.remote {
+            Some(remote) => remote.host_snapshot(),
+            None => Some(crate::remote::control::HostWire::off()),
+        };
+        let Some(snapshot) = snapshot else { return };
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"host", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Host(snapshot));
+        }
+    }
+
+    fn publish_metrics(&self, kind: &str) {
+        if !gui_protocol_enabled() && self.remote.is_none() {
+            return;
+        }
+        let snapshot = self.metrics_snapshot(kind);
+        self.publish_metrics_snapshot(snapshot);
+    }
+
+    fn publish_metrics_snapshot(&self, snapshot: crate::remote::control::MetricsWire) {
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"metrics", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Metrics(snapshot));
+        }
+    }
+
+    fn publish_downloads(&self) {
+        if !gui_protocol_enabled() && self.remote.is_none() {
+            return;
+        }
+        let snapshot = crate::remote::control::DownloadsWire::capture();
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"downloads", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Downloads(snapshot));
+        }
+    }
+
+    fn publish_cache(&self, page: usize) {
+        if gui_protocol_enabled() || self.remote.is_some() {
+            self.publish_cache_snapshot(self.cache_snapshot(page));
+        }
+    }
+
+    fn publish_cache_snapshot(&self, snapshot: crate::remote::control::CacheWire) {
+        if gui_protocol_enabled() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"cache", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = &self.remote {
+            remote.bus.broadcast(UiEvent::Cache(snapshot));
         }
     }
 
@@ -9507,9 +11003,13 @@ the original is frozen and listed in /tree"
     /// stdout tree are always the same rows.
     #[must_use]
     fn kvcache_pane(&self) -> crate::kvpane::KvPane {
+        self.kvcache_pane_from_nodes(self.store.kv_nodes())
+    }
+
+    fn kvcache_pane_from_nodes(&self, nodes: Vec<crate::kvmeta::KvMeta>) -> crate::kvpane::KvPane {
         let settings = crate::settings::active();
         crate::kvpane::KvPane::new(
-            crate::kvtree::build(self.store.kv_nodes()),
+            crate::kvtree::build(nodes),
             crate::kvgc::SweepPolicy::from_settings(&settings.kvcache),
             // The same set the startup sweep is given. Without it the pane marks
             // this launch's own chain `⏳ expired` and counts it as reclaimable
@@ -9563,7 +11063,10 @@ the original is frozen and listed in /tree"
             Ok(changed) if changed.is_empty() => {
                 "retitle: every session title is current".to_owned()
             }
-            Ok(changed) => format!("retitle: rewrote {} session titles", changed.len()),
+            Ok(changed) => {
+                self.refresh_saved_sessions();
+                format!("retitle: rewrote {} session titles", changed.len())
+            }
             Err(e) => format!("retitle failed: {e}"),
         }
     }
@@ -9630,9 +11133,6 @@ the original is frozen and listed in /tree"
         // ... and a new log deserves a fresh alphabet: the next unnamed
         // sub-agent is `alpha` again.
         self.unnamed_subagents = 0;
-        self.broadcast_session_reset(Some(
-            "[session replaced — its history is on the local screen only]",
-        ));
         self.last_ctx_used = 0;
         self.checkpoints.clear();
         self.usage = SessionUsage::default();
@@ -9644,6 +11144,9 @@ the original is frozen and listed in /tree"
         // fork_points stays parallel to fork_kv (see the field doc); clear both together.
         self.fork_points.clear();
         self.session_start = std::time::Instant::now();
+        self.broadcast_session_reset(Some(
+            "[session replaced — its history is on the local screen only]",
+        ));
         note
     }
 
@@ -10006,56 +11509,7 @@ the original is frozen and listed in /tree"
                 meta.fingerprint
             ));
         }
-        match verb {
-            "rm" => {
-                // Last check before an irreversible unlink: the body must still
-                // be there, and a readable sidecar must still name the same
-                // blob. A sidecar-less body is fine — the scan's fingerprint is
-                // then synthesized from the file stem, which the check above
-                // already matched.
-                //
-                // This is defence in depth against a concurrent writer, layered
-                // on top of the index/fingerprint check above. It is NOT
-                // exercised by this module's unit test, and it cannot be: the
-                // scan above and this re-check both read the same sidecar in
-                // the same single-threaded call, so nothing can change between
-                // them without a real interleave from another process or
-                // thread. The unit test covers only the index/fingerprint
-                // guard; this one guards a race no single-threaded test can
-                // reach.
-                if !path.exists() {
-                    return Err(format!("{expect_fp} is already gone from disk"));
-                }
-                if let Some(fresh) = crate::kvmeta::load(path)
-                    && fresh.fingerprint != expect_fp
-                {
-                    return Err(format!(
-                        "{} was replaced by {} under you; reopen /kvcache",
-                        expect_fp, fresh.fingerprint
-                    ));
-                }
-                std::fs::remove_file(path).map_err(|e| e.to_string())?;
-                // The sidecar must go too: one left behind is a phantom node in
-                // every later scan.
-                let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(path));
-                Ok(format!(
-                    "kvcache: removed {} ({})",
-                    meta.fingerprint,
-                    crate::kvpane::human_bytes(meta.bytes)
-                ))
-            }
-            verb @ ("pin" | "unpin") => {
-                // Read the sidecar fresh rather than rewriting the snapshot this
-                // scan produced: a concurrent `kv_load` may have bumped `hits`
-                // and `last_used` in between, and writing the stale copy back
-                // would silently revert it.
-                let mut m = crate::kvmeta::load(path).unwrap_or_else(|| meta.clone());
-                m.pinned = verb == "pin";
-                crate::kvmeta::store(path, &m).map_err(|e| e.to_string())?;
-                Ok(format!("kvcache: {verb}ned {}", m.fingerprint))
-            }
-            other => Err(format!("unknown action {other:?}")),
-        }
+        mutate_cache_blob(verb, path, meta, expect_fp)
     }
 
     /// Parses a `/notify [on|off]` argument and applies it; returns the
@@ -10589,22 +12043,39 @@ the original is frozen and listed in /tree"
         ]
     }
 
-    // A long straight-line pipeline; the length is not complexity.
-    #[allow(clippy::too_many_lines)]
     fn run_insights(
         &mut self,
         arg: &str,
         note: &mut dyn FnMut(String),
         tick: &mut dyn FnMut(String),
     ) -> Result<Insights, String> {
+        self.run_insights_in(arg, &crate::insights::usage_dir(), note, tick)
+    }
+
+    // A long straight-line pipeline; the length is not complexity.
+    #[allow(clippy::too_many_lines)]
+    fn run_insights_in(
+        &mut self,
+        arg: &str,
+        root: &std::path::Path,
+        note: &mut dyn FnMut(String),
+        tick: &mut dyn FnMut(String),
+    ) -> Result<Insights, String> {
         use crate::insights;
+        use sha2::Digest as _;
+        let remote = self.remote.clone();
+        let interrupted =
+            || crate::interrupt::pending() || console_remote_interrupted(remote.as_deref());
+        if interrupted() {
+            crate::interrupt::clear();
+            return Ok(Insights::Cancelled);
+        }
 
         let fast = matches!(arg.trim(), "fast" | "--fast" | "quick");
         // `fresh` overrides the reuse below: the prose is written again even
         // when nothing much has changed, for when the last answer was wrong
         // rather than stale.
         let fresh = matches!(arg.trim(), "fresh" | "--fresh" | "full");
-        let root = insights::usage_dir();
         let tz = insights::local_utc_offset();
 
         // The report reads back the user's whole history and can take minutes,
@@ -10617,7 +12088,7 @@ the original is frozen and listed in /tree"
         let mut last_pct = usize::MAX;
         let scan = insights::collect_metas(
             &self.store,
-            &root,
+            root,
             &mut |done, total| {
                 if total == 0 {
                     return;
@@ -10632,7 +12103,7 @@ the original is frozen and listed in /tree"
                     tick(format!("reading sessions… {done}/{total}"));
                 }
             },
-            &|| crate::interrupt::pending(),
+            &interrupted,
         )?;
         let insights::Scan::Done(metas, _entries) = scan else {
             // Stopped during the scan: nothing has been computed worth
@@ -10648,7 +12119,7 @@ the original is frozen and listed in /tree"
         // session's own transcript, loaded on demand for rated sessions only.
         insights::aggregate_feedback(
             &mut agg,
-            &crate::feedback::load_all(&root),
+            &crate::feedback::load_all(root),
             tz,
             &|session_id| self.store.load(session_id).ok().map(|s| s.transcript),
         );
@@ -10660,7 +12131,7 @@ the original is frozen and listed in /tree"
 
         // What the last report knew. Two uses: how much is genuinely new
         // (below), and what the report subtracts from for its "since" strip.
-        let previous = insights::load_state(&root);
+        let previous = insights::load_state(root);
         let changed = previous
             .as_ref()
             .map_or(metas.len(), |st| insights::changed_since(st, &metas));
@@ -10672,6 +12143,7 @@ the original is frozen and listed in /tree"
         }
 
         let mut narrative = insights::Narrative::new();
+        let mut prose_interrupted = false;
         // Reuse the prose while the picture behind it has barely moved. The
         // sections describe habits, and habits do not change because two more
         // sessions exist — but writing them costs minutes, every run. A
@@ -10708,7 +12180,8 @@ the original is frozen and listed in /tree"
                 if narrative.contains_key(spec.key) {
                     continue;
                 }
-                if crate::interrupt::pending() {
+                if interrupted() {
+                    prose_interrupted = true;
                     note("[interrupted; writing what is ready]".to_owned());
                     break;
                 }
@@ -10741,6 +12214,10 @@ the original is frozen and listed in /tree"
                     crate::engine::ThinkMode::Medium,
                     crate::engine::ThinkMode::Off,
                 ] {
+                    if interrupted() {
+                        stopped = true;
+                        break;
+                    }
                     let mut reply = String::new();
                     // Stream the reasoning as it arrives, the way an ordinary
                     // turn does, so the wait is legible rather than blank.
@@ -10762,7 +12239,7 @@ the original is frozen and listed in /tree"
                     let generated = self.generate_aside_best(
                         &prompt,
                         &opts,
-                        &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                        &|| stop.load(Ordering::Relaxed) || interrupted(),
                         &mut |ev| {
                             if let crate::engine::EngineEvent::Text(t) = ev {
                                 reply.push_str(&t);
@@ -10778,7 +12255,7 @@ the original is frozen and listed in /tree"
                                 // mid-sentence into a stopped generation rather
                                 // than one noticed at the next section
                                 // boundary.
-                                if crate::interrupt::pending() {
+                                if interrupted() {
                                     stop.store(true, Ordering::Relaxed);
                                 }
                             }
@@ -10788,7 +12265,8 @@ the original is frozen and listed in /tree"
                     // say nothing about it and leave, rather than reporting it
                     // "unavailable" and trying the next one. The model's own
                     // loop raises the same flag, so it is ruled out first.
-                    if !looped && generated.as_ref().is_ok_and(|s| s.interrupted) {
+                    if interrupted() || (!looped && generated.as_ref().is_ok_and(|s| s.interrupted))
+                    {
                         stopped = true;
                         break;
                     }
@@ -10804,7 +12282,7 @@ the original is frozen and listed in /tree"
                         }
                         Err(e) => failure = e,
                     }
-                    if crate::interrupt::pending() {
+                    if interrupted() {
                         stopped = true;
                         break;
                     }
@@ -10814,6 +12292,7 @@ the original is frozen and listed in /tree"
                     ));
                 }
                 if stopped {
+                    prose_interrupted = true;
                     note("[stopped; writing the report as it stands]".to_owned());
                     break;
                 }
@@ -10832,19 +12311,28 @@ the original is frozen and listed in /tree"
                     note(format!("[“{}” unavailable: {failure}]", spec.heading));
                 }
             }
-            crate::interrupt::clear();
         }
 
         // The statistics are finished by this point even if the prose was
         // interrupted, so the report is still written: throwing away a
         // completed scan because the user stopped the writing would punish
         // them for the part that was slow. The interrupt flag is therefore
-        // cleared first — the stop has been honoured, and it must not now be
-        // read as "abandon the render too".
-        crate::interrupt::clear();
+        // cleared only after a prose stop was honored. The shared remote stop
+        // remains for dispatcher retirement. A newly arriving stop must still
+        // cancel rendering rather than be mistaken for that earlier stop.
+        if prose_interrupted {
+            crate::interrupt::clear();
+        }
+        // A stop already honored by the prose phase still permits its finished
+        // statistics report. A new remote stop during rendering cancels it.
+        let remote_stop_honored =
+            prose_interrupted && console_remote_interrupted(remote.as_deref());
         tick("writing the report…".to_owned());
         let at = insights::now_secs();
-        let cancel = crate::interrupt::pending;
+        let cancel = || {
+            crate::interrupt::pending()
+                || (!remote_stop_honored && console_remote_interrupted(remote.as_deref()))
+        };
         let Some(html) = insights::render_html_cancellable(&agg, &narrative, tz, at, &cancel)
         else {
             // Stopped mid-render: nothing is written, so the report the user
@@ -10852,7 +12340,11 @@ the original is frozen and listed in /tree"
             crate::interrupt::clear();
             return Ok(Insights::Cancelled);
         };
-        let path = insights::write_report(&root, &html, tz, at)?;
+        if cancel() {
+            crate::interrupt::clear();
+            return Ok(Insights::Cancelled);
+        }
+        let path = insights::write_report(root, &html, tz, at)?;
         // Only after the report is on disk: a state file describing a report
         // that was never written would make the next run reuse prose the user
         // has never seen, and skip the sessions it claims to have covered.
@@ -10863,7 +12355,7 @@ the original is frozen and listed in /tree"
         // against a report that never had sections to reuse.
         if !fast {
             let _ = insights::save_state(
-                &root,
+                root,
                 &insights::ReportState {
                     version: insights::STATE_VERSION,
                     at,
@@ -10873,6 +12365,18 @@ the original is frozen and listed in /tree"
                 },
             );
         }
+        self.publish_metrics_snapshot(crate::remote::control::MetricsWire::Insights {
+            markdown: insights::render_client_report(&agg, &narrative, tz, at),
+            html_sha256: Some(crate::downloader::hex(&sha2::Sha256::digest(
+                html.as_bytes(),
+            ))),
+        });
+        self.publish_available_export(
+            &path,
+            crate::export::Format::Html,
+            &html,
+            crate::export::transfer::Purpose::Insights,
+        );
         Ok(Insights::Done {
             path,
             summary: insights::render_summary(&agg, &narrative, tz, at),
@@ -10891,7 +12395,9 @@ the original is frozen and listed in /tree"
         // bug report against a saved session needs to know whether the user
         // was looking at the thinking, and the transcript cannot say.
         self.session.render = Some(crate::session::RenderState::active());
-        self.store.save(&mut self.session)
+        let id = self.store.save(&mut self.session)?;
+        self.refresh_saved_sessions();
+        Ok(id)
     }
 
     /// Renames the live session: the name every later save writes under, on
@@ -10948,7 +12454,7 @@ the original is frozen and listed in /tree"
 
     /// Saves the session at exit and returns `(id, path)` so the caller can
     /// tell the user how to resume it. Returns `None` when there is nothing
-    /// worth saving (no user turn) or the save fails.
+    /// worth saving (no user turn or tasks) or the save fails.
     fn save_for_exit(&mut self) -> Option<(String, std::path::PathBuf)> {
         // No activity since the session was started or loaded — nothing worth
         // persisting. This skips both a fresh session with no turns and a
@@ -11298,8 +12804,100 @@ the original is frozen and listed in /tree"
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+        std::fs::write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.publish_available_export(
+            &path,
+            format,
+            &body,
+            crate::export::transfer::Purpose::Conversation,
+        );
         Ok(path)
+    }
+
+    fn publish_available_export(
+        &self,
+        path: &std::path::Path,
+        format: crate::export::Format,
+        body: &str,
+        purpose: crate::export::transfer::Purpose,
+    ) {
+        // Local pipes provide backpressure. Remote subscribers must explicitly
+        // negotiate file events, which use a separate bounded queue.
+        let gui = gui_protocol_enabled()
+            && std::env::var("PLANK_GUI_EXPORT_STREAM").as_deref() == Ok("1");
+        let remote = self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.bus.has_export_subscribers());
+        if gui || remote {
+            self.publish_export(path, format, body, gui, remote, purpose);
+        }
+    }
+
+    /// Publishes a written export separately from transcript and telemetry snapshots.
+    fn publish_export(
+        &self,
+        path: &std::path::Path,
+        format: crate::export::Format,
+        body: &str,
+        mut gui: bool,
+        remote: bool,
+        purpose: crate::export::transfer::Purpose,
+    ) {
+        if (!gui && (!remote || self.remote.is_none())) || self.in_sidechain() {
+            return;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let id = self.tool_ctx.console.new_export_id();
+        let mut remote_retired = false;
+        let result = crate::export::transfer::emit(purpose, &id, name, format, body, |event| {
+            if self.tool_ctx.console.interrupted() {
+                return Err(());
+            }
+            if gui {
+                use std::io::Write as _;
+                // A broken console consumer must not panic or prevent remote delivery.
+                gui = writeln!(
+                    std::io::stderr().lock(),
+                    "+PLANK_TELEMETRY {}",
+                    serde_json::json!({"type":"artifact", "event":event})
+                )
+                .is_ok();
+            }
+            if let Some(remote) = self.remote.as_ref().filter(|_| remote) {
+                if remote
+                    .bus
+                    .broadcast_artifact(&event, || self.tool_ctx.console.interrupted())
+                    .is_err()
+                {
+                    remote_retired = true;
+                    return Err(());
+                }
+            } else if !gui {
+                return Err(());
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            let event = crate::export::transfer::Transfer::Abort {
+                id,
+                reason: "Export transfer cancelled or disconnected".into(),
+            };
+            if gui {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "+PLANK_TELEMETRY {}",
+                    serde_json::json!({"type":"artifact", "event":event})
+                );
+            }
+            if let Some(remote) = self.remote.as_ref().filter(|_| remote && !remote_retired) {
+                let _ = remote.bus.broadcast_artifact(&event, || false);
+            }
+        }
     }
 
     /// Rates the last assistant turn (`/rate [+|-] [note]`), recording it in
@@ -11788,7 +13386,8 @@ the original is frozen and listed in /tree"
         // Now take the engines. Any that turns out serial-only sends the whole
         // block back to the serial path with every engine returned.
         let mut slots: Vec<FanoutSlot> = Vec::with_capacity(specs.len());
-        for (task, body, spec, label) in &specs {
+        let labels = unique_subagent_labels(specs.iter().map(|(_, _, _, label)| label.as_str()));
+        for ((task, body, spec, _), label) in specs.iter().zip(&labels) {
             match self.take_alt_engine(spec) {
                 Ok((key, engine)) if engine.max_parallel() > 1 => {
                     let mut session = Session::new();
@@ -11885,6 +13484,7 @@ the original is frozen and listed in /tree"
         let ctx = PassCtx {
             opts: &opts,
             think_off: matches!(opts.think_mode, crate::engine::ThinkMode::Off),
+            remote: self.remote.clone(),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             display: PassDisplay {
                 show_thinking: crate::settings::show_thinking_effective(),
@@ -11897,7 +13497,10 @@ the original is frozen and listed in /tree"
         };
         let cwd = self.tool_ctx.cwd.clone();
         for round in 0..MAX_ROUNDS {
-            if slots.iter().all(|s| s.done) || crate::interrupt::pending() {
+            if slots.iter().all(|s| s.done)
+                || crate::interrupt::pending()
+                || self.console_remote_interrupted()
+            {
                 break;
             }
             // On the last permitted round ask each live slot to report now, and
@@ -11930,7 +13533,8 @@ the original is frozen and listed in /tree"
 
             // Phase 2, `width` threads at a time: generate. Only an engine and
             // plain data cross the boundary.
-            let passes = generate_fanout_round(slots, &prepared, width, &ctx, &cwd);
+            let passes =
+                generate_fanout_round(slots, &prepared, width, &ctx, &cwd, &self.tool_ctx.console);
 
             // Phase 3, main thread only: fold results in, then dispatch tools.
             for (slot, pass) in slots.iter_mut().zip(passes) {
@@ -11949,12 +13553,11 @@ the original is frozen and listed in /tree"
                 })
                 .collect();
             for (i, calls) in pending {
-                let observations = self.run_tool_calls(&calls);
-                self.sync_tasks_after_dispatch();
-                // The sidechain has no UI to drain these into.
-                self.tool_ctx.edit_previews.clear();
-                self.tool_ctx.task_completions.clear();
-                self.tool_ctx.hook_warnings.clear();
+                if self.console_remote_interrupted() {
+                    break;
+                }
+                let observations =
+                    self.subagent_tool_batch(&calls, &slots[i].label, &slots[i].task);
                 let images = std::mem::take(&mut self.pending_images);
                 slots[i].session.push(
                     Message::user(format!("<tool_result>{observations}</tool_result>"))
@@ -12091,6 +13694,13 @@ the original is frozen and listed in /tree"
                 )));
             }
             self.emit_sub(crate::worker::UiEvent::SubEnd);
+            let report = last_assistant_text(&slot.session.transcript)
+                .unwrap_or_else(|| "No final report was produced.".into());
+            let report = slot.error.as_ref().map_or_else(
+                || report.clone(),
+                |error| format!("Run ended with error: {error}\n\n{report}"),
+            );
+            self.publish_subagent_report(&slot.label, &report);
         }
     }
 
@@ -12410,6 +14020,7 @@ the original is frozen and listed in /tree"
     }
 
     fn btw_plain(&mut self, question: &str) -> Result<(), String> {
+        let _aside = self.tool_ctx.console.aside_scope();
         let mut prompt_text = render_transcript(&self.session, &self.system);
         {
             use std::fmt::Write as _;
@@ -12420,22 +14031,36 @@ the original is frozen and listed in /tree"
         // Whatever the outcome, the live session now ends with the question
         // and its answer (or part of it); trim it back to the transcript.
         self.sync_exact_kv_to_parent();
+        self.last_ctx_used = saved_ctx;
         let (stream, _text, _stats) = generated?;
         let tried_tool = !stream.finished().calls.is_empty() || stream.finished().error.is_some();
-        let mut renderer = stream.into_sink().into_renderer();
+        let mut renderer = stream.into_sink().inner.into_renderer();
         renderer.finish();
-        if !renderer.last_output_newline() {
+        if !gui_protocol_enabled() && !renderer.last_output_newline() {
             println!();
         }
         if tried_tool {
+            let message = "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)";
+            worker::publish_aside(
+                gui_protocol_enabled(),
+                self.remote.as_ref().map(|remote| remote.bus.as_ref()),
+                UiEvent::Dim(message.into()),
+            );
+            if !gui_protocol_enabled() {
+                println!("{message}");
+            }
+        }
+        worker::publish_aside(
+            gui_protocol_enabled(),
+            self.remote.as_ref().map(|remote| remote.bus.as_ref()),
+            UiEvent::Dim("[btw — not part of the conversation]".into()),
+        );
+        if !gui_protocol_enabled() {
             println!(
-                "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)"
+                "{}",
+                self.debug_line("[btw — not part of the conversation]")
             );
         }
-        println!(
-            "{}",
-            self.debug_line("[btw — not part of the conversation]")
-        );
         self.last_ctx_used = saved_ctx;
         Ok(())
     }
@@ -13578,6 +15203,7 @@ impl Agent<'_> {
         // about, and folding it in would mean `Arcade` holding a registry.
         let mut wasm_frame: Option<crate::wasmreg::OpenFrame> = None;
         let mut wasm_frame_last = Instant::now();
+        let mut remote_jobs_last = Instant::now();
         // When the user was last heard from, for `ui.screensaver`. Only real
         // input counts: a poll that times out is exactly the idleness the
         // screensaver is waiting for. A running turn never reaches this loop,
@@ -13596,6 +15222,7 @@ impl Agent<'_> {
                 &offer.question,
                 ("Not now", "leave it off; /plugins trust approves it later"),
                 ("Trust", "record the approval and load it now"),
+                self.remote.as_deref(),
             );
             let outcome = crate::wasmreg::answer_trust_offer(
                 &mut self.tool_ctx.wasm,
@@ -13609,7 +15236,7 @@ impl Agent<'_> {
         // anything else runs, through the same panel every other question
         // uses. Declining just starts the session.
         if offer_init {
-            match run_agentsmd_offer_panel(terminal, &log, &mut view) {
+            match run_agentsmd_offer_panel(terminal, &log, &mut view, self.remote.as_deref()) {
                 crate::agentsmd::Offer::Generate => {
                     self.tui_run_init(
                         InitSource::LaunchOffer,
@@ -13760,6 +15387,17 @@ impl Agent<'_> {
             // segments off the line; see `build_status_text_within`.
             let cols = terminal.size().map_or(80, |s| s.width) as usize;
             self.refresh_jobs_report(&mut report);
+            if self.remote.is_some() && remote_jobs_last.elapsed() >= Duration::from_secs(1) {
+                self.tool_ctx.bash.sweep();
+                if let Some(remote) = &self.remote {
+                    remote
+                        .bus
+                        .broadcast(UiEvent::Jobs(crate::remote::control::JobsWire::capture(
+                            &self.tool_ctx.bash.rows(),
+                        )));
+                }
+                remote_jobs_last = Instant::now();
+            }
             let mut status = self.idle_status_text(cols);
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
@@ -13897,7 +15535,11 @@ impl Agent<'_> {
                 // pass below: the lines stay queued in `shared` and run once
                 // it closes. A screensaver is taken down instead, since a
                 // remote line is activity.
-                let remote_queued = self.remote.as_ref().is_some_and(|r| r.shared.has_queued());
+                let remote_queued = self.remote.as_ref().is_some_and(|r| {
+                    r.shared.has_queued()
+                        || r.shared.has_commands()
+                        || r.shared.has_prompt_requests()
+                });
                 let gate =
                     remote_lines_gate(wasm_frame.as_ref().map(|f| f.screensaver), remote_queued);
                 if remote_wait_notice_due(gate, remote_queued, &mut remote_wait_noticed)
@@ -13929,7 +15571,19 @@ impl Agent<'_> {
                     // for all of it. `with_turn_from_remote` clears the flag on
                     // every way out, the quit and each error included.
                     let quit = self.with_turn_from_remote(|this| -> Result<bool, String> {
-                        let queued = r.shared.take_queued();
+                        let prompt_requests = r.shared.take_prompt_requests();
+                        let queued = r
+                            .shared
+                            .take_commands()
+                            .into_iter()
+                            .chain(r.shared.take_queued())
+                            .chain(
+                                prompt_requests
+                                    .iter()
+                                    .filter(|(id, text)| r.begin_input(id, text))
+                                    .map(|(_, text)| text.clone()),
+                            );
+                        let mut deferred_commands = Vec::new();
                         let mut run = false;
                         for line in queued {
                             let line = line.trim().to_owned();
@@ -13937,22 +15591,45 @@ impl Agent<'_> {
                                 continue;
                             }
                             if line.starts_with('/') {
-                                if !this.tui_slash(
-                                    &line,
-                                    &mut log,
-                                    terminal,
-                                    &mut view,
-                                    &mut input,
-                                    &mut btw_panel,
-                                    &mut config_form,
-                                    &mut kv_pane,
-                                    &mut resume_pane,
-                                    &mut arcade,
-                                    &mut sub_pane,
-                                    &mut report,
-                                ) {
+                                let before = log.line_count();
+                                let (_, sequence) = r.bus.scrollback_since(None);
+                                let prior_report = report.take();
+                                if !this.remote_document_command(&line, &mut log, terminal)
+                                    && !this.tui_slash(
+                                        &line,
+                                        &mut log,
+                                        terminal,
+                                        &mut view,
+                                        &mut input,
+                                        &mut btw_panel,
+                                        &mut config_form,
+                                        &mut kv_pane,
+                                        &mut resume_pane,
+                                        &mut arcade,
+                                        &mut sub_pane,
+                                        &mut report,
+                                    )
+                                {
                                     return Ok(true);
                                 }
+                                remote_command_output(
+                                    &r.bus,
+                                    &log,
+                                    before,
+                                    sequence,
+                                    report.take(),
+                                );
+                                report = prior_report;
+                                r.bus.broadcast(UiEvent::Controls(this.gui_controls()));
+                                r.bus.broadcast(UiEvent::Jobs(
+                                    crate::remote::control::JobsWire::capture(
+                                        &this.tool_ctx.bash.rows(),
+                                    ),
+                                ));
+                                r.bus.broadcast(UiEvent::Tasks(tui::TaskView::with_goal(
+                                    &this.session.tasks,
+                                    this.session.goal.as_ref(),
+                                )));
                                 // `/goal` arms a loop instead of running one: it
                                 // cannot start a turn from inside `tui_slash`,
                                 // which has no terminal handles of its own.
@@ -13960,6 +15637,9 @@ impl Agent<'_> {
                                 // means exactly "`/goal` just started one".
                                 if this.goal.is_some() {
                                     run = true;
+                                    deferred_commands.push(line);
+                                } else {
+                                    r.bus.broadcast(UiEvent::CommandDone { text: line });
                                 }
                             } else {
                                 r.bus.broadcast(UiEvent::UserEcho(line.clone()));
@@ -13983,6 +15663,26 @@ impl Agent<'_> {
                             // from the moment the UI comes back to idle, not
                             // from before the turn.
                             last_activity = Instant::now();
+                        }
+                        for text in deferred_commands {
+                            r.bus.broadcast(UiEvent::CommandDone { text });
+                        }
+                        for (request_id, text) in prompt_requests {
+                            if !r.shared.request_is_pending(&request_id) {
+                                continue;
+                            }
+                            if r.shared.request_is_legacy(&request_id) {
+                                // Legacy commands already got CommandDone at their
+                                // dispatch/goal boundary; do not duplicate it here.
+                                r.shared.finish_prompt_request(&request_id);
+                                continue;
+                            }
+                            r.shared.finish_prompt_request(&request_id);
+                            r.bus.broadcast(if text.trim_start().starts_with('/') {
+                                UiEvent::CommandRequestDone { request_id }
+                            } else {
+                                UiEvent::PromptDone { request_id }
+                            });
                         }
                         Ok(false)
                     })?;
@@ -14465,19 +16165,23 @@ impl Agent<'_> {
                     // draw instead.
                     crate::kvpane::Outcome::Pin(idx, fp) => {
                         log.push_dim(self.kvcache_apply_idx("pin", idx, &fp));
+                        self.publish_cache(1);
                     }
                     crate::kvpane::Outcome::Unpin(idx, fp) => {
                         log.push_dim(self.kvcache_apply_idx("unpin", idx, &fp));
+                        self.publish_cache(1);
                     }
                     // These two change what is on disk, so the pane has to be
                     // rebuilt or it would keep offering rows that are gone.
                     crate::kvpane::Outcome::Delete(idx, fp) => {
                         log.push_dim(self.kvcache_apply_idx("rm", idx, &fp));
                         kv_pane = Some(self.kvcache_pane());
+                        self.publish_cache(1);
                     }
                     crate::kvpane::Outcome::Sweep => {
                         log.push_dim(self.kvcache_sweep());
                         kv_pane = Some(self.kvcache_pane());
+                        self.publish_cache(1);
                     }
                 }
                 continue;
@@ -15400,8 +17104,17 @@ impl Agent<'_> {
             return;
         }
         let st = self.idle_status();
+        self.publish_idle_metrics(&st);
         if let Some(r) = &self.remote {
             r.bus.broadcast(UiEvent::Status(st));
+            r.bus
+                .broadcast(UiEvent::Jobs(crate::remote::control::JobsWire::capture(
+                    &self.tool_ctx.bash.rows(),
+                )));
+            r.bus.broadcast(UiEvent::Tasks(tui::TaskView::with_goal(
+                &self.session.tasks,
+                self.session.goal.as_ref(),
+            )));
         }
     }
 
@@ -15830,6 +17543,17 @@ impl Agent<'_> {
                             let g = self.goal.as_mut().expect("goal is live in this branch");
                             (g.next_iteration(), g.max_iters())
                         };
+                        if let Some(goal) = self.session.goal.as_mut() {
+                            goal.iter = iter;
+                        }
+                        if let Some(remote) = &self.remote {
+                            remote
+                                .bus
+                                .broadcast(UiEvent::Tasks(tui::TaskView::with_goal(
+                                    &self.session.tasks,
+                                    self.session.goal.as_ref(),
+                                )));
+                        }
                         log.push_dim(crate::goal::banner(iter, max));
                         run_main = true;
                         continue;
@@ -15890,16 +17614,23 @@ impl Agent<'_> {
     /// replayed the transcript that was just cleared. A no-op with no bridge.
     ///
     /// Call it wherever `self.session` is replaced wholesale — `/clear`,
-    /// `/new`, `/switch`, `/resume` — right after the swap.
+    /// `/new`, `/switch`, `/resume` — after clearing old session-scoped state.
     fn broadcast_session_reset(&self, note: Option<&str>) {
-        let Some(r) = &self.remote else { return };
-        r.bus.broadcast(UiEvent::SessionReset);
-        // `/switch` and `/resume` replay the loaded transcript into the *local*
-        // log directly, not through the bus, so a remote client would be left
-        // looking at an empty page. Say why rather than leave it blank.
-        if let Some(note) = note {
-            r.bus.broadcast(UiEvent::Dim(note.to_owned()));
+        self.tool_ctx.console.reset_subagents();
+        if gui_protocol_enabled() {
+            eprintln!("+PLANK_TELEMETRY {}", serde_json::json!({"type":"reset"}));
         }
+        if let Some(r) = &self.remote {
+            r.bus.broadcast(UiEvent::SessionReset);
+            // `/switch` and `/resume` replay the loaded transcript into the *local*
+            // log directly, not through the bus, so a remote client would be left
+            // looking at an empty page. Say why rather than leave it blank.
+            if let Some(note) = note {
+                r.bus.broadcast(UiEvent::Dim(note.to_owned()));
+            }
+        }
+        self.refresh_saved_sessions();
+        self.refresh_history();
     }
 
     /// Whether a remote-control bridge is currently live.
@@ -16050,6 +17781,16 @@ impl Agent<'_> {
     /// must ask, and each request waits for a local `/grant`. Use it when the
     /// link may reach someone you would rather approve one turn at a time.
     fn remote_toggle_lines(&mut self, cmd: &str, arg: &str) -> Vec<String> {
+        if arg.eq_ignore_ascii_case("status") {
+            return vec![
+                if self.remote_is_on() {
+                    "Remote host status requested"
+                } else {
+                    "Remote control is off"
+                }
+                .into(),
+            ];
+        }
         let mut allow_control = true;
         let want_on = if arg.is_empty() {
             !self.remote_is_on()
@@ -16099,6 +17840,10 @@ impl Agent<'_> {
     /// Runs on the worker thread and talks to the UI only through `tx`.
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
+        if shared.prompt_batch_cancelled() {
+            self.last_turn_interrupted = true;
+            return Ok(());
+        }
         self.refuse_oversized_prompt()?;
         // TUI: a headless sub-agent's output is forwarded over the same
         // worker→UI channel as the parent turn's own render events.
@@ -16135,6 +17880,10 @@ impl Agent<'_> {
                 let _ = tx.send(UiEvent::Markdown(doc.to_owned()));
             })
         });
+        if self.subagent_progress().is_some() {
+            self.tool_ctx.status_sink = self.subagent_tool_sink(false);
+            self.tool_ctx.markdown_sink = self.subagent_tool_sink(true);
+        }
         // After the status sink, so the retry's notice reaches the log.
         self.begin_turn_gpu_yield();
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
@@ -16439,6 +18188,9 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
                 }
                 shared.set_jobs(self.tool_ctx.bash.rows());
+                let _ = tx.send(UiEvent::Jobs(crate::remote::control::JobsWire::capture(
+                    &self.tool_ctx.bash.rows(),
+                )));
                 // The transcript just grew by this round's results, which is
                 // where context fills in bulk; re-count so the panel's
                 // breakdown is current, not turn-start.
@@ -16450,7 +18202,11 @@ impl Agent<'_> {
                 let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
                 if let Some(line) = self.tool_activity_line(&out.calls) {
-                    let _ = tx.send(UiEvent::Dim(line));
+                    if self.subagent_progress().is_some() {
+                        self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(line))));
+                    } else {
+                        let _ = tx.send(UiEvent::Dim(line));
+                    }
                 }
                 // Keep this exactly in step with the plain-stdout path: only
                 // an observed file mutation resets the budget.
@@ -16463,17 +18219,29 @@ impl Agent<'_> {
                     self.tool_ctx.last_written.take(),
                 );
                 for preview in previews {
-                    let _ = tx.send(UiEvent::EditCard(preview));
+                    if self.subagent_progress().is_some() {
+                        self.emit_sub(UiEvent::Sub(Box::new(UiEvent::EditCard(preview))));
+                    } else {
+                        let _ = tx.send(UiEvent::EditCard(preview));
+                    }
                 }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
-                    let _ = tx.send(UiEvent::Dim(format!("✓ {line}")));
+                    if self.subagent_progress().is_some() {
+                        self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(format!("✓ {line}")))));
+                    } else {
+                        let _ = tx.send(UiEvent::Dim(format!("✓ {line}")));
+                    }
                 }
                 let _ = tx.send(UiEvent::Tasks(tui::TaskView::with_goal(
                     &self.session.tasks,
                     self.session.goal.as_ref(),
                 )));
-                for warning in self.tool_ctx.hook_warnings.drain(..) {
-                    let _ = tx.send(UiEvent::Dim(warning));
+                for warning in std::mem::take(&mut self.tool_ctx.hook_warnings) {
+                    if self.subagent_progress().is_some() {
+                        self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(warning))));
+                    } else {
+                        let _ = tx.send(UiEvent::Dim(warning));
+                    }
                 }
                 // Mirror of the plain-stdout path: anchor the rung at the
                 // index this result will occupy, before it is appended.
@@ -16484,13 +18252,23 @@ impl Agent<'_> {
                         .with_images(images),
                 );
                 if crate::settings::active().ui.show_tool_results && !self.quiet_tools {
-                    for line in observations.lines() {
-                        let _ = tx.send(UiEvent::Dim(line.to_owned()));
+                    if self.subagent_progress().is_some() {
+                        self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(observations.clone()))));
+                    } else {
+                        for line in observations.lines() {
+                            let _ = tx.send(UiEvent::Dim(line.to_owned()));
+                        }
                     }
                 }
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
+                    if self.subagent_progress().is_some() {
+                        self.emit_sub(UiEvent::Sub(Box::new(UiEvent::Dim(format!(
+                            "halted: {reason}"
+                        )))));
+                    } else {
+                        let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
+                    }
                     return Ok(());
                 }
                 if self.loop_guard.tripped() {
@@ -16515,6 +18293,9 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::Dim(Self::job_wake_line(woke)));
                 }
                 shared.set_jobs(self.tool_ctx.bash.rows());
+                let _ = tx.send(UiEvent::Jobs(crate::remote::control::JobsWire::capture(
+                    &self.tool_ctx.bash.rows(),
+                )));
                 // The transcript just grew by this round's results, which is
                 // where context fills in bulk; re-count so the panel's
                 // breakdown is current, not turn-start.
@@ -17046,6 +18827,9 @@ impl Agent<'_> {
         if self.in_sidechain() {
             return false; // never nest a pass inside another sidechain
         }
+        if self.console_remote_interrupted() {
+            return false; // the dispatcher retires the stop before another idle attempt
+        }
         if self.gpu_yield.pending.is_some() {
             // The model is out after a failed GPU-yield reload: the job waits
             // for the turn-start retry rather than failing against the
@@ -17115,7 +18899,7 @@ impl Agent<'_> {
                 return false;
             }
         };
-        if interrupted || crate::interrupt::pending() {
+        if interrupted || crate::interrupt::pending() || self.console_remote_interrupted() {
             self.requeue_memory_job(job, true);
             return false;
         }
@@ -17480,11 +19264,14 @@ impl Agent<'_> {
         // An engine whose KV truncates exactly keeps the prefilled prefix for
         // the retry on its own, so a snapshot would only copy the whole cache.
         let exact = self.engine.kv_truncates_exactly();
+        let remote_interrupted = self.console_remote_interrupted();
         let mut snapshot = || {
             if exact { None } else { self.engine.get_kv() }
         };
         match result {
-            Ok(false) if !crate::interrupt::pending() => MemoryPrefill::Done(snapshot()),
+            Ok(false) if !crate::interrupt::pending() && !remote_interrupted => {
+                MemoryPrefill::Done(snapshot())
+            }
             Ok(_) => MemoryPrefill::Interrupted(snapshot()),
             Err(e) if e == QUIET_ABORT_INTERRUPTED => MemoryPrefill::Interrupted(snapshot()),
             Err(_) => MemoryPrefill::Failed,
@@ -17577,6 +19364,131 @@ impl Agent<'_> {
     fn jobs_command(&mut self) -> String {
         self.tool_ctx.bash.sweep();
         self.tool_ctx.bash.render_table()
+    }
+
+    fn engines_report(&self, argument: &str) -> String {
+        use std::fmt::Write as _;
+        let words = argument.split_whitespace().collect::<Vec<_>>();
+        let ["--page", page] = words.as_slice() else {
+            return "usage: /engines [--page N]".into();
+        };
+        let Ok(page) = page.parse::<usize>() else {
+            return "Engine catalog page must be a positive integer".into();
+        };
+        if page == 0 {
+            return "Engine catalog page must be a positive integer".into();
+        }
+        let snapshot = crate::enginefit::EngineInventory::capture(page);
+        let mut report = format!(
+            "Engine catalog · {} entries · page {}\n",
+            snapshot.total, snapshot.page
+        );
+        for engine in &snapshot.engines {
+            let _ = writeln!(
+                report,
+                "{} · v{} · {}\n{}",
+                engine.name, engine.version, engine.detail, engine.notes
+            );
+        }
+        self.publish_metrics_snapshot(crate::remote::control::MetricsWire::Engines { snapshot });
+        report
+    }
+
+    fn tasks_command(&mut self, argument: &str) -> String {
+        const USAGE: &str = "usage: /tasks [add <subject>|set <id> <pending|in_progress|completed>|rename <id> <subject>|active <id> <text|->]\n";
+        let argument = argument.trim();
+        if argument.is_empty() {
+            self.publish_console_tasks();
+            return self.session.tasks.render_list(self.session.goal.as_ref());
+        }
+        if argument.len() > 1024 || argument.chars().any(char::is_control) {
+            return "Task commands require a single line of at most 1024 bytes\n".into();
+        }
+        let Some((action, rest)) = argument.split_once(char::is_whitespace) else {
+            return USAGE.into();
+        };
+        let rest = rest.trim();
+        let task_id = if action == "add" {
+            if rest.is_empty() || self.session.tasks.next_id() == u32::MAX {
+                return USAGE.into();
+            }
+            self.session.tasks.add(rest, None)
+        } else {
+            let Some((id, value)) = rest.split_once(char::is_whitespace) else {
+                return USAGE.into();
+            };
+            let Ok(id) = id.parse::<u32>() else {
+                return USAGE.into();
+            };
+            let value = value.trim();
+            if id == 0 || value.is_empty() {
+                return USAGE.into();
+            }
+            let (status, subject, active) = match action {
+                "set" => {
+                    let Some(status) = crate::tasks::TaskStatus::parse(value) else {
+                        return USAGE.into();
+                    };
+                    (Some(status), None, None)
+                }
+                "rename" => (None, Some(value.to_owned()), None),
+                "active" => (
+                    None,
+                    None,
+                    Some(if value == "-" {
+                        String::new()
+                    } else {
+                        value.to_owned()
+                    }),
+                ),
+                _ => return USAGE.into(),
+            };
+            if self
+                .session
+                .tasks
+                .update(id, status, subject, active)
+                .is_err()
+            {
+                return format!("No task with id {id}\n");
+            }
+            id
+        };
+        self.session.dirty = true;
+        let saved = self.save_session();
+        self.publish_console_tasks();
+        let status = self
+            .session
+            .tasks
+            .get(task_id)
+            .expect("added or updated task exists")
+            .status
+            .as_str();
+        match saved {
+            Ok(id) => format!(
+                "Task [{task_id}] {status}; saved in session {}\n",
+                crate::session::display_id(&id)
+            ),
+            Err(error) => format!("Task [{task_id}] changed in memory; save failed: {error}\n"),
+        }
+    }
+
+    fn jobs_action(&mut self, argument: &str) -> String {
+        let words = argument.split_whitespace().collect::<Vec<_>>();
+        if words.is_empty() {
+            return self.jobs_command();
+        }
+        let [action @ ("output" | "stop"), id] = words.as_slice() else {
+            return "usage: /jobs [output|stop <id>]".into();
+        };
+        let Ok(id) = id.parse::<i64>() else {
+            return "Job ID must be a positive integer".into();
+        };
+        if id <= 0 {
+            return "Job ID must be a positive integer".into();
+        }
+        let result = self.tool_ctx.bash.report_job(id, *action == "stop");
+        self.publish_console_jobs();
+        result.unwrap_or_else(|error| error)
     }
 
     /// Opens the `/jobs` panel, or closes it when it is the one showing:
@@ -17693,7 +19605,20 @@ impl Agent<'_> {
         // the deepest ladder rung below the divergence first. This is the
         // path every ordinary TUI turn runs through, so it needs its own call.
         self.rescue_prefix_before_rebuild(prompt);
-        let mut stream = StreamRenderer::with_syntax(ChannelSink(tx.clone()), self.tool_syntax());
+        let mut progress = if aside {
+            None
+        } else {
+            self.subagent_progress()
+        };
+        let sink: Box<dyn crate::viz::RenderSink + Send> = if progress.is_some() {
+            Box::new(crate::worker::SubAgentSink(tx.clone()))
+        } else {
+            Box::new(ChannelSink(tx.clone()))
+        };
+        let mut stream = StreamRenderer::with_syntax(
+            crate::console_input::output::mirror_sink(sink, progress.as_ref()),
+            self.tool_syntax(),
+        );
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
         // See the matching comment in `stream_generation`: a defensive retry
@@ -17733,7 +19658,9 @@ impl Agent<'_> {
             self.tool_ctx.bash.running_count(),
         );
         shared.set_jobs(self.tool_ctx.bash.rows());
-        shared.set_context(self.context_breakdown());
+        let breakdown = self.context_breakdown();
+        self.publish_metrics_snapshot(context_metrics(&breakdown, live.prompt_tokens));
+        shared.set_context(breakdown);
         let mut assistant_text = String::new();
 
         // Polled between tokens, and relayed into prefill by the progress
@@ -17756,6 +19683,7 @@ impl Agent<'_> {
         };
         let greedy_fn = || greedy.load(Ordering::Relaxed);
         let mut on_event = |ev: EngineEvent| {
+            crate::console_input::note_subagent_progress(&mut progress, &ev);
             if let EngineEvent::Text(t) = &ev {
                 assistant_text.push_str(t);
                 stream.push(t);
@@ -17774,7 +19702,7 @@ impl Agent<'_> {
                 greedy.load(Ordering::Relaxed),
                 repeat.repeating(),
             ) {
-                let _ = tx.send(UiEvent::Status(status));
+                live.publish_status(status, tx);
             }
         };
         // Provider engines take a structured turn; local engines keep the flat
@@ -18143,10 +20071,25 @@ impl Agent<'_> {
         log: &mut OutputLog,
         config_form: &mut Option<crate::configform::ConfigForm>,
     ) {
-        if arg == "--resolved" {
+        if let Some(page) = arg
+            .strip_prefix("--page ")
+            .and_then(|page| page.parse::<usize>().ok())
+        {
+            self.publish_config(page, None);
+            log.push_plain("Settings page requested");
+        } else if arg == "--resolved" {
             log.push_ansi(&crate::provenance::render_resolved(
                 crate::settings::active(),
                 self.cfg,
+            ));
+        } else if arg.is_empty() && self.turn_from_remote {
+            self.publish_config(1, None);
+            log.push_plain(crate::configform::render_text_list(
+                crate::settings::active(),
+            ));
+            log.push_plain(crate::configform::render_plugin_list(
+                crate::settings::active(),
+                &self.tool_ctx.wasm.registry.declared_config(),
             ));
         } else if arg.is_empty() {
             // Open the interactive modal; the run loop drives it and persists
@@ -18174,6 +20117,7 @@ impl Agent<'_> {
             ));
         } else {
             log.push_dim(self.config_set_command(arg));
+            self.publish_config(1, arg.split_whitespace().next());
         }
     }
 
@@ -18267,7 +20211,13 @@ impl Agent<'_> {
                 self.tui_clear_session(log, terminal, view, sub, true);
             }
             "/checkpoint" => {
-                if arg.is_empty() {
+                if let Some(page) = arg
+                    .strip_prefix("--page ")
+                    .and_then(|page| page.parse().ok())
+                {
+                    self.publish_history(true, page);
+                } else if arg.is_empty() {
+                    self.publish_history(true, 1);
                     log.push_ansi(&crate::checkpoint::render_list(
                         &self.checkpoints,
                         now_secs(),
@@ -18282,20 +20232,32 @@ impl Agent<'_> {
                     log.push_plain("usage: /rollback <name> (see /checkpoint for the list)");
                 } else {
                     match self.rollback_to(arg) {
-                        Ok(msg) => log.push_plain(msg),
+                        Ok(msg) => {
+                            log.push_plain(msg);
+                        }
                         Err(e) => log.push_plain(e),
                     }
                 }
             }
             "/tree" => {
+                self.publish_history(
+                    false,
+                    arg.strip_prefix("--page ")
+                        .and_then(|page| page.parse().ok())
+                        .unwrap_or(1),
+                );
                 *report = Some(tui::ReportPanel::new("tree", &self.tree_view(true)));
             }
             "/fork" => match self.fork_branch(arg, true) {
-                Ok(msg) => log.push_ansi(&msg),
+                Ok(msg) => {
+                    log.push_ansi(&msg);
+                }
                 Err(e) => log.push_plain(e),
             },
             "/clone" => match self.clone_branch() {
-                Ok(msg) => log.push_plain(msg),
+                Ok(msg) => {
+                    log.push_plain(msg);
+                }
                 Err(e) => log.push_plain(e),
             },
             "/help" => {
@@ -18303,12 +20265,30 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/command" | "/commands" => {
+                let text = self.gui_controls()["commands"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|command| {
+                        format!(
+                            "{} {} — {}",
+                            command["name"].as_str().unwrap_or(""),
+                            command["args"].as_str().unwrap_or(""),
+                            command["description"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                *report = Some(tui::ReportPanel::new("Commands", &text));
+            }
             "/version" => log.push_plain(format!("plank {}", crate::logo::version_label())),
             // The inventory reports below all go to the dismissable panel for
             // the reason `/usage` does: they are snapshots of state, so in the
             // scrollback they interleave with the model's output and scroll
             // away for good.
             "/mcp" => {
+                self.publish_extensions("mcp");
                 *report = Some(tui::ReportPanel::new(
                     MCP_REPORT_TITLE,
                     &render_mcp_report(&self.tool_ctx.mcp, true),
@@ -18318,6 +20298,7 @@ impl Agent<'_> {
             // uses, so the breakdown stays in one place instead of scrolling
             // away inside the model's output.
             "/context" => {
+                self.publish_metrics("context");
                 *report = Some(tui::ReportPanel::new(
                     CONTEXT_REPORT_TITLE,
                     &self.render_context_report(true),
@@ -18327,6 +20308,7 @@ impl Agent<'_> {
             // the bottom instead of into the scrollback, where it would
             // interleave with the model's output and scroll away for good.
             "/usage" => {
+                self.publish_metrics("usage");
                 *report = Some(tui::ReportPanel::new(
                     "usage",
                     &self.render_usage_report(true),
@@ -18335,6 +20317,7 @@ impl Agent<'_> {
             // A snapshot like `/usage`: the chart belongs in the dismissable
             // panel, not in the scrollback between the model's output.
             "/toks" => {
+                self.publish_metrics("throughput");
                 *report = Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
             }
             // Re-issuing `/stats` with the panel up cycles the range; an
@@ -18403,7 +20386,9 @@ impl Agent<'_> {
                 // The panel borrows the log and view the arm otherwise only
                 // writes to, so the confirmer is built here and the result
                 // reported after it is done.
-                let mut confirm = |q: &str| run_confirm_panel(terminal, &*log, view, q);
+                let remote = self.remote.clone();
+                let mut confirm =
+                    |q: &str| run_confirm_panel(terminal, &*log, view, q, remote.as_deref());
                 let outcome = self.rename_session(arg, &mut confirm);
                 match outcome {
                     Ok(msg) => log.push_plain(msg),
@@ -18412,9 +20397,10 @@ impl Agent<'_> {
             }
             "/list" => match self.store.list() {
                 Ok(entries) => {
+                    let entries = self.publish_saved_sessions(&entries, arg);
                     *report = Some(tui::ReportPanel::new(
                         "sessions",
-                        &crate::session::render_session_list(&entries, now_secs(), false),
+                        &crate::session::render_session_list(entries, now_secs(), false),
                     ));
                 }
                 // A failure is a one-line acknowledgement, not a report.
@@ -18428,10 +20414,13 @@ impl Agent<'_> {
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
             "/del" => match self.store.delete(arg) {
-                Ok(id) => log.push_plain(format!(
-                    "deleted session {}",
-                    crate::session::display_id(&id)
-                )),
+                Ok(id) => {
+                    self.refresh_saved_sessions();
+                    log.push_plain(format!(
+                        "deleted session {}",
+                        crate::session::display_id(&id)
+                    ));
+                }
                 Err(e) => log.push_plain(format!("delete failed: {e}")),
             },
             "/retitle" => log.push_plain(self.retitle_sessions()),
@@ -18498,7 +20487,15 @@ impl Agent<'_> {
                         .map(|c| (c.as_str(), "download it from plank-buddies"))
                         .collect();
                     options.push(("Not now", "leave the buddy as it is"));
-                    let picked = run_pick_panel(terminal, log, view, "Buddy", &question, &options);
+                    let picked = run_pick_panel(
+                        terminal,
+                        log,
+                        view,
+                        "Buddy",
+                        &question,
+                        &options,
+                        self.remote.as_deref(),
+                    );
                     match picked.and_then(|i| choices.get(i)) {
                         Some(name) => log.push_plain(crate::buddy::chosen(name)),
                         None => log.push_plain("no buddy picked"),
@@ -18509,8 +20506,12 @@ impl Agent<'_> {
             // `/usage`, refreshed every tick while open (`refresh_jobs_report`).
             "/jobs" => {
                 *report = Some(tui::ReportPanel::new(
-                    JOBS_REPORT_TITLE,
-                    &self.jobs_command(),
+                    if arg.is_empty() {
+                        JOBS_REPORT_TITLE
+                    } else {
+                        "Background job output"
+                    },
+                    &self.jobs_action(arg),
                 ));
             }
             "/think" => {
@@ -18571,6 +20572,7 @@ impl Agent<'_> {
             "/kvcache" => {
                 if arg.is_empty() {
                     *kv_pane = Some(self.kvcache_pane());
+                    self.publish_cache(1);
                 } else {
                     // Subcommands work in the TUI too, for scripted use.
                     for line in self.kvcache_text_command(arg).lines() {
@@ -18580,9 +20582,11 @@ impl Agent<'_> {
             }
             "/model" => {
                 log.push_dim(Self::model_text_command(arg));
+                self.publish_downloads();
             }
             "/skills" => {
                 *report = Some(tui::ReportPanel::new("skills", &self.skills_command(arg)));
+                self.publish_extensions("skills");
             }
             // A bare `/frame` lists the openable frames, which is a report; with
             // an argument it opens one, which is an action and stays a line in
@@ -18601,6 +20605,7 @@ impl Agent<'_> {
             // removes or trusts and reports its outcome as a line.
             "/plugins" => {
                 let out = self.plugins_command(arg);
+                self.publish_extensions("plugins");
                 if arg.trim().is_empty() {
                     *report = Some(tui::ReportPanel::new("plugins", &out));
                 } else {
@@ -18624,6 +20629,10 @@ impl Agent<'_> {
                     return false;
                 }
             }
+            "/engines" if !arg.trim().is_empty() => {
+                let text = self.engines_report(arg);
+                *report = Some(tui::ReportPanel::new("Engine catalog", &text));
+            }
             "/engines" => match self.save_session() {
                 Ok(id) => {
                     crate::profileedit::request_restart(crate::profileedit::Restart {
@@ -18639,18 +20648,24 @@ impl Agent<'_> {
                 )),
             },
             "/templates" => {
+                self.publish_extensions("templates");
                 *report = Some(tui::ReportPanel::new(
                     "templates",
                     &crate::templates::render_list(&self.templates),
                 ));
             }
             "/tasks" => {
+                let text = self.tasks_command(arg);
+                if !arg.trim().is_empty() {
+                    log.push_plain(text);
+                }
                 *report = Some(tui::ReportPanel::new(
                     TASKS_REPORT_TITLE,
                     &self.session.tasks.render_list(self.session.goal.as_ref()),
                 ));
             }
             "/agent" => {
+                self.publish_extensions("agents");
                 *report = Some(tui::ReportPanel::new(
                     "agents",
                     &crate::agents::render_list(&self.agents),
@@ -18658,16 +20673,19 @@ impl Agent<'_> {
             }
             "/hooks" => {
                 *report = Some(tui::ReportPanel::new("hooks", &self.hooks_command(arg)));
+                self.publish_extensions("hooks");
             }
             "/remote-control" | "/rc" => {
                 for line in self.remote_toggle_lines(cmd, arg) {
                     log.push_plain(line);
                 }
+                self.publish_host();
             }
             "/grant" => {
                 for line in self.grant_lines(arg) {
                     log.push_plain(line);
                 }
+                self.publish_host();
             }
             "/btw" => {
                 if arg.is_empty() {
@@ -18714,6 +20732,7 @@ impl Agent<'_> {
                             &question,
                             ("Keep it", "cancel and leave memory unchanged"),
                             ("Forget", "remove the matching entries now"),
+                            self.remote.as_deref(),
                         );
                         if confirmed {
                             match crate::memory::forget_matching(&self.tool_ctx.cwd, pattern) {
@@ -18906,16 +20925,27 @@ impl Agent<'_> {
                     let fork_at =
                         self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     log.push_dim(tui::subagent_signpost(&label));
-                    sub.begin(label, &task, tui::roster_clock_ms());
+                    self.publish_subagent_event(&UiEvent::SubStart {
+                        label: label.clone(),
+                        task: task.clone(),
+                    });
+                    sub.begin(label.clone(), &task, tui::roster_clock_ms());
                     sub.adopt_turn = true;
+                    let previous_label = self.tool_ctx.subagent_label.replace(label.clone());
                     let outcome = match alt {
                         None => self.tui_turn(terminal, log, view, input, btw, arcade, sub),
                         Some((key, engine)) => self.run_sidechain_on(key, engine, |s| {
                             s.tui_turn(terminal, log, view, input, btw, arcade, sub)
                         }),
                     };
+                    self.tool_ctx.subagent_label = previous_label;
                     sub.adopt_turn = false;
                     sub.end(tui::roster_clock_ms());
+                    self.finish_subagent_activity(
+                        &label,
+                        fork_at,
+                        outcome.as_ref().err().map(String::as_str),
+                    );
                     if let Err(e) = outcome {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, &task);
@@ -18973,6 +21003,109 @@ impl Agent<'_> {
             },
         }
         true
+    }
+
+    /// Handles document controls without opening an editor on the host terminal.
+    fn remote_document_command(
+        &mut self,
+        line: &str,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> bool {
+        let (command, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let result = match command {
+            "/open" => self.remote_open_document(arg.trim(), terminal),
+            "/memory" if !matches!(arg.split_whitespace().next(), Some("log" | "calibrate")) => {
+                self.remote_memory_document(terminal)
+            }
+            "/edit-profile" => self.remote_profile_document(terminal),
+            _ => return false,
+        };
+        match result {
+            Ok(lines) => {
+                for line in lines {
+                    log.push_plain(line);
+                }
+            }
+            Err(error) => log.push_plain(format!("{command}: {error}; nothing written")),
+        }
+        true
+    }
+
+    fn remote_open_document(
+        &mut self,
+        arg: &str,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<Vec<String>, String> {
+        let path = crate::openfile::resolve_open_target(
+            arg,
+            self.last_edited.as_deref(),
+            &self.tool_ctx.cwd,
+        )?;
+        // Remote HTML previews need a client-side renderer, never a host browser launch.
+        if crate::openfile::is_browser_target(&path) {
+            return Err("Remote HTML preview is not available yet".into());
+        }
+        let initial = crate::openfile::load(&path)?;
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or("Remote editor is not connected")?;
+        let edited = remote_edit_dialog(remote, terminal, &path.display().to_string(), &initial)?;
+        self.last_edited = Some(path.clone());
+        let Some(edited) = edited else {
+            return Ok(vec!["File edit cancelled".into()]);
+        };
+        let changed = apply_gui_file_edit(&path, &initial, &edited)?;
+        Ok(vec![if changed {
+            format!("Saved {}", path.display())
+        } else {
+            "File unchanged".into()
+        }])
+    }
+
+    fn remote_memory_document(
+        &self,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<Vec<String>, String> {
+        let sources = crate::memory::sources_for(&self.tool_ctx.cwd);
+        let initial = crate::memory::combine(&sources);
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or("Remote editor is not connected")?;
+        let Some(edited) =
+            remote_edit_dialog(remote, terminal, "Project and user memory", &initial)?
+        else {
+            return Ok(vec!["Memory edit cancelled".into()]);
+        };
+        apply_gui_memory_edit(&sources, &initial, &edited)
+    }
+
+    fn remote_profile_document(
+        &self,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<Vec<String>, String> {
+        let Some((plugin, spec)) = self.active_profile_plugin() else {
+            return Ok(vec![NO_ACTIVE_PROFILE.into()]);
+        };
+        let initial = crate::profileedit::render(&plugin, &spec)?;
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or("Remote editor is not connected")?;
+        let Some(edited) = remote_edit_dialog(remote, terminal, "Profile", &initial)? else {
+            return Ok(vec!["Profile edit cancelled".into()]);
+        };
+        if crate::profileedit::render(&plugin, &spec)? != initial {
+            return Err("Profile changed on disk; reopen /edit-profile before saving".into());
+        }
+        let applied = crate::profileedit::apply(&plugin, &spec, &edited)?;
+        let mut lines = applied.lines;
+        if applied.changed {
+            lines.push("Saved profile applies on the next engine restart; remote restart is not available yet".into());
+        }
+        Ok(lines)
     }
 
     /// Handles `/open [path]`: resolves the target, then either shows it in the
@@ -19088,6 +21221,7 @@ impl Agent<'_> {
                 ),
                 ("Later", "keep going; the changes apply at the next launch"),
             ],
+            self.remote.as_deref(),
         );
         if choice != Some(0) {
             log.push_dim("[profile] the changes apply at the next launch".to_owned());
@@ -19257,15 +21391,7 @@ fn render_memory_log_line(line: &str) -> String {
     format!("{action:<7} [{scope}] {id} — {text} ({reason})")
 }
 
-/// Asks a yes/no question at the plain-stdout prompt and returns the answer.
-/// Only an explicit yes counts; a closed or unreadable stdin declines, which is
-/// what keeps a piped run from silently agreeing to overwrite something.
-fn confirm_on_stdin(question: &str) -> bool {
-    ask_yes_no_on_stdin(question, "overwrite it? [y/N] ")
-}
-
-/// [`confirm_on_stdin`] with the caller's own answer prompt, for questions
-/// that are not about overwriting something.
+/// Declines unattended plain-REPL confirmations without reading its prompt stream.
 fn ask_yes_no_on_stdin(question: &str, prompt: &str) -> bool {
     // A piped stdin is somebody else's protocol stream (the headless front end
     // reads prompts off it): asking there would both go unanswered and eat a
@@ -19345,6 +21471,7 @@ fn run_confirm_panel(
     log: &OutputLog,
     view: &mut tui::OutputView,
     question: &str,
+    remote: Option<&RemoteState>,
 ) -> bool {
     run_yes_no_panel(
         terminal,
@@ -19357,12 +21484,17 @@ fn run_confirm_panel(
             "Overwrite",
             "adopt the name; the next save replaces the saved session",
         ),
+        remote,
     )
 }
 
 /// The two-option panel behind [`run_confirm_panel`], with the caller's header
 /// and labels. `no` is listed first so a stray Enter picks the safe answer;
 /// the result is true only when `yes` was chosen.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares local panel labels with the optional remote question bridge"
+)]
 fn run_yes_no_panel(
     terminal: &mut ratatui::DefaultTerminal,
     log: &OutputLog,
@@ -19371,8 +21503,9 @@ fn run_yes_no_panel(
     question: &str,
     no: (&str, &str),
     yes: (&str, &str),
+    remote: Option<&RemoteState>,
 ) -> bool {
-    run_pick_panel(terminal, log, view, header, question, &[no, yes]) == Some(1)
+    run_pick_panel(terminal, log, view, header, question, &[no, yes], remote) == Some(1)
 }
 
 /// The startup `AGENTS.md` offer as a three-way panel. Generate is listed
@@ -19382,12 +21515,21 @@ fn run_agentsmd_offer_panel(
     terminal: &mut ratatui::DefaultTerminal,
     log: &OutputLog,
     view: &mut tui::OutputView,
+    remote: Option<&RemoteState>,
 ) -> crate::agentsmd::Offer {
     use crate::agentsmd::{OFFER_OPTIONS, OFFER_QUESTION, Offer};
     let labels: Vec<(&str, &str)> = OFFER_OPTIONS.iter().map(|(_, l, d)| (*l, *d)).collect();
-    run_pick_panel(terminal, log, view, "AGENTS.md", OFFER_QUESTION, &labels)
-        .and_then(|i| OFFER_OPTIONS.get(i))
-        .map_or(Offer::NotNow, |(o, _, _)| *o)
+    run_pick_panel(
+        terminal,
+        log,
+        view,
+        "AGENTS.md",
+        OFFER_QUESTION,
+        &labels,
+        remote,
+    )
+    .and_then(|i| OFFER_OPTIONS.get(i))
+    .map_or(Offer::NotNow, |(o, _, _)| *o)
 }
 
 /// Records "Don't ask for this folder" for the current directory. Returns the
@@ -19413,6 +21555,7 @@ fn run_pick_panel(
     header: &str,
     question: &str,
     options: &[(&str, &str)],
+    remote: Option<&RemoteState>,
 ) -> Option<usize> {
     use crate::tools::ask::{AskOption, AskRequest, AskState};
     let req = AskRequest {
@@ -19429,7 +21572,19 @@ fn run_pick_panel(
         allow_chat: false,
     };
     let mut state = AskState::new(req.options.len(), false);
+    let remote_question =
+        remote.map(|remote| RemoteQuestion::open(&remote.shared, Some(&remote.bus), &req));
     loop {
+        if let Some(remote) = remote {
+            if remote.shared.interrupt.swap(false, Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(question) = &remote_question
+                && let Some(answer) = remote.shared.questions.take_answer(&question.id)
+            {
+                return pick_answer_index(&req, answer);
+            }
+        }
         if terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, "", view, &tui::TaskView::default()))
             .is_err()
@@ -19445,11 +21600,46 @@ fn run_pick_panel(
         match key.code {
             KeyCode::Up => state.move_up(),
             KeyCode::Down => state.move_down(),
-            KeyCode::Enter => return Some(state.cursor),
-            KeyCode::Esc => return None,
+            KeyCode::Enter => {
+                if remote_question.is_none() {
+                    return Some(state.cursor);
+                }
+                let answer = state.resolve(&req);
+                return finish_pick_answer(&req, remote_question.as_ref(), answer);
+            }
+            KeyCode::Esc => {
+                let answer = crate::tools::ask::AskOutcome::Declined;
+                return finish_pick_answer(&req, remote_question.as_ref(), answer);
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
             _ => {}
         }
+    }
+}
+
+fn finish_pick_answer(
+    request: &crate::tools::ask::AskRequest,
+    remote: Option<&RemoteQuestion<'_>>,
+    answer: crate::tools::ask::AskOutcome,
+) -> Option<usize> {
+    let answer = if let Some(remote) = remote {
+        remote.finish(answer)
+    } else {
+        answer
+    };
+    pick_answer_index(request, answer)
+}
+
+fn pick_answer_index(
+    request: &crate::tools::ask::AskRequest,
+    answer: crate::tools::ask::AskOutcome,
+) -> Option<usize> {
+    match answer {
+        crate::tools::ask::AskOutcome::Answered(labels) if labels.len() == 1 => request
+            .options
+            .iter()
+            .position(|option| option.label == labels[0]),
+        _ => None,
     }
 }
 
@@ -19636,14 +21826,123 @@ fn drive_frame(
     (session, close, result)
 }
 
-/// Drives an interactive `ask` question (issue #34): renders the option panel
-/// into the input region and reads keys until the user answers, declines
-/// (Escape), or interrupts (Ctrl-C). Blocks the UI loop while up — the worker
-/// is already blocked on the [`AskBridge`], so nothing else needs servicing —
-/// and posts the outcome back through the bridge to unblock the worker.
+/// Publishes a document and closes its remote identity on every exit path.
+struct RemoteEditor<'a> {
+    id: String,
+    shared: &'a TurnShared,
+    bus: &'a BroadcastBus,
+}
+
+impl<'a> RemoteEditor<'a> {
+    fn open(
+        shared: &'a TurnShared,
+        bus: &'a BroadcastBus,
+        title: &str,
+        text: &str,
+    ) -> Result<Self, String> {
+        if text.len() > crate::remote::editors::DOCUMENT_BYTES {
+            return Err("Document exceeds the 256 KiB editing limit".into());
+        }
+        let id = gui_request_id("re");
+        shared.editors.open(&id);
+        bus.broadcast(UiEvent::Editor(
+            serde_json::json!({"id":id, "title":title, "text":text}),
+        ));
+        Ok(Self { id, shared, bus })
+    }
+}
+
+impl Drop for RemoteEditor<'_> {
+    fn drop(&mut self) {
+        self.shared.editors.close(&self.id);
+        self.bus.broadcast(UiEvent::EditorDone {
+            id: self.id.clone(),
+        });
+    }
+}
+
+fn remote_edit_dialog(
+    remote: &RemoteState,
+    terminal: &mut ratatui::DefaultTerminal,
+    title: &str,
+    text: &str,
+) -> Result<Option<String>, String> {
+    let editor = RemoteEditor::open(&remote.shared, &remote.bus, title, text)?;
+    let mut notice = tui::ReportPanel::new(
+        title,
+        "Editing in the remote client. Save or Cancel there. Escape or Ctrl-C cancels here.",
+    );
+    loop {
+        if remote.shared.interrupt.swap(false, Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if let Some(reply) = remote.shared.editors.take_reply(&editor.id) {
+            return Ok(reply.into_text());
+        }
+        terminal
+            .draw(|frame| tui::draw_report(frame, None, &mut notice, 0))
+            .map_err(|error| error.to_string())?;
+        if let Some(Event::Key(key)) = next_event(None, Duration::from_millis(100))?
+            && key.kind == KeyEventKind::Press
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            return Ok(None);
+        }
+    }
+}
+
+/// Mirrors a modal question and closes its remote identity on every exit path.
+struct RemoteQuestion<'a> {
+    id: String,
+    shared: &'a TurnShared,
+    bus: Option<&'a BroadcastBus>,
+}
+
+impl<'a> RemoteQuestion<'a> {
+    fn open(
+        shared: &'a TurnShared,
+        bus: Option<&'a BroadcastBus>,
+        request: &crate::tools::ask::AskRequest,
+    ) -> Self {
+        let id = gui_request_id("rq");
+        shared.questions.open(&id, request.clone());
+        if let Some(bus) = bus {
+            let options: Vec<_> = crate::tools::ask::rows(request).iter().map(|option| {
+                serde_json::json!({"label": option.label, "description": option.description})
+            }).collect();
+            bus.broadcast(UiEvent::Question(serde_json::json!({"id":id,
+                "header":request.header, "question":request.question,
+                "multi":request.multi, "options":options})));
+        }
+        Self { id, shared, bus }
+    }
+
+    fn finish(&self, local: crate::tools::ask::AskOutcome) -> crate::tools::ask::AskOutcome {
+        let remote = self.shared.questions.close(&self.id);
+        if local == crate::tools::ask::AskOutcome::Interrupted {
+            local
+        } else {
+            remote.unwrap_or(local)
+        }
+    }
+}
+
+impl Drop for RemoteQuestion<'_> {
+    fn drop(&mut self) {
+        self.shared.questions.close(&self.id);
+        if let Some(bus) = self.bus {
+            bus.broadcast(UiEvent::QuestionDone {
+                id: self.id.clone(),
+            });
+        }
+    }
+}
+
+/// Drives the local question panel while accepting matching controller replies.
 ///
-/// Escape returns a distinct declined result and the turn continues; Ctrl-C
-/// both interrupts the turn and unblocks the worker so no partial state lingers.
+/// Escape declines; Ctrl-C or a remote interrupt unblocks the worker as interrupted.
 #[allow(clippy::too_many_arguments)]
 fn run_ask_panel(
     terminal: &mut ratatui::DefaultTerminal,
@@ -19653,13 +21952,23 @@ fn run_ask_panel(
     tasks: &tui::TaskView,
     shared: &TurnShared,
     bridge: &crate::tools::ask::AskBridge,
+    bus: Option<&BroadcastBus>,
 ) -> Result<(), String> {
     use crate::tools::ask::{AskOutcome, AskState};
     let Some(req) = bridge.take_request() else {
         return Ok(());
     };
     let mut state = AskState::for_request(&req);
+    let remote_question = RemoteQuestion::open(shared, bus, &req);
     loop {
+        if shared.interrupt.load(Ordering::Relaxed) {
+            bridge.respond(remote_question.finish(AskOutcome::Interrupted));
+            return Ok(());
+        }
+        if let Some(answer) = shared.questions.take_answer(&remote_question.id) {
+            bridge.respond(answer);
+            return Ok(());
+        }
         terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, status, view, tasks))
             .map_err(|e| e.to_string())?;
@@ -19676,16 +21985,16 @@ fn run_ask_panel(
             KeyCode::Down => state.move_down(),
             KeyCode::Char(' ') if req.multi => state.toggle(),
             KeyCode::Enter => {
-                bridge.respond(state.resolve(&req));
+                bridge.respond(remote_question.finish(state.resolve(&req)));
                 return Ok(());
             }
             KeyCode::Esc => {
-                bridge.respond(AskOutcome::Declined);
+                bridge.respond(remote_question.finish(AskOutcome::Declined));
                 return Ok(());
             }
             KeyCode::Char('c') if ctrl => {
                 raise_worker_interrupt(shared);
-                bridge.respond(AskOutcome::Interrupted);
+                bridge.respond(remote_question.finish(AskOutcome::Interrupted));
                 return Ok(());
             }
             _ => {}
@@ -20534,6 +22843,7 @@ fn busy_ui_loop(
                 &task_view,
                 shared,
                 bridge,
+                bus,
             )?;
             continue;
         }
@@ -20552,7 +22862,26 @@ fn busy_ui_loop(
             if let Some(bus) = bus
                 && !ev.is_local_pane_only()
             {
-                bus.broadcast(ev.clone());
+                let side_output = btw_active
+                    && matches!(
+                        &ev,
+                        UiEvent::Visible(_)
+                            | UiEvent::Think(_)
+                            | UiEvent::Tool(_)
+                            | UiEvent::Error(_)
+                            | UiEvent::Dim(_)
+                            | UiEvent::Plain(_)
+                            | UiEvent::UserEcho(_)
+                            | UiEvent::Markdown(_)
+                            | UiEvent::SystemStatus(_)
+                    );
+                if side_output {
+                    worker::publish_aside(false, Some(bus), ev.clone());
+                } else if let UiEvent::Btw(inner) = &ev {
+                    worker::publish_aside(false, Some(bus), *inner.clone());
+                } else {
+                    bus.broadcast(ev.clone());
+                }
             }
             match ev {
                 UiEvent::Status(st) => {
@@ -21197,7 +23526,7 @@ fn busy_ui_loop(
                                 Some(tui::ReportPanel::new(TOKS_REPORT_TITLE, &toks_report(true)));
                             view.follow = true;
                             sub.follow_all();
-                        } else if line.split_whitespace().next() == Some("/jobs") {
+                        } else if line.trim() == "/jobs" {
                             // The worker owns the job table; the UI renders the
                             // snapshot it publishes at every tool boundary.
                             input.history.add(&line);
@@ -22055,17 +24384,404 @@ pub fn run_interactive(
     result.map(|()| restart)
 }
 
+/// Enables structured questions only for an explicitly attached GUI client.
+#[must_use]
+pub fn gui_protocol_enabled() -> bool {
+    std::env::var("PLANK_GUI_PROTOCOL").is_ok_and(|value| value == "1")
+}
+
+/// Coalesces console callbacks for local GUI and remote mirrors.
+struct GuiTelemetry {
+    progress: Option<crate::console_input::SubagentProgress>,
+    enabled: bool,
+    remote: Option<Arc<RemoteState>>,
+    status: Status,
+    last: Option<Instant>,
+    started: Instant,
+    generation_started: Option<Instant>,
+    jobs_last: Option<Instant>,
+}
+
+fn prefill_state(progress: &crate::engine::PrefillProgress) -> WorkerState {
+    if progress.is_complete() {
+        WorkerState::Generating
+    } else {
+        WorkerState::Prefill
+    }
+}
+
+impl GuiTelemetry {
+    fn new(ctx_size: i32, ctx_used: i32, think: crate::engine::ThinkMode) -> Self {
+        Self {
+            progress: None,
+            enabled: gui_protocol_enabled(),
+            remote: None,
+            status: Status {
+                ctx_used,
+                ctx_size,
+                think,
+                ..Status::default()
+            },
+            last: None,
+            started: Instant::now(),
+            generation_started: None,
+            jobs_last: None,
+        }
+    }
+
+    fn with_remote(mut self, remote: Option<Arc<RemoteState>>) -> Self {
+        self.remote = remote;
+        self
+    }
+
+    fn event(&mut self, event: &EngineEvent) {
+        crate::console_input::note_subagent_progress(&mut self.progress, event);
+        if !self.enabled && self.remote.is_none() {
+            return;
+        }
+        let previous = self.status.state;
+        match event {
+            EngineEvent::Text(_) => {
+                self.status.state = WorkerState::Generating;
+                self.status.generated = self.status.generated.saturating_add(1);
+                self.status.ctx_used = self.status.ctx_used.saturating_add(1);
+                let start = self.generation_started.get_or_insert_with(Instant::now);
+                self.status.gen_tps = f64::from(self.status.generated.saturating_sub(1))
+                    / start.elapsed().as_secs_f64().max(0.001);
+            }
+            EngineEvent::Prefill(progress) => {
+                self.status.state = prefill_state(progress);
+                self.status.prefill_done = progress.done;
+                self.status.prefill_total = progress.total;
+                self.status.prefill_tps = progress.tps;
+            }
+            EngineEvent::Notice(_) | EngineEvent::Spec(_) => return,
+        }
+        self.status.elapsed_secs = self.started.elapsed().as_secs_f64();
+        if previous != self.status.state
+            || self
+                .last
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            if self.enabled {
+                gui_status(&self.status);
+            }
+            if let Some(remote) = &self.remote {
+                remote.bus.broadcast(UiEvent::Status(self.status.clone()));
+            }
+            let snapshot = crate::remote::control::MetricsWire::Throughput {
+                generation: crate::toks::snapshot(),
+                prefill: crate::toks::prefill_snapshot(),
+            };
+            if self.enabled {
+                eprintln!(
+                    "+PLANK_TELEMETRY {}",
+                    serde_json::json!({"type":"metrics", "snapshot":snapshot})
+                );
+            }
+            if let Some(remote) = &self.remote {
+                remote.bus.broadcast(UiEvent::Metrics(snapshot));
+            }
+            self.last = Some(Instant::now());
+        }
+    }
+
+    fn event_with_jobs(&mut self, event: &EngineEvent, jobs: &mut crate::tools::bash::BashJobs) {
+        self.event(event);
+        if (self.enabled || self.remote.is_some())
+            && self
+                .jobs_last
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            jobs.sweep();
+            let rows = jobs.rows();
+            if self.enabled {
+                gui_jobs(&rows);
+            }
+            if let Some(remote) = &self.remote {
+                remote.shared.set_jobs(rows.clone());
+                remote
+                    .bus
+                    .broadcast(UiEvent::Jobs(crate::remote::control::JobsWire::capture(
+                        &rows,
+                    )));
+            }
+            self.jobs_last = Some(Instant::now());
+        }
+    }
+}
+
+fn context_metrics(
+    breakdown: &crate::ctxreport::Breakdown,
+    resident: i32,
+) -> crate::remote::control::MetricsWire {
+    let count = |value: i32| u64::try_from(value.max(0)).unwrap_or(0);
+    crate::remote::control::MetricsWire::Context {
+        model: breakdown
+            .model
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect(),
+        window: count(breakdown.ctx_size),
+        used: count(resident),
+        categories: [
+            breakdown.system,
+            breakdown.mcp,
+            breakdown.messages,
+            breakdown.agents_md,
+            breakdown.memory,
+        ]
+        .map(count),
+    }
+}
+
+fn gui_status(status: &Status) {
+    eprintln!(
+        "+PLANK_TELEMETRY {}",
+        serde_json::json!({
+            "type": "status", "status": crate::remote::control::StatusWire::from(status)
+        })
+    );
+}
+
+fn gui_tasks(session: &Session) {
+    if !gui_protocol_enabled() {
+        return;
+    }
+    let view = tui::TaskView::with_goal(&session.tasks, session.goal.as_ref());
+    let (completed, total) = view.counter().unwrap_or((0, 0));
+    eprintln!(
+        "+PLANK_TELEMETRY {}",
+        serde_json::json!({
+            "type":"tasks", "completed":completed, "total":total, "report":view.wire_report(), "rows":view.wire_rows(), "goal":view.wire_goal()
+        })
+    );
+}
+
+fn gui_jobs(rows: &[crate::tools::bash::JobRow]) {
+    if gui_protocol_enabled() {
+        eprintln!(
+            "+PLANK_TELEMETRY {}",
+            serde_json::json!({
+                "type":"jobs", "snapshot":crate::remote::control::JobsWire::capture(rows)
+            })
+        );
+    }
+}
+
+/// Validates editor identity, explicit cancellation, and bounded UTF-8 document text.
+#[cfg(test)]
+fn gui_edit_reply(id: &str, answer: &str) -> Result<Option<String>, String> {
+    let answer: serde_json::Value =
+        serde_json::from_str(answer).map_err(|error| error.to_string())?;
+    if answer["id"].as_str() != Some(id) {
+        return Err("Editor answer belongs to a different request".into());
+    }
+    match answer.get("text") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if text.len() <= 256 * 1024 => Ok(Some(text.clone())),
+        _ => Err("Editor requires explicit document text or cancellation".into()),
+    }
+}
+
+/// Saves an explicit edit only while the file still matches its original snapshot.
+fn apply_gui_file_edit(
+    path: &std::path::Path,
+    initial: &str,
+    edited: &str,
+) -> Result<bool, String> {
+    if crate::openfile::load(path)? != initial {
+        return Err("File changed on disk; reopen /open before saving".into());
+    }
+    if edited == initial {
+        return Ok(false);
+    }
+    crate::openfile::save(path, edited)?;
+    Ok(true)
+}
+
+fn apply_gui_memory_edit(
+    sources: &[crate::memory::Source],
+    initial: &str,
+    edited: &str,
+) -> Result<Vec<String>, String> {
+    if crate::memory::combine(sources) != initial {
+        return Err("Memory changed on disk; reopen /memory before saving".into());
+    }
+    crate::memory::apply(sources, edited)
+}
+
+/// Keeps local inspection from taking away a remote controller's grant.
+fn console_input_claims_control(input: &str) -> bool {
+    let mut words = input.split_whitespace();
+    let command = words.next().unwrap_or("");
+    let argument = words.next();
+    let readonly = match command {
+        "/command" | "/commands" | "/help" | "/context" | "/usage" | "/toks" | "/version"
+        | "/agent" | "/templates" | "/mcp" | "/history" | "/tree" | "/stats" | "/list"
+        | "/search" => true,
+        "/rc" | "/remote-control" => argument == Some("status") && words.next().is_none(),
+        "/jobs" => argument.is_none() || argument == Some("output"),
+        "/engines" => argument == Some("--page"),
+        "/config" => argument.is_none() || matches!(argument, Some("--page" | "--resolved")),
+        "/checkpoint" | "/kvcache" => argument.is_none() || argument == Some("--page"),
+        "/model" => argument.is_none() || argument == Some("status"),
+        "/tasks" | "/goal" | "/fork" | "/plugins" | "/skills" | "/hooks" | "/think" | "/temp"
+        | "/mtp" | "/mc" | "/loopguard" | "/lg" | "/remote" => argument.is_none(),
+        _ => false,
+    };
+    !readonly
+}
+
+/// Shares explicit Yes/No choices without consuming unrelated console input.
+fn console_confirm_input(
+    console: &crate::console_input::ConsoleInput,
+    question: &str,
+    prompt: &str,
+) -> bool {
+    if !gui_protocol_enabled() {
+        return ask_yes_no_on_stdin(question, prompt);
+    }
+    let request = console_confirmation(question);
+    matches!(console.question(&gui_request_id("q"), &request, true, console_dialog_poll), Ok(crate::tools::ask::AskOutcome::Answered(answers)) if answers == ["Yes"])
+}
+
+fn console_confirmation(question: &str) -> crate::tools::ask::AskRequest {
+    crate::tools::ask::AskRequest {
+        question: question.into(),
+        header: "Confirm".into(),
+        multi: false,
+        allow_chat: false,
+        options: vec![
+            crate::tools::ask::AskOption {
+                label: "Yes".into(),
+                description: String::new(),
+            },
+            crate::tools::ask::AskOption {
+                label: "No".into(),
+                description: String::new(),
+            },
+        ],
+    }
+}
+
+/// Polls often enough for remote replies and interruption without busy waiting.
+fn console_dialog_poll(eof: &mut bool) -> Result<Option<Vec<u8>>, String> {
+    // A dialog checks its shared reply/interrupt slots at least every 50 ms idle.
+    read_console_bytes(eof, 50).map_err(|error| error.to_string())
+}
+
+/// Sends a structured question and accepts only a matching explicit answer.
+pub(crate) fn gui_question(
+    question: &str,
+    header: &str,
+    options: &[serde_json::Value],
+    multi: bool,
+) -> Option<String> {
+    let id = gui_send_question(question, header, options, multi);
+    let answer = gui_reply_line_from(libc::STDIN_FILENO);
+    eprintln!("+PLANK_QUESTION_DONE {}", serde_json::json!({"id":id}));
+    match answer {
+        Ok(Some(answer)) => gui_answer(&id, &answer),
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("Question: {error}");
+            None
+        }
+    }
+}
+
+/// Reads only one pre-agent reply; subsequent stdin bytes remain in the pipe.
+fn gui_reply_line_from(fd: std::os::fd::RawFd) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = 0_u8;
+        // SAFETY: `byte` is valid writable storage for exactly one byte.
+        // Invalid/closed descriptors return an OS error rather than touching memory.
+        let count = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted && !crate::interrupt::pending() {
+                continue;
+            }
+            return Err(error);
+        }
+        if count == 0 || byte == b'\n' {
+            break;
+        }
+        // Match the daemon's maximum escaped JSON frame, without read-ahead.
+        if bytes.len() >= 2 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "GUI reply exceeds 2 MiB",
+            ));
+        }
+        bytes.push(byte);
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Creates request identities that cannot be reused by a re-executed engine.
+fn gui_request_id(prefix: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{prefix}{}-{time}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Publishes a question while allowing its caller to continue polling progress.
+pub(crate) fn gui_send_question(
+    question: &str,
+    header: &str,
+    options: &[serde_json::Value],
+    multi: bool,
+) -> String {
+    let id = gui_request_id("q");
+    let request = serde_json::json!({"id": id, "question": question, "header": header, "options": options, "multi": multi});
+    eprintln!("+PLANK_QUESTION {request}");
+    id
+}
+
+/// Rejects answers belonging to a different question or protocol shape.
+pub(crate) fn gui_answer(id: &str, answer: &str) -> Option<String> {
+    let answer: serde_json::Value = serde_json::from_str(answer).ok()?;
+    (answer.get("id")?.as_str()? == id).then_some(())?;
+    answer.get("answer")?.as_str().map(str::to_owned)
+}
+
 /// Plain-REPL [`Asker`](crate::tools::ask::Asker): prints the header, question,
 /// and numbered options, then reads one stdin line and resolves it to a choice
 /// (a number or a label prefix; an empty line declines). The degraded form of
 /// the TUI panel for the piped/non-fullscreen path (issue #34).
 struct StdinAsker {
     color: bool,
+    console: Arc<crate::console_input::ConsoleInput>,
 }
 
 impl crate::tools::ask::Asker for StdinAsker {
     fn ask(&mut self, req: crate::tools::ask::AskRequest) -> crate::tools::ask::AskOutcome {
         use crate::tools::ask::{AskOutcome, parse_repl_answer};
+        if gui_protocol_enabled() {
+            return self
+                .console
+                .question(&gui_request_id("q"), &req, true, console_dialog_poll)
+                .unwrap_or_else(|error| {
+                    eprintln!("Question: {error}");
+                    AskOutcome::Declined
+                });
+        }
         let mut out = std::io::stdout();
         let _ = writeln!(out, "\n[{}] {}", req.header, req.question);
         for (i, opt) in crate::tools::ask::rows(&req).iter().enumerate() {
@@ -22100,7 +24816,10 @@ fn run_plain_flow(
 ) -> Result<(), String> {
     // The plain REPL answers `ask` questions by printing numbered options and
     // reading a line from stdin (issue #34).
-    agent.tool_ctx.asker = Some(Box::new(StdinAsker { color: agent.color }));
+    agent.tool_ctx.asker = Some(Box::new(StdinAsker {
+        color: agent.color,
+        console: Arc::clone(&agent.tool_ctx.console),
+    }));
     agent.warm_plain()?;
     // The plain REPL is up and accepting input.
     crate::title::set(crate::title::State::Idle);
@@ -22109,13 +24828,7 @@ fn run_plain_flow(
     }
     // The plain mirror of the TUI's launch trust panel for a profile's
     // bundled components.
-    let project = agent.tool_ctx.cwd.clone();
-    for offer in agent.tool_ctx.wasm.profile_trust_offers() {
-        let trust = ask_trust_offer_on_stdin(&offer.question);
-        let outcome =
-            crate::wasmreg::answer_trust_offer(&mut agent.tool_ctx.wasm, &offer, trust, &project);
-        println!("plank: {outcome}");
-    }
+    profile_trust_offers_plain(agent);
     // No AGENTS.md and no CLAUDE.md to link: offer to generate one, the plain
     // mirror of the TUI's three-way panel. A non-terminal stdin declines.
     if offer_init {
@@ -22142,6 +24855,21 @@ fn run_plain_flow(
         println!("{line}");
     }
     result
+}
+
+/// Offers profile component trust without treating a queued model prompt as consent.
+fn profile_trust_offers_plain(agent: &mut Agent<'_>) {
+    let project = agent.tool_ctx.cwd.clone();
+    for offer in agent.tool_ctx.wasm.profile_trust_offers() {
+        let trust = if gui_protocol_enabled() {
+            agent.console_confirm(&offer.question, "trust it? [y/N] ")
+        } else {
+            ask_trust_offer_on_stdin(&offer.question)
+        };
+        let outcome =
+            crate::wasmreg::answer_trust_offer(&mut agent.tool_ctx.wasm, &offer, trust, &project);
+        println!("plank: {outcome}");
+    }
 }
 
 /// Yellow hint shown when Ctrl-C is pressed on an empty idle prompt.
@@ -22682,10 +25410,25 @@ pub fn run_headless(
     plugins: crate::plugins::PluginSet,
 ) -> Result<u8, String> {
     let mut agent = new_agent(engine, cfg, false, local_engine, reopen, plugins)?;
+    if gui_protocol_enabled() {
+        agent.tool_ctx.asker = Some(Box::new(StdinAsker {
+            color: agent.color,
+            console: Arc::clone(&agent.tool_ctx.console),
+        }));
+    }
     // The notification mode is seeded (and kept live) by
     // `settings::install`/`reinstall`, not here — see their doc comments.
+    let resumed = cfg.resume.is_some();
+    if let Some(arg) = &cfg.resume {
+        agent.resume_from_cli(arg)?;
+    }
     agent.warm_plain()?;
-    agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
+    agent.fire_session_start(if resumed { "resume" } else { "startup" }, &mut |w| {
+        eprintln!("{w}");
+    });
+    if gui_protocol_enabled() && cfg.prompt.is_none() {
+        profile_trust_offers_plain(&mut agent);
+    }
     if let Some(prompt) = cfg.prompt.as_deref() {
         // `/init` is the one command this path understands. It is not text
         // for the model: it runs the canned phases with the loop guards
@@ -22781,25 +25524,96 @@ pub fn run_headless(
     // §3.4). The driver owns the loop: plank appends the notification, marks
     // it on stderr, and runs the turn, then goes back to waiting.
     let mut eof = false;
-    while !eof {
-        eprintln!("+DWARFSTAR_WAITING");
-        let idle_ms = if crate::settings::active().tools.bash_notify {
+    let mut last_controls = String::new();
+    let mut status_dirty = true;
+    let mut jobs_last = Instant::now();
+    while !eof || agent.tool_ctx.console.has_pending() {
+        let mut local_input = if gui_protocol_enabled() {
+            agent
+                .tool_ctx
+                .console
+                .prompt(|eof| read_console_bytes(eof, 0).map_err(|error| error.to_string()))?
+        } else {
+            None
+        };
+        if local_input.is_none()
+            && !agent.tool_ctx.console.has_pending()
+            && agent.console_remote_inputs()
+        {
+            status_dirty = true;
+            let _ = std::io::stdout().flush();
+            // Local bytes may have arrived during the remote turn. Preserve
+            // its queued local request before advertising another idle slot.
+            if gui_protocol_enabled() {
+                local_input = agent
+                    .tool_ctx
+                    .console
+                    .prompt(|eof| read_console_bytes(eof, 0).map_err(|error| error.to_string()))?;
+            }
+        }
+        let announce_ready =
+            status_dirty && local_input.is_none() && !agent.tool_ctx.console.has_pending();
+        if (gui_protocol_enabled() || agent.remote.is_some())
+            && jobs_last.elapsed() >= Duration::from_secs(1)
+        {
+            agent.publish_console_jobs();
+            jobs_last = Instant::now();
+        }
+        if status_dirty {
+            if gui_protocol_enabled() || agent.remote.is_some() {
+                agent.publish_console_idle();
+            }
+            status_dirty = false;
+        }
+        if gui_protocol_enabled() {
+            let controls = agent.gui_controls().to_string();
+            if controls != last_controls {
+                eprintln!("+PLANK_CONTROLS {controls}");
+                last_controls = controls;
+            }
+        }
+        // GUI job polling must not look like another input completed.
+        if !gui_protocol_enabled() || announce_ready {
+            eprintln!("+DWARFSTAR_WAITING");
+        }
+        let idle_ms = if gui_protocol_enabled()
+            || agent.remote.is_some()
+            || crate::settings::active().tools.bash_notify
+        {
             250
         } else {
             -1
         };
-        let Some(prompt) = read_quiet_batched(&mut eof, idle_ms).map_err(|e| e.to_string())? else {
+        let prompt = if gui_protocol_enabled() {
+            let prompt = if local_input.is_some() {
+                local_input
+            } else {
+                agent.tool_ctx.console.prompt(|eof| {
+                    read_console_bytes(eof, idle_ms).map_err(|error| error.to_string())
+                })?
+            };
+            eof = agent.tool_ctx.console.eof();
+            prompt
+        } else {
+            read_quiet_batched(&mut eof, idle_ms).map_err(|error| error.to_string())?
+        };
+        let Some(prompt) = prompt else {
             if eof {
                 break;
             }
-            if agent.has_finished_jobs() {
+            if agent.has_finished_jobs() && !agent.tool_ctx.console.has_pending() {
                 let n = agent.drain_job_notifications();
                 if n > 0 {
+                    if gui_protocol_enabled() {
+                        eprintln!("+PLANK_BUSY");
+                    }
                     eprintln!("+DWARFSTAR_JOBS_FINISHED {n}");
-                    agent.run_turn()?;
+                    agent.console_turn()?;
+                    status_dirty = true;
                 }
-            } else if agent.memory_jobs_pending() {
+            } else if agent.memory_jobs_pending() && !agent.tool_ctx.console.has_pending() {
                 agent.process_memory_job();
+                agent.finish_console_dispatch();
                 agent.pending_memory_notice = None;
             }
             continue;
@@ -22807,8 +25621,16 @@ pub fn run_headless(
         if prompt.trim().is_empty() {
             continue;
         }
-        agent.session.push(Message::user(prompt.trim_end()));
-        agent.run_turn()?;
+        // Console clients use the same slash dispatch as the plain REPL.
+        // Never pass a control command to the model as a user message.
+        if gui_protocol_enabled() {
+            eprintln!("+PLANK_BUSY");
+        }
+        if !agent.console_input(&prompt)? {
+            break;
+        }
+        status_dirty = true;
+        let _ = std::io::stdout().flush();
     }
     agent.drain_memory_jobs();
     agent.save_headless_session(cfg.save_session);
@@ -23193,7 +26015,7 @@ fn headless_quit_repro(agent: &mut Agent<'_>) {
 /// Returns `None` at EOF with nothing buffered, or when `idle_ms` (>= 0)
 /// elapsed with nothing buffered and `eof` still clear; sets `eof` once stdin
 /// closes. `-1` waits for input indefinitely.
-fn read_quiet_batched(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<String>> {
+pub(crate) fn read_quiet_batched(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<String>> {
     read_batched_from(libc::STDIN_FILENO, eof, idle_ms)
 }
 
@@ -23208,6 +26030,27 @@ fn read_batched_from(
     eof: &mut bool,
     idle_ms: i32,
 ) -> std::io::Result<Option<String>> {
+    read_batched_bytes_from(fd, eof, idle_ms, None)
+        .map(|batch| batch.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Retains raw UTF-8 fragments for the owned GUI console inbox.
+fn read_console_bytes(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<Vec<u8>>> {
+    read_batched_bytes_from(
+        libc::STDIN_FILENO,
+        eof,
+        idle_ms,
+        Some(crate::console_input::BATCH_BYTES),
+    )
+}
+
+/// Reads raw bytes with an optional bound for GUI input batches.
+fn read_batched_bytes_from(
+    fd: std::os::fd::RawFd,
+    eof: &mut bool,
+    idle_ms: i32,
+    limit: Option<usize>,
+) -> std::io::Result<Option<Vec<u8>>> {
     const QUIET_MS: i32 = 200;
     let mut buf = Vec::new();
     loop {
@@ -23245,12 +26088,18 @@ fn read_batched_from(
             *eof = true;
             break;
         }
+        if limit.is_some_and(|limit| buf.len().saturating_add(n.cast_unsigned()) > limit) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Console input batch exceeds its limit",
+            ));
+        }
         buf.extend_from_slice(&chunk[..n.cast_unsigned()]);
     }
     if buf.is_empty() {
         return Ok(None);
     }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    Ok(Some(buf))
 }
 
 /// The command that resumes session `short`: with `--profile <name>` when a
@@ -23293,6 +26142,335 @@ fn masthead_label(profile_name: Option<&str>, version: &str, ctx: &str, model: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_aside_command_restores_scope_and_keeps_the_parent_transcript_unchanged() {
+        let dir = scratch_dir("console-aside-command");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["side answer\n".into(), "main answer\n".into()],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        agent.session.push(Message::user("parent context"));
+        let before = agent.session.transcript.clone();
+        agent.last_ctx_used = 77;
+        agent.btw_plain("side question").unwrap();
+        assert_eq!(agent.session.transcript, before);
+        assert_eq!(agent.last_ctx_used, 77);
+        assert!(!agent.tool_ctx.console.is_aside());
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event, UiEvent::Btw(inner) if matches!(inner.as_ref(), UiEvent::Visible(text) if text.contains("side answer")))));
+        assert!(!events.iter().any(
+            |event| matches!(&event.event, UiEvent::Visible(text) if text.contains("side answer"))
+        ));
+        agent.run_turn("main prompt").unwrap();
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(
+            |event| matches!(&event.event, UiEvent::Visible(text) if text.contains("main answer"))
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn export_transfer_publishes_written_bytes_without_changing_the_conversation() {
+        use crate::export::{Format, transfer::Transfer};
+        let dir = scratch_dir("gui-export-transfer");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("Export this 🦀"));
+        agent.session.push(Message::assistant(
+            "An answer with <html> and **Markdown**.",
+        ));
+        let transcript = agent.session.transcript.clone();
+        let dirty = agent.session.dirty;
+        let path = agent.write_export("html exported.html").unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let receiver = remote.bus.subscribe_exports();
+        agent.publish_export(
+            &path,
+            Format::Html,
+            &body,
+            false,
+            true,
+            crate::export::transfer::Purpose::Conversation,
+        );
+        let mut received = String::new();
+        let mut complete = false;
+        for event in receiver.try_iter() {
+            match event.event {
+                UiEvent::Artifact(Transfer::Begin { name, bytes, .. }) => {
+                    assert_eq!(name, "exported.html");
+                    assert_eq!(bytes, body.len() as u64);
+                }
+                UiEvent::Artifact(Transfer::Chunk { offset, text, .. }) => {
+                    assert_eq!(offset, received.len() as u64);
+                    received.push_str(&text);
+                }
+                UiEvent::Artifact(Transfer::End { bytes, .. }) => {
+                    assert_eq!(bytes, received.len() as u64);
+                    complete = true;
+                }
+                unexpected => panic!("export entered another channel: {unexpected:?}"),
+            }
+        }
+        assert!(complete);
+        assert_eq!(received, body);
+        assert_eq!(agent.session.transcript, transcript);
+        assert_eq!(agent.session.dirty, dirty);
+        assert!(remote.bus.scrollback_since(None).0.is_empty());
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, "file").unwrap();
+        assert!(
+            agent
+                .write_export(&format!("md {}/export.md", blocked.display()))
+                .is_err()
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a failed file write cannot start a transfer"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gui_saved_sessions_refresh_after_mutations_without_command_injection() {
+        let dir = scratch_dir("saved-live-refresh");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let receiver = remote.bus.subscribe();
+        agent.session.push(Message::user("Keep this conversation"));
+        let old = agent.save_session().unwrap();
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|event| matches!(event.event, UiEvent::Sessions(_))),
+            "do not scan an unopened panel"
+        );
+        agent.publish_saved_sessions(&agent.store.list().unwrap(), "1");
+        receiver.try_iter().for_each(drop);
+        agent.set_tag("work").unwrap();
+        assert!(receiver.try_iter().any(|event| matches!(event.event, UiEvent::Sessions(snapshot) if snapshot.sessions[0].tag == "work")));
+        agent
+            .rename_session("renamed-copy", &mut |_| false)
+            .unwrap();
+        assert!(!agent.store.path_for_id("renamed-copy").exists());
+        agent.save_session().unwrap();
+        assert!(receiver.try_iter().any(|event| matches!(event.event, UiEvent::Sessions(snapshot) if snapshot.total == 2 && snapshot.sessions.iter().any(|row| row.id == "renamed-copy"))));
+        agent.slash(&format!("/del {old}")).unwrap();
+        assert!(receiver.try_iter().any(|event| matches!(event.event, UiEvent::Sessions(snapshot) if snapshot.total == 1 && snapshot.sessions[0].id == "renamed-copy")));
+        let transcript = agent.session.transcript.clone();
+        agent.refresh_saved_sessions();
+        assert_eq!(agent.session.transcript, transcript);
+        assert!(!agent.session.dirty);
+        let loaded = agent.store.load("renamed-copy").unwrap();
+        agent.reset_for_adopted_session(loaded);
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, UiEvent::SessionReset))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, UiEvent::Sessions(_)))
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gui_saved_sessions_refresh_clamps_a_deleted_last_page() {
+        let dir = scratch_dir("saved-refresh-page");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let receiver = remote.bus.subscribe();
+        for index in 0..65 {
+            let mut session = Session::new();
+            session.id = format!("saved-{index}");
+            session.push(Message::user("Saved entry"));
+            agent.store.save(&mut session).unwrap();
+        }
+        let entries = agent.store.list().unwrap();
+        let last = agent.publish_saved_sessions(&entries, "2")[0].id.clone();
+        assert_eq!(agent.tool_ctx.console.saved_page(), Some(2));
+        receiver.try_iter().for_each(drop);
+        agent.slash(&format!("/del {last}")).unwrap();
+        assert!(receiver.try_iter().any(|event| matches!(event.event,
+            UiEvent::Sessions(snapshot) if snapshot.total == 64 && snapshot.page == 1 && snapshot.sessions.len() == 64)));
+        assert_eq!(agent.tool_ctx.console.saved_page(), Some(1));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fanout_roster_labels_separate_repeated_definitions_and_suffix_collisions() {
+        let labels = super::unique_subagent_labels(["review", "review", "review #2", "review"]);
+        assert_eq!(labels[0], "review");
+        assert_eq!(labels[1], "review #2");
+        assert_eq!(
+            labels
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn metrics_snapshots_tui_speed_sampling_is_bounded() {
+        let mut live = super::LiveStatus::new(
+            100,
+            Instant::now(),
+            8192,
+            0,
+            crate::engine::ThinkMode::Medium,
+            "echo".into(),
+            0,
+        );
+        assert!(live.speed_snapshot().is_some());
+        assert!(live.speed_snapshot().is_none());
+        live.metrics_last = Some(Instant::now() - Duration::from_secs(2));
+        assert!(live.speed_snapshot().is_some());
+        assert!(live.speed_snapshot().is_none());
+    }
+
+    #[test]
+    fn console_remote_telemetry_refreshes_speed_only_with_coalesced_status() {
+        use crate::{
+            engine::{EngineEvent, ThinkMode},
+            remote::control::MetricsWire,
+        };
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let receiver = remote.bus.subscribe();
+        let mut live = super::GuiTelemetry::new(8192, 2048, ThinkMode::Medium)
+            .with_remote(Some(Arc::clone(&remote)));
+        live.enabled = false;
+        live.event(&EngineEvent::Text("first".into()));
+        live.event(&EngineEvent::Text("second".into()));
+        let events: Vec<_> = receiver.try_iter().map(|event| event.event).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, UiEvent::Status(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, UiEvent::Metrics(MetricsWire::Throughput { .. })))
+                .count(),
+            1
+        );
+        live.last = Some(Instant::now() - Duration::from_secs(2));
+        live.event(&EngineEvent::Text("third".into()));
+        assert!(receiver.try_iter().any(|event| matches!(event.event,
+            UiEvent::Metrics(MetricsWire::Throughput { generation, prefill })
+                if generation.len() <= 64 && prefill.len() <= 64
+                    && generation.iter().chain(&prefill).all(|value| value.is_finite() && *value >= 0.0))));
+        let (tail, _) = remote.bus.scrollback_since(None);
+        assert_eq!(
+            tail.len(),
+            2,
+            "streaming updates replace status and speed replay entries"
+        );
+    }
+
+    #[test]
+    fn console_remote_telemetry_streams_state_changes_without_local_gui_and_coalesces_updates() {
+        use crate::{
+            engine::{EngineEvent, PrefillProgress, ThinkMode},
+            status::WorkerState,
+            worker::UiEvent,
+        };
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let receiver = remote.bus.subscribe();
+        let mut live = super::GuiTelemetry::new(8192, 2048, ThinkMode::Medium)
+            .with_remote(Some(std::sync::Arc::clone(&remote)));
+        live.enabled = false;
+        live.event(&EngineEvent::Prefill(PrefillProgress {
+            done: 1,
+            total: 10,
+            tps: 20.0,
+        }));
+        live.event(&EngineEvent::Text("first".into()));
+        let last = live.last;
+        live.event(&EngineEvent::Text("second".into()));
+        assert_eq!(
+            live.last, last,
+            "same-state callbacks must not flood the bus"
+        );
+        live.last = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        live.event(&EngineEvent::Text("third".into()));
+        let states = receiver
+            .try_iter()
+            .filter_map(|event| match event.event {
+                UiEvent::Status(status) => Some(status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(states.len(), 3);
+        assert_eq!(states[0].state, WorkerState::Prefill);
+        assert_eq!(states[1].state, WorkerState::Generating);
+        assert_eq!(states[2].generated, 3);
+        assert_eq!(states[2].ctx_used, 2051);
+        assert!(states[2].gen_tps.is_finite());
+        let mut jobs = crate::tools::bash::BashJobs::default();
+        live.event_with_jobs(&EngineEvent::Text("fourth".into()), &mut jobs);
+        assert!(
+            matches!(receiver.try_recv().unwrap().event, UiEvent::Jobs(snapshot) if snapshot.running == 0 && snapshot.total == 0)
+        );
+        assert!(remote.shared.jobs.lock().unwrap().is_empty());
+        let count = remote
+            .bus
+            .scrollback_since(None)
+            .0
+            .iter()
+            .filter(|event| matches!(&event.event, UiEvent::Status(_)))
+            .count();
+        assert_eq!(count, 1, "reconnect replay retains the latest status");
+    }
+
+    #[test]
+    fn gui_telemetry_coalesces_stream_updates_and_preserves_state_transitions() {
+        let mut live = super::GuiTelemetry::new(8192, 2048, crate::engine::ThinkMode::Medium);
+        live.enabled = true;
+        live.event(&crate::engine::EngineEvent::Prefill(
+            crate::engine::PrefillProgress {
+                done: 1,
+                total: 10,
+                tps: 20.0,
+            },
+        ));
+        let prefill = live.last;
+        assert_eq!(live.status.state, crate::status::WorkerState::Prefill);
+        live.event(&crate::engine::EngineEvent::Text("first".into()));
+        let first = live.last;
+        assert_ne!(first, prefill);
+        assert!(first.is_some());
+        live.event(&crate::engine::EngineEvent::Text("second".into()));
+        assert_eq!(live.last, first);
+        assert_eq!(live.status.generated, 2);
+        assert_eq!(live.status.ctx_used, 2050);
+        assert_eq!(live.status.state, crate::status::WorkerState::Generating);
+        live.last = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        live.event(&crate::engine::EngineEvent::Text("third".into()));
+        assert_ne!(live.last, first);
+        assert!(live.status.gen_tps.is_finite());
+        live.enabled = false;
+        live.event(&crate::engine::EngineEvent::Text("ignored".into()));
+        assert_eq!(live.status.generated, 3);
+    }
     #[test]
     fn the_room_left_is_the_window_less_what_the_pass_used() {
         assert_eq!(context_room(32_768, 30_000), Some(2_768));
@@ -25049,10 +28227,21 @@ mod tests {
     // where it needs to.
     #[allow(clippy::struct_excessive_bools)]
     struct ScriptedEngine {
+        /// Optional billed usage per reply, for ownership/accounting regressions.
+        pass_usages: Vec<crate::engine::TokenUsage>,
         replies: Vec<String>,
         next: usize,
         prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         interrupt_at: Option<usize>,
+        /// Cancels an identified input during generation to exercise its stop hook.
+        console_cancel: Option<(Arc<TurnShared>, String)>,
+        /// Stops after callbacks, while deliberately returning uninterrupted stats.
+        quiet_remote_stop: Option<Arc<TurnShared>>,
+        quiet_remote_error: bool,
+        /// Stops an aside after its final callback, before returning its result.
+        aside_remote_stop: Option<Arc<TurnShared>>,
+        aside_remote_cancel: Option<(Arc<TurnShared>, String)>,
+        aside_remote_error: bool,
         /// When true, `generate_aside` is implemented (mirrors a real engine's
         /// snapshot/restore support) so the in-pass `/btw` suspend path runs
         /// instead of falling back to the boundary queue.
@@ -25146,6 +28335,35 @@ mod tests {
     }
 
     impl ScriptedEngine {
+        fn play_aside(
+            &mut self,
+            prompt: &str,
+            interrupt: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<GenerationStats, EngineError> {
+            let stats = self.play_next(prompt, on_event);
+            let mut stopped = false;
+            if let Some(shared) = self.aside_remote_stop.take() {
+                shared.interrupt.store(true, Ordering::Relaxed);
+                stopped = true;
+            }
+            if let Some((shared, id)) = self.aside_remote_cancel.take() {
+                assert!(!shared.cancel_prompt_request(&id));
+                shared.interrupt.store(false, Ordering::Relaxed);
+                stopped = true;
+            }
+            if stopped {
+                assert!(
+                    interrupt(),
+                    "aside generation must observe its owning remote stop"
+                );
+                if self.aside_remote_error {
+                    return Err(EngineError::new("provider request cancelled"));
+                }
+            }
+            Ok(stats)
+        }
+
         /// Notes which aside tier a call took, when the test is watching.
         fn record_tier(&self, tier: &str) {
             if let Some(tiers) = &self.aside_tiers {
@@ -25181,6 +28399,7 @@ mod tests {
             GenerationStats {
                 interrupted,
                 limit,
+                usage: self.pass_usages.get(self.next - 1).copied(),
                 ..GenerationStats::default()
             }
         }
@@ -25219,7 +28438,7 @@ mod tests {
             &mut self,
             prompt: crate::engine::Prompt<'_>,
             opts: &crate::engine::GenerationOptions,
-            _interrupt: &dyn Fn() -> bool,
+            interrupt: &dyn Fn() -> bool,
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
@@ -25235,20 +28454,39 @@ mod tests {
             if let Some(msg) = &self.fail_with {
                 return Err(EngineError::new(msg.clone()));
             }
-            Ok(self.play_next(prompt.flat(), on_event))
+            let mut stats = self.play_next(prompt.flat(), on_event);
+            if let Some(shared) = self.quiet_remote_stop.take() {
+                shared.interrupt.store(true, Ordering::Relaxed);
+                assert!(interrupt(), "quiet generation must poll the remote stop");
+                if self.quiet_remote_error {
+                    return Err(EngineError::new("provider request cancelled"));
+                }
+            }
+            if let Some((shared, id)) = self.console_cancel.take() {
+                assert!(
+                    !shared.cancel_prompt_request(&id),
+                    "running cancellation waits for dispatch completion"
+                );
+                assert!(
+                    interrupt(),
+                    "console generation must observe remote cancellation"
+                );
+                stats.interrupted = true;
+            }
+            Ok(stats)
         }
         fn generate_aside(
             &mut self,
             prompt: &str,
             _opts: &crate::engine::GenerationOptions,
-            _interrupt: &dyn Fn() -> bool,
+            interrupt: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
             if !self.aside_support {
                 return Err(EngineError::unsupported());
             }
             self.record_tier("destructive");
-            Ok(self.play_next(prompt, on_event))
+            self.play_aside(prompt, interrupt, on_event)
         }
         fn supports_aside(&self) -> bool {
             self.aside_support
@@ -25257,14 +28495,14 @@ mod tests {
             &mut self,
             prompt: &str,
             _opts: &crate::engine::GenerationOptions,
-            _interrupt: &dyn Fn() -> bool,
+            interrupt: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
             if !self.fork_aside_support {
                 return Err(EngineError::unsupported());
             }
             self.record_tier("forked");
-            Ok(self.play_next(prompt, on_event))
+            self.play_aside(prompt, interrupt, on_event)
         }
         fn supports_forked_aside(&self) -> bool {
             self.fork_aside_support
@@ -26582,8 +29820,271 @@ mod tests {
             .unwrap();
         assert!(text.contains("Sessions: 0"));
         assert!(!text.contains('\x1b'));
+        let mut agent = agent;
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        agent
+            .stats_report(crate::stats::Scope::Last7, false, false)
+            .unwrap();
+        agent
+            .stats_report(crate::stats::Scope::Last30, false, false)
+            .unwrap();
+        let (events, _) = remote.bus.scrollback_since(None);
+        let reports = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiEvent::Metrics(crate::remote::control::MetricsWire::Activity { snapshot }) => {
+                    Some(snapshot)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].scope, "30");
+        assert_eq!(reports[0].days.len(), crate::stats::WEEKS * 7);
         assert_eq!(crate::stats::Scope::parse("yesterday"), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn client_insights_report_is_published_only_after_the_standalone_report_is_written() {
+        use sha2::Digest as _;
+        let _interrupt = crate::interrupt::test_guard();
+        let _status = crate::status::origin_test_guard();
+        let dir = scratch_dir("client-insights-report");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let receiver = remote.bus.subscribe_exports();
+        let capture = std::thread::spawn(move || {
+            use crate::export::transfer::{Purpose, Transfer};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut reports = Vec::new();
+            let mut body = String::new();
+            while reports.len() < 2 {
+                if let Ok(event) = receiver.try_recv() {
+                    match event.event {
+                        UiEvent::Artifact(Transfer::Begin {
+                            purpose, format, ..
+                        }) => {
+                            assert_eq!(purpose, Purpose::Insights);
+                            assert_eq!(format, "html");
+                            body.clear();
+                        }
+                        UiEvent::Artifact(Transfer::Chunk { offset, text, .. }) => {
+                            assert_eq!(offset, body.len() as u64);
+                            body.push_str(&text);
+                        }
+                        UiEvent::Artifact(Transfer::End { bytes, .. }) => {
+                            assert_eq!(bytes, body.len() as u64);
+                            reports.push(std::mem::take(&mut body));
+                        }
+                        UiEvent::Artifact(Transfer::Abort { .. }) => {
+                            panic!("completed report must transfer")
+                        }
+                        _ => {}
+                    }
+                } else {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            reports
+        });
+        let mut written = Vec::new();
+        for _ in 0..2 {
+            let result = agent
+                .run_insights_in("fast", &dir.join("reports"), &mut |_| {}, &mut |_| {})
+                .unwrap();
+            let Insights::Done { path, summary } = result else {
+                panic!("report should finish");
+            };
+            let html = std::fs::read_to_string(path).unwrap();
+            assert!(html.contains("Your plank insights"));
+            written.push(html);
+            assert!(
+                summary
+                    .iter()
+                    .any(|line| line.contains("No sessions substantial enough"))
+            );
+        }
+        assert_eq!(capture.join().unwrap(), written);
+        let checksum =
+            crate::downloader::hex(&sha2::Sha256::digest(written.last().unwrap().as_bytes()));
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event,
+            UiEvent::Metrics(crate::remote::control::MetricsWire::Insights { html_sha256: Some(hash), .. }) if hash == &checksum)));
+        let reports = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiEvent::Metrics(crate::remote::control::MetricsWire::Insights {
+                    markdown,
+                    ..
+                }) => Some(markdown),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1, "replay retains only the newest report");
+        assert!(reports[0].contains("No sessions substantial enough"));
+        assert!(reports[0].len() <= 64 * 1024);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_insights_stop_cancels_scan_and_render_without_replacing_a_report() {
+        let _interrupt = crate::interrupt::test_guard();
+        let _status = crate::status::origin_test_guard();
+        for phase in ["before", "first", "last", "render"] {
+            let dir = scratch_dir(&format!("remote-insights-stop-{phase}"));
+            let root = dir.join("reports");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("existing.html"), "previous report").unwrap();
+            let cfg = test_cfg();
+            let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+            agent.session.id = agent.store.mint_id();
+            for _ in 0..crate::insights::MIN_HUMAN_MESSAGES {
+                agent.session.push(Message::user("Investigate the parser"));
+                agent
+                    .session
+                    .push(Message::assistant("Inspected the parser"));
+            }
+            agent.save_session().unwrap();
+            let remote = crate::remote::control::RemoteState::test_bridge();
+            agent.remote = Some(Arc::clone(&remote));
+            agent.publish_metrics_snapshot(crate::remote::control::MetricsWire::Insights {
+                markdown: "previous report".into(),
+                html_sha256: None,
+            });
+            let mut triggered = phase == "before";
+            remote.shared.interrupt.store(triggered, Ordering::Relaxed);
+            let result = agent
+                .run_insights_in("fast", &root, &mut |_| {}, &mut |line| {
+                    if (phase == "first" && line.contains("0/1"))
+                        || (phase == "last" && line.contains("1/1"))
+                        || (phase == "render" && line.starts_with("writing the report"))
+                    {
+                        triggered = true;
+                        remote.shared.interrupt.store(true, Ordering::Relaxed);
+                    }
+                })
+                .unwrap();
+            assert!(triggered, "{phase} cancellation point was reached");
+            assert!(matches!(result, Insights::Cancelled));
+            assert!(console_remote_interrupted(Some(&remote)));
+            let html = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "html"))
+                .count();
+            assert_eq!(html, 1, "{phase} cannot write a new report");
+            assert_eq!(
+                std::fs::read_to_string(root.join("existing.html")).unwrap(),
+                "previous report"
+            );
+            let (events, _) = remote.bus.scrollback_since(None);
+            assert!(events.iter().any(|event| matches!(&event.event,
+                UiEvent::Metrics(crate::remote::control::MetricsWire::Insights { markdown, .. }) if markdown == "previous report")));
+            agent.finish_console_dispatch();
+            assert!(!console_remote_interrupted(Some(&remote)));
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn remote_insights_stop_preserves_finished_statistics_and_discards_late_aside_results() {
+        let _interrupt = crate::interrupt::test_guard();
+        let _status = crate::status::origin_test_guard();
+        for forked in [false, true] {
+            for error in [false, true] {
+                for identified in [false, true] {
+                    let dir = scratch_dir(&format!(
+                        "remote-insights-aside-{forked}-{error}-{identified}"
+                    ));
+                    let root = dir.join("reports");
+                    let remote = crate::remote::control::RemoteState::test_bridge();
+                    if identified {
+                        remote
+                            .shared
+                            .push_command_request("insights-id".into(), "/insights".into())
+                            .unwrap();
+                        remote.shared.take_prompt_requests();
+                        assert!(remote.shared.begin_prompt_request("insights-id"));
+                    }
+                    let engine = ScriptedEngine {
+                        aside_support: true,
+                        fork_aside_support: forked,
+                        replies: vec![r#"{"paragraphs":["discarded insight"]}"#.into()],
+                        aside_remote_stop: (!identified).then(|| Arc::clone(&remote.shared)),
+                        aside_remote_cancel: identified
+                            .then(|| (Arc::clone(&remote.shared), "insights-id".into())),
+                        aside_remote_error: error,
+                        ..ScriptedEngine::default()
+                    };
+                    let prompts = Arc::clone(&engine.prompts);
+                    let cfg = test_cfg();
+                    let mut agent = test_agent(&dir, engine, &cfg);
+                    agent.remote = Some(Arc::clone(&remote));
+                    agent.session.id = agent.store.mint_id();
+                    for _ in 0..crate::insights::MIN_HUMAN_MESSAGES {
+                        agent.session.push(Message::user("Investigate the parser"));
+                        agent
+                            .session
+                            .push(Message::assistant("Inspected the parser"));
+                    }
+                    agent.save_session().unwrap();
+                    let mut notes = Vec::new();
+                    let result = agent
+                        .run_insights_in("fresh", &root, &mut |line| notes.push(line), &mut |_| {})
+                        .unwrap();
+                    let Insights::Done { path, summary } = result else {
+                        panic!("finished statistics must survive a prose stop");
+                    };
+                    assert!(
+                        !std::fs::read_to_string(path)
+                            .unwrap()
+                            .contains("discarded insight")
+                    );
+                    assert!(summary.iter().any(|line| line.contains("2 prompts")));
+                    assert_eq!(
+                        prompts.lock().unwrap().len(),
+                        1,
+                        "no retry or later section after stop"
+                    );
+                    assert!(notes.iter().any(|line| line.contains("stopped")));
+                    assert!(
+                        !notes
+                            .iter()
+                            .any(|line| line.contains("retrying") || line.contains("unavailable"))
+                    );
+                    assert!(
+                        crate::insights::load_state(&root)
+                            .unwrap()
+                            .narrative
+                            .is_empty()
+                    );
+                    assert!(
+                        console_remote_interrupted(Some(&remote)),
+                        "dispatch owns stop retirement"
+                    );
+                    if identified {
+                        assert!(!remote.shared.interrupt.load(Ordering::Relaxed));
+                    }
+                    agent.finish_console_dispatch();
+                    if identified {
+                        remote.shared.finish_prompt_request("insights-id");
+                    }
+                    assert!(!console_remote_interrupted(Some(&remote)));
+                    assert!(matches!(
+                        agent
+                            .run_insights_in("fast", &root, &mut |_| {}, &mut |_| {})
+                            .unwrap(),
+                        Insights::Done { .. }
+                    ));
+                    std::fs::remove_dir_all(dir).ok();
+                }
+            }
+        }
     }
 
     #[test]
@@ -27141,6 +30642,44 @@ mod tests {
                 "expected {name} to be refused as unknown under a restrictive profile, got: {out}"
             );
         }
+    }
+
+    #[test]
+    fn remote_shell_stop_blocks_engine_routed_tools_before_dispatch() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let dir = scratch_dir("remote-tool-stop");
+        let cfg = test_cfg();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        remote.shared.interrupt.store(true, Ordering::Relaxed);
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote = Some(Arc::clone(&remote));
+        let calls = [
+            crate::tools::test_call("agent", &[("task", "must not run")]),
+            crate::tools::test_call("fanout", &[]),
+            crate::tools::test_call("view_image", &[("path", "missing.png")]),
+            crate::tools::test_call(
+                "write",
+                &[("path", "blocked.txt"), ("content", "must not be written")],
+            ),
+        ];
+        let output = agent.run_tool_calls(&calls);
+        assert_eq!(
+            output.matches("interrupted before dispatch").count(),
+            calls.len()
+        );
+        assert!(!dir.join("blocked.txt").exists());
+        assert!(remote.shared.interrupt.load(Ordering::Relaxed));
+        agent.finish_console_dispatch();
+        let output = agent.run_tool_calls(&[crate::tools::test_call(
+            "write",
+            &[("path", "allowed.txt"), ("content", "later input")],
+        )]);
+        assert!(!output.contains("interrupted before dispatch"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("allowed.txt")).unwrap(),
+            "later input"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// Companion to the refusal test: the same three names still reach their
@@ -31601,10 +35140,135 @@ mod tests {
     }
 
     #[test]
+    fn metrics_snapshots_keep_raw_context_and_numeric_usage() {
+        use crate::remote::control::{MetricsWire, ServerMsg};
+        let dir = scratch_dir("metrics-snapshots");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.last_ctx_used = 150;
+        let breakdown = agent.context_breakdown();
+        let context = agent.metrics_snapshot("context");
+        let MetricsWire::Context {
+            window,
+            used,
+            categories,
+            ..
+        } = &context
+        else {
+            panic!("context snapshot")
+        };
+        assert_eq!(*window, u64::try_from(breakdown.ctx_size.max(0)).unwrap());
+        assert_eq!(*used, 150);
+        assert_eq!(
+            categories[0],
+            u64::try_from(breakdown.system.max(0)).unwrap()
+        );
+        agent.stats.input_tokens = 1234;
+        agent.stats.output_tokens = 567;
+        agent.usage.total.cache_read_tokens = 89;
+        let usage = agent.metrics_snapshot("usage");
+        let MetricsWire::Usage {
+            input,
+            output,
+            cache_read,
+            provider_passes,
+            ..
+        } = &usage
+        else {
+            panic!("usage snapshot")
+        };
+        assert_eq!((*input, *output, *cache_read), (1234, 567, 89));
+        assert!(provider_passes.is_none());
+        let speed = agent.metrics_snapshot("throughput");
+        let MetricsWire::Throughput {
+            generation,
+            prefill,
+        } = &speed
+        else {
+            panic!("throughput snapshot")
+        };
+        assert!(generation.len() <= 64 && prefill.len() <= 64);
+        let bus = crate::worker::BroadcastBus::new();
+        bus.broadcast(UiEvent::Visible("Keep answer".into()));
+        for _ in 0..100 {
+            bus.broadcast(UiEvent::Metrics(context.clone()));
+            bus.broadcast(UiEvent::Metrics(usage.clone()));
+            bus.broadcast(UiEvent::Metrics(speed.clone()));
+        }
+        let (tail, _) = bus.scrollback_since(None);
+        assert_eq!(tail.len(), 4);
+        assert!(
+            matches!(&tail[1].event, UiEvent::Metrics(snapshot) if snapshot.kind() == "context")
+        );
+        assert!(matches!(&tail[2].event, UiEvent::Metrics(snapshot) if snapshot.kind() == "usage"));
+        assert!(
+            matches!(&tail[3].event, UiEvent::Metrics(snapshot) if snapshot.kind() == "throughput")
+        );
+        let frame = ServerMsg::from_event(&UiEvent::Metrics(usage)).unwrap();
+        let value = serde_json::to_value(frame).unwrap();
+        assert_eq!(value["type"], "metrics");
+        assert_eq!(value["snapshot"]["input"], 1234);
+        bus.broadcast(UiEvent::SessionReset);
+        assert_eq!(bus.scrollback_since(None).0.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metrics_snapshots_refresh_at_idle_without_dispatching_a_command() {
+        use crate::remote::control::MetricsWire;
+        let dir = scratch_dir("metrics-live-idle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let receiver = remote.bus.subscribe();
+        agent.remote = Some(Arc::clone(&remote));
+        agent.stats.input_tokens = 321;
+        agent.stats.output_tokens = 45;
+        // Idle uses the current transcript count, even after a stale generation.
+        agent.last_ctx_used = 9999;
+        let status = agent.idle_status();
+        let original = agent.session.transcript.clone();
+        agent.publish_idle_metrics(&status);
+        let events: Vec<_> = receiver.try_iter().map(|event| event.event).collect();
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::Metrics(MetricsWire::Context { used, .. })
+                if *used == u64::try_from(status.ctx_used.max(0)).unwrap())));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UiEvent::Metrics(MetricsWire::Usage {
+                input: 321,
+                output: 45,
+                ..
+            })
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, UiEvent::Metrics(MetricsWire::Throughput { .. })))
+        );
+        assert_eq!(agent.session.transcript, original);
+        agent.stats.output_tokens = 46;
+        agent.publish_idle_metrics(&status);
+        let (tail, _) = remote.bus.scrollback_since(None);
+        assert_eq!(
+            tail.len(),
+            3,
+            "each metric category retains only its latest snapshot"
+        );
+        assert!(tail.iter().any(|event| matches!(
+            &event.event,
+            UiEvent::Metrics(MetricsWire::Usage { output: 46, .. })
+        )));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn readonly_slash_commands_do_not_dirty_or_log() {
         let dir = scratch_dir("readonly-slash");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
         // Session-start scaffolding, not activity.
         let combined = agent.context_content.combined();
         agent.session.push(Message::user(combined));
@@ -31623,10 +35287,1063 @@ mod tests {
             );
             assert!(!agent.session.dirty, "{cmd} must not dirty the session");
         }
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(
+            events.iter().any(
+                |event| matches!(&event.event, UiEvent::Plain(text) if !text.trim().is_empty())
+            ),
+            "console control reports must reach attached clients without changing the conversation"
+        );
         assert!(
             agent.save_for_exit().is_none(),
             "a report-only session gets no resume point"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn console_controls_never_become_model_prompts() {
+        let dir = scratch_dir("console-controls");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let before = agent.session.transcript.clone();
+        for command in ["/usage", " /tasks ", "/version", "/unknown-command"] {
+            assert!(agent.console_input(command).unwrap(), "{command}");
+            assert_eq!(agent.session.transcript.len(), before.len(), "{command}");
+        }
+        assert!(!agent.console_input("/quit").unwrap());
+        assert!(!agent.console_input("/exit").unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn task_controls_edit_and_persist_stable_ids_without_model_prompts() {
+        let dir = scratch_dir("task-controls");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let before = agent.session.transcript.clone();
+        assert!(
+            agent
+                .console_input("/tasks add Inspect the parser")
+                .unwrap()
+        );
+        assert!(agent.console_input("/tasks set 1 in_progress").unwrap());
+        assert!(
+            agent
+                .console_input("/tasks rename 1 Review parser changes")
+                .unwrap()
+        );
+        assert!(
+            agent
+                .console_input("/tasks active 1 Reviewing parser changes")
+                .unwrap()
+        );
+        let task = agent.session.tasks.get(1).unwrap();
+        assert_eq!(task.subject, "Review parser changes");
+        assert_eq!(task.status, crate::tasks::TaskStatus::InProgress);
+        assert_eq!(
+            task.active_form.as_deref(),
+            Some("Reviewing parser changes")
+        );
+        assert!(agent.session.is_persisted());
+        assert!(!agent.session.dirty);
+        assert_eq!(agent.session.transcript, before);
+        let id = agent.session.id.clone();
+        assert_eq!(agent.store.load(&id).unwrap().tasks, agent.session.tasks);
+        assert!(agent.store.load(&id).unwrap().transcript.is_empty());
+        assert_eq!(agent.store.load(&id).unwrap().title, "Inspect the parser");
+        assert_eq!(agent.store.retitle_all().unwrap().len(), 1);
+        assert_eq!(
+            agent.store.load(&id).unwrap().title,
+            "Review parser changes"
+        );
+        assert!(agent.store.find(&id).is_ok());
+        for invalid in [
+            "add",
+            "set 0 completed",
+            "set 1 completed extra",
+            "set 999 completed",
+            "rename 1",
+            "remove 1",
+            "add bad\n/quit",
+        ] {
+            let tasks = agent.session.tasks.clone();
+            agent.session.dirty = false;
+            let _ = agent.tasks_command(invalid);
+            assert_eq!(agent.session.tasks, tasks, "{invalid}");
+            assert!(!agent.session.dirty, "{invalid}");
+        }
+        agent.tasks_command("set 1 completed");
+        agent.tasks_command("set 1 pending");
+        agent.tasks_command("active 1 -");
+        assert_eq!(
+            agent.session.tasks.get(1).unwrap().status,
+            crate::tasks::TaskStatus::Pending
+        );
+        assert!(agent.session.tasks.get(1).unwrap().active_form.is_none());
+        assert!(agent.console_input("/tasks add Verify the tests").unwrap());
+        assert_eq!(agent.session.tasks.next_id(), 2);
+        agent.session.dirty = false;
+        agent.tasks_command("");
+        assert!(!agent.session.dirty);
+        assert!(!console_input_claims_control("/tasks"));
+        assert!(console_input_claims_control("/tasks set 1 completed"));
+        let (events, _) = remote.bus.scrollback_since(None);
+        let rows = events
+            .iter()
+            .find_map(|event| match &event.event {
+                UiEvent::Tasks(view) => Some(view.wire_rows()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[1].id, 2);
+        let reply = agent.tasks_command("set 2 completed");
+        assert_eq!(reply.lines().count(), 1);
+        assert!(reply.contains("Task [2] completed; saved in session"));
+        assert_eq!(
+            agent.store.load(&id).unwrap().tasks.get(2).unwrap().status,
+            crate::tasks::TaskStatus::Completed
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, "not a directory").unwrap();
+        let reply = agent.tasks_command("add Preserve the unsaved change");
+        assert!(reply.contains("changed in memory; save failed"));
+        assert!(agent.session.dirty);
+        assert!(agent.session.tasks.get(3).is_some());
+        std::fs::remove_file(dir).ok();
+    }
+
+    #[test]
+    fn console_remote_inputs_preserve_commands_and_complete_their_own_turns() {
+        let dir = scratch_dir("console-remote-inputs");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["First answer".into(), "Second answer".into()],
+            think_tags: true,
+            ..ScriptedEngine::default()
+        };
+        let prompts = Arc::clone(&engine.prompts);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        remote
+            .shared
+            .push_command_request("catalog".into(), "/command".into())
+            .unwrap();
+        remote
+            .shared
+            .push_prompt_request("first".into(), "First prompt".into())
+            .unwrap();
+        remote
+            .shared
+            .push_prompt_request("second".into(), "Second prompt".into())
+            .unwrap();
+        assert!(agent.console_remote_inputs());
+        assert!(!agent.console_remote_inputs());
+        assert!(!agent.turn_from_remote);
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "a slash command must not generate a model turn"
+        );
+        assert!(prompts[0].contains("First prompt"));
+        assert!(!prompts[0].contains("Second prompt"));
+        assert!(prompts[1].contains("Second prompt"));
+        let (events, _) = remote.bus.scrollback_since(None);
+        let completions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiEvent::CommandRequestDone { request_id } | UiEvent::PromptDone { request_id } => {
+                    Some(request_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completions, ["catalog", "first", "second"]);
+        let position = |id: &str| {
+            events.iter().position(|event| matches!(&event.event, UiEvent::PromptDone { request_id } if request_id == id)).unwrap()
+        };
+        let first_done = position("first");
+        let second_done = position("second");
+        let visible = |range: std::ops::Range<usize>| {
+            events[range]
+                .iter()
+                .filter_map(|event| match &event.event {
+                    UiEvent::Visible(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert!(visible(0..first_done).contains("First answer"));
+        assert!(visible(first_done + 1..second_done).contains("Second answer"));
+        assert!(!remote.shared.cancel_prompt_request("first"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn console_background_cleanup_retires_interruption_on_early_return_and_failure() {
+        #[derive(Debug)]
+        struct InterruptedFailure(Arc<TurnShared>);
+        impl Engine for InterruptedFailure {
+            fn ctx_size(&self) -> i32 {
+                100_000
+            }
+            fn generate(
+                &mut self,
+                _prompt: crate::engine::Prompt<'_>,
+                _options: &crate::engine::GenerationOptions,
+                _interrupt: &dyn Fn() -> bool,
+                _greedy: &dyn Fn() -> bool,
+                _event: &mut dyn FnMut(EngineEvent),
+            ) -> Result<GenerationStats, EngineError> {
+                self.0.interrupt.store(true, Ordering::Relaxed);
+                Err(EngineError::new("generation failed"))
+            }
+        }
+        let dir = scratch_dir("console-background-cleanup");
+        let cfg = test_cfg();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["Later answer".into()],
+                think_tags: true,
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.remote = Some(Arc::clone(&remote));
+        remote.shared.interrupt.store(true, Ordering::Relaxed);
+        agent.console_turn().unwrap();
+        assert!(agent.last_turn_interrupted);
+        assert!(!remote.shared.interrupt.load(Ordering::Relaxed));
+        assert!(agent.console_input("A later local prompt").unwrap());
+        assert!(!agent.last_turn_interrupted);
+        assert!(!remote.shared.interrupt.load(Ordering::Relaxed));
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event, UiEvent::UserEcho(text) if text == "A later local prompt")));
+        agent
+            .tool_ctx
+            .tasks
+            .add("Publish console task updates", None);
+        agent.sync_tasks_after_dispatch();
+        agent.publish_console_idle();
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event, UiEvent::Tasks(tasks) if tasks.wire_report().contains("Publish console task updates"))));
+        assert!(events.iter().any(|event| matches!(&event.event, UiEvent::Status(status) if status.state == crate::status::WorkerState::Idle)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(&event.event, UiEvent::Jobs(_)))
+        );
+        agent.engine = Box::new(InterruptedFailure(Arc::clone(&remote.shared)));
+        assert!(agent.console_turn().is_err());
+        assert!(!remote.shared.interrupt.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn console_local_input_reclaims_control_and_retires_waiting_network_inputs() {
+        let dir = scratch_dir("console-local-ownership");
+        let cfg = test_cfg();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let stamp = {
+            let mut policy = remote.control.lock().unwrap();
+            policy.grant(7);
+            policy.stamp(7).unwrap()
+        };
+        remote
+            .shared
+            .push_remote_request(stamp, "old".into(), "Old network prompt".into(), false)
+            .unwrap();
+        remote
+            .shared
+            .push_legacy_request(stamp, "/usage".into())
+            .unwrap();
+        remote.shared.interrupt.store(true, Ordering::Relaxed);
+        let engine = ScriptedEngine {
+            replies: vec!["Local answer".into()],
+            think_tags: true,
+            ..ScriptedEngine::default()
+        };
+        let prompts = Arc::clone(&engine.prompts);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.remote = Some(Arc::clone(&remote));
+        assert!(agent.console_input("Local user prompt").unwrap());
+        assert_eq!(
+            remote.control.lock().unwrap().holder(),
+            crate::remote::control::Holder::Local
+        );
+        assert!(!remote.shared.has_prompt_requests());
+        assert!(!agent.console_remote_inputs());
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Local user prompt"));
+        assert!(!prompts[0].contains("Old network prompt"));
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(
+            |event| matches!(&event.event, UiEvent::PromptDone {request_id} if request_id == "old")
+        ));
+        assert!(
+            events.iter().any(
+                |event| matches!(&event.event, UiEvent::CommandDone {text} if text == "/usage")
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn console_local_reports_preserve_remote_control_and_its_waiting_input() {
+        let dir = scratch_dir("console-local-report");
+        let cfg = test_cfg();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let stamp = {
+            let mut policy = remote.control.lock().unwrap();
+            policy.grant(7);
+            policy.stamp(7).unwrap()
+        };
+        remote
+            .shared
+            .push_remote_request(stamp, "waiting".into(), "Remote task".into(), false)
+            .unwrap();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote = Some(Arc::clone(&remote));
+        for report in [
+            "/command",
+            "/usage",
+            "/rc status",
+            "/jobs output 1",
+            "/engines --page 1",
+        ] {
+            assert!(agent.console_input(report).unwrap());
+        }
+        assert_eq!(
+            remote.control.lock().unwrap().holder(),
+            crate::remote::control::Holder::Remote(7)
+        );
+        assert!(remote.shared.has_prompt_requests());
+        assert!(console_input_claims_control("/new"));
+        assert!(console_input_claims_control("/rc off"));
+        assert!(console_input_claims_control("/jobs stop 1"));
+        assert!(!console_input_claims_control("/jobs output 1"));
+        assert!(!console_input_claims_control("/jobs"));
+        assert!(!console_input_claims_control("/engines --page 1"));
+        assert!(console_input_claims_control("/engines"));
+        assert!(console_input_claims_control("/config engine.temperature 1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn console_remote_inputs_stop_generation_without_poisoning_the_next_request() {
+        let dir = scratch_dir("console-remote-interrupt");
+        let cfg = test_cfg();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let engine = ScriptedEngine {
+            replies: vec!["Partial answer".into(), "Next answer".into()],
+            think_tags: true,
+            console_cancel: Some((Arc::clone(&remote.shared), "stopped".into())),
+            ..ScriptedEngine::default()
+        };
+        let prompts = Arc::clone(&engine.prompts);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.remote = Some(Arc::clone(&remote));
+        remote
+            .shared
+            .push_prompt_request("stopped".into(), "First input".into())
+            .unwrap();
+        remote
+            .shared
+            .push_prompt_request("next".into(), "Next input".into())
+            .unwrap();
+        assert!(agent.console_remote_inputs());
+        assert_eq!(prompts.lock().unwrap().len(), 2);
+        assert!(
+            !agent.last_turn_interrupted,
+            "the next request must run normally"
+        );
+        assert!(!remote.shared.interrupt.load(Ordering::Relaxed));
+        assert!(!remote.shared.prompt_batch_cancelled());
+        assert!(!remote.shared.cancel_prompt_request("stopped"));
+        let (events, _) = remote.bus.scrollback_since(None);
+        let completed = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiEvent::PromptDone { request_id } => Some(request_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed, ["stopped", "next"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn console_remote_inputs_skip_cancelled_requests_and_refuse_host_exit() {
+        let dir = scratch_dir("console-remote-cancel");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        remote
+            .shared
+            .push_prompt_request("cancelled".into(), "Never generate this".into())
+            .unwrap();
+        assert!(remote.shared.cancel_prompt_request("cancelled"));
+        remote.shared.finish_prompt_request("cancelled");
+        // Production ingress refuses this too; the dispatcher retains the guard.
+        remote
+            .shared
+            .push_command_request("exit".into(), "/quit".into())
+            .unwrap();
+        remote
+            .shared
+            .push_command_request("report".into(), "/usage".into())
+            .unwrap();
+        let before = agent.session.transcript.len();
+        assert!(agent.console_remote_inputs());
+        assert_eq!(agent.session.transcript.len(), before);
+        assert!(!agent.turn_from_remote);
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(
+            |event| matches!(&event.event, UiEvent::Error(text) if text.contains("local-only"))
+        ));
+        let completions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiEvent::CommandRequestDone { request_id } => Some(request_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completions, ["exit", "report"]);
+        assert!(!remote.shared.has_prompt_requests());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_questions_publish_options_and_close_on_local_or_remote_input() {
+        use crate::tools::ask::{AskOption, AskOutcome, AskRequest};
+        let shared = TurnShared::default();
+        let bus = BroadcastBus::new();
+        let receiver = bus.subscribe();
+        let request = AskRequest {
+            question: "Proceed?".into(),
+            header: "Confirm".into(),
+            multi: false,
+            allow_chat: true,
+            options: vec![AskOption {
+                label: "Yes".into(),
+                description: "Continue".into(),
+            }],
+        };
+        let question = RemoteQuestion::open(&shared, Some(&bus), &request);
+        let id = question.id.clone();
+        let UiEvent::Question(wire) = receiver.try_recv().unwrap().event else {
+            panic!("expected question");
+        };
+        assert_eq!(wire["id"], id);
+        assert_eq!(wire["options"][1]["label"], crate::tools::ask::CHAT_LABEL);
+        assert!(shared.questions.answer(&id, "1"));
+        assert_eq!(
+            question.finish(AskOutcome::Declined),
+            AskOutcome::Answered(vec!["Yes".into()])
+        );
+        drop(question);
+        assert!(
+            matches!(receiver.try_recv().unwrap().event, UiEvent::QuestionDone { id: done } if done == id)
+        );
+        assert!(!shared.questions.answer(&id, "1"));
+        let question = RemoteQuestion::open(&shared, Some(&bus), &request);
+        let next = question.id.clone();
+        assert_ne!(next, id);
+        assert!(shared.questions.answer(&next, "1"));
+        assert_eq!(
+            question.finish(AskOutcome::Interrupted),
+            AskOutcome::Interrupted
+        );
+        drop(question);
+        assert!(!shared.questions.answer(&next, "1"));
+    }
+
+    #[test]
+    fn command_confirmations_preserve_safe_option_order_and_close_remote_requests() {
+        use crate::tools::ask::{AskOption, AskOutcome, AskRequest};
+        let shared = TurnShared::default();
+        let bus = BroadcastBus::new();
+        let receiver = bus.subscribe();
+        let request = AskRequest {
+            question: "Overwrite saved session?".into(),
+            header: "Overwrite".into(),
+            options: vec![
+                AskOption {
+                    label: "Keep it".into(),
+                    description: "Leave both sessions alone".into(),
+                },
+                AskOption {
+                    label: "Overwrite".into(),
+                    description: "Replace the saved session".into(),
+                },
+            ],
+            multi: false,
+            allow_chat: false,
+        };
+        assert_eq!(
+            finish_pick_answer(&request, None, AskOutcome::Answered(vec!["Keep it".into()])),
+            Some(0)
+        );
+        assert_eq!(
+            finish_pick_answer(&request, None, AskOutcome::Declined),
+            None
+        );
+        for (choice, expected) in [("1", Some(0)), ("2", Some(1)), ("0", None)] {
+            let question = RemoteQuestion::open(&shared, Some(&bus), &request);
+            let UiEvent::Question(wire) = receiver.try_recv().unwrap().event else {
+                panic!("expected question");
+            };
+            assert_eq!(wire["options"].as_array().unwrap().len(), 2);
+            assert_eq!(wire["options"][0]["label"], "Keep it");
+            assert!(!shared.questions.answer(&question.id, "3"));
+            assert!(shared.questions.answer(&question.id, choice));
+            assert_eq!(
+                finish_pick_answer(&request, Some(&question), AskOutcome::Declined),
+                expected
+            );
+            let id = question.id.clone();
+            drop(question);
+            assert!(
+                matches!(receiver.try_recv().unwrap().event, UiEvent::QuestionDone { id: done } if done == id)
+            );
+            assert!(!shared.questions.answer(&id, "2"));
+        }
+        let question = RemoteQuestion::open(&shared, Some(&bus), &request);
+        assert!(shared.questions.answer(&question.id, "2"));
+        assert_eq!(
+            finish_pick_answer(&request, Some(&question), AskOutcome::Interrupted),
+            None
+        );
+    }
+
+    #[test]
+    fn gui_config_pages_cover_builtin_fields_and_preserve_setter_values() {
+        let dir = scratch_dir("gui-config-pages");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let first = agent.config_snapshot(1, None);
+        assert_eq!(first.total, crate::configform::FIELDS.len());
+        assert_eq!(first.fields.len(), 32);
+        let mut paths = std::collections::HashSet::new();
+        for page in 1..=first.total.div_ceil(32) {
+            let snapshot = agent.config_snapshot(page, None);
+            assert_eq!(snapshot.page, page);
+            for field in &snapshot.fields {
+                assert!(paths.insert(field.path.clone()));
+                assert_ne!(field.value, "(unset)");
+                assert_ne!(field.value, "(default)");
+            }
+            let frame = crate::remote::control::ServerFrame::seq(
+                1,
+                crate::remote::control::ServerMsg::from_event(&UiEvent::Config(snapshot)).unwrap(),
+            );
+            assert!(serde_json::to_vec(&frame).unwrap().len() < 2 * 1024 * 1024);
+        }
+        assert_eq!(paths.len(), crate::configform::FIELDS.len());
+        let key = "memory.minTurnSeconds";
+        let selected = agent.config_snapshot(1, Some(key));
+        assert!(selected.fields.iter().any(|field| field.path == key));
+        assert_eq!(
+            agent.config_snapshot(usize::MAX, None).page,
+            first.total.div_ceil(32)
+        );
+        let declared = vec![
+            (
+                "dev.demo".into(),
+                crate::wasmreg::ConfigOption {
+                    name: "difficulty".into(),
+                    kind: crate::wasmreg::ConfigKind::Enum(vec!["easy".into(), "hard".into()]),
+                    default: "easy".into(),
+                },
+            ),
+            (
+                "dev.demo".into(),
+                crate::wasmreg::ConfigOption {
+                    name: "note".into(),
+                    kind: crate::wasmreg::ConfigKind::Text,
+                    default: "🦀".repeat(2048),
+                },
+            ),
+        ];
+        let plugin = Agent::config_snapshot_with_options(
+            1,
+            Some("pluginConfig.dev.demo.difficulty"),
+            &declared,
+        );
+        assert_eq!(plugin.total, first.total + 2);
+        let difficulty = plugin
+            .fields
+            .iter()
+            .find(|field| field.path == "pluginConfig.dev.demo.difficulty")
+            .unwrap();
+        assert_eq!(difficulty.value, "easy");
+        assert_eq!(difficulty.hint, "easy, hard");
+        assert!(difficulty.editable);
+        let note = plugin
+            .fields
+            .iter()
+            .find(|field| field.path == "pluginConfig.dev.demo.note")
+            .unwrap();
+        assert!(!note.editable);
+        assert!(note.value.len() <= 4096);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gui_history_pages_follow_real_fork_and_rollback_commands() {
+        let dir = scratch_dir("gui-history-pages");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        for index in 1..=65 {
+            agent.session.push(Message::user(format!("turn-{index}")));
+            agent.session.push(Message::assistant("answer"));
+        }
+        let page = agent.history_snapshot(false, 2);
+        assert_eq!(page.total, 65);
+        assert_eq!(page.rows.len(), 32);
+        assert_eq!(page.rows[0].key.as_deref(), Some("33"));
+        assert_eq!(page.rows[0].detail, "turn-33");
+        assert!(agent.console_input("/checkpoint before review").unwrap());
+        let checkpoint = agent.history_snapshot(true, 1);
+        assert_eq!(checkpoint.rows[0].key.as_deref(), Some("before review"));
+        assert!(agent.console_input("/fork 33").unwrap());
+        assert_eq!(agent.session.transcript.len(), 64);
+        assert!(agent.console_input("/clone").unwrap());
+        assert!(agent.session.tree().branch_count() > 1);
+        assert!(agent.console_input("/rollback before review").unwrap());
+        assert_eq!(agent.session.transcript.len(), 130);
+        assert_eq!(agent.session.tree().branch_count(), 1);
+        let checkpoint = agent.history_snapshot(true, 1);
+        assert_eq!(checkpoint.total, 2);
+        assert!(
+            checkpoint
+                .rows
+                .iter()
+                .any(|row| row.key.as_deref() == Some(PRE_ROLLBACK_CHECKPOINT))
+        );
+        agent.checkpoints.save("unsafe\nname", &agent.session, None);
+        let checkpoint = agent.history_snapshot(true, 1);
+        assert!(checkpoint.rows.last().unwrap().key.is_none());
+        let frame = crate::remote::control::ServerFrame::seq(
+            1,
+            crate::remote::control::ServerMsg::from_event(&UiEvent::History(checkpoint)).unwrap(),
+        );
+        assert!(serde_json::to_vec(&frame).unwrap().len() < 2 * 1024 * 1024);
+        assert_eq!(agent.history_snapshot(false, usize::MAX).page, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gui_history_refresh_preserves_pages_and_clamps_after_rollback() {
+        let dir = scratch_dir("gui-history-refresh");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("first"));
+        agent.session.push(Message::assistant("answer"));
+        agent.checkpoints.save("early", &agent.session, None);
+        for index in 2..=65 {
+            agent.session.push(Message::user(format!("turn-{index}")));
+            agent.session.push(Message::assistant("answer"));
+            agent
+                .checkpoints
+                .save(&format!("cp-{index}"), &agent.session, None);
+        }
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let receiver = remote.bus.subscribe();
+        agent.refresh_history();
+        assert!(
+            receiver.try_recv().is_err(),
+            "unopened panels stay unscanned"
+        );
+        agent.publish_history(true, 2);
+        agent.publish_history(false, 2);
+        receiver.try_iter().for_each(drop);
+        agent.checkpoint_create("new checkpoint");
+        assert!(receiver.try_iter().any(|event| matches!(event.event,
+            UiEvent::History(snapshot) if snapshot.kind == "checkpoints" && snapshot.page == 2 && snapshot.total == 66)));
+        assert!(agent.rollback_to("missing").is_err());
+        assert!(
+            receiver.try_recv().is_err(),
+            "a failed mutation publishes no success"
+        );
+        agent.rollback_to("early").unwrap();
+        let events = receiver
+            .try_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::History(snapshot) if snapshot.kind == "checkpoints" && snapshot.page == 2 && snapshot.total == 67)));
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::History(snapshot) if snapshot.kind == "forks" && snapshot.page == 1 && snapshot.total == 1)));
+        assert_eq!(agent.tool_ctx.console.history_page(false), Some(1));
+        let transcript = agent.session.transcript.clone();
+        let dirty = agent.session.dirty;
+        agent.publish_idle_metrics(&Status::default());
+        assert_eq!(agent.session.transcript, transcript);
+        assert_eq!(agent.session.dirty, dirty);
+        let events = receiver
+            .try_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, UiEvent::History(_)))
+                .count(),
+            2
+        );
+        // A normal turn adds a new fork point; idle refresh reflects it without /tree.
+        agent.session.push(Message::user("next prompt"));
+        agent.session.push(Message::assistant("next answer"));
+        agent.publish_idle_metrics(&Status::default());
+        assert!(receiver.try_iter().any(|event| matches!(event.event,
+            UiEvent::History(snapshot) if snapshot.kind == "forks" && snapshot.total == 2)));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gui_history_reset_refreshes_new_state_after_the_reset_frame() {
+        let dir = scratch_dir("gui-history-reset");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let receiver = remote.bus.subscribe();
+        agent.session.push(Message::user("old prompt"));
+        agent.checkpoint_create("old checkpoint");
+        agent.publish_history(false, 1);
+        receiver.try_iter().for_each(drop);
+        agent.reset_session_state();
+        let events = receiver
+            .try_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        let reset = events
+            .iter()
+            .position(|event| matches!(event, UiEvent::SessionReset))
+            .unwrap();
+        for (index, event) in events.iter().enumerate() {
+            if let UiEvent::History(snapshot) = event {
+                assert!(index > reset);
+                let checkpoints = snapshot.kind == "checkpoints";
+                assert_eq!(*snapshot, agent.history_snapshot(checkpoints, 1));
+                if checkpoints {
+                    assert_eq!(snapshot.total, 0);
+                } else {
+                    assert!(snapshot.rows.iter().all(|row| row.detail != "old prompt"));
+                }
+                assert_eq!(snapshot.page, 1);
+            }
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, UiEvent::History(_)))
+                .count(),
+            2
+        );
+        agent.checkpoint_create("another old checkpoint");
+        receiver.try_iter().for_each(drop);
+        let mut loaded = Session::new();
+        loaded.push(Message::user("loaded prompt"));
+        agent.reset_for_adopted_session(loaded);
+        let events = receiver
+            .try_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert!(matches!(events[0], UiEvent::SessionReset));
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::History(snapshot) if snapshot.kind == "checkpoints" && snapshot.total == 0)));
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::History(snapshot) if snapshot.kind == "forks" && snapshot.total == 1 && snapshot.rows[0].detail == "loaded prompt")));
+        // A temporary sidechain must not replace the parent monitor or page.
+        let before = agent.begin_sidechain("temporary task".into(), false);
+        agent.publish_history(false, usize::MAX);
+        agent.refresh_history();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(agent.tool_ctx.console.history_page(false), Some(1));
+        agent.session.transcript.truncate(before);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_editors_publish_text_and_close_after_save_cancel_or_host_interruption() {
+        let shared = TurnShared::default();
+        let bus = BroadcastBus::new();
+        let receiver = bus.subscribe();
+        for reply in [serde_json::json!("edited 🦀\r\n"), serde_json::Value::Null] {
+            let editor = RemoteEditor::open(&shared, &bus, "File", "original\n").unwrap();
+            let UiEvent::Editor(wire) = receiver.try_recv().unwrap().event else {
+                panic!("expected editor");
+            };
+            assert_eq!(wire["id"], editor.id);
+            assert_eq!(wire["text"], "original\n");
+            assert!(shared.editors.reply(&editor.id, &reply));
+            assert_eq!(
+                shared.editors.take_reply(&editor.id),
+                Some(match reply.as_str() {
+                    Some(text) => crate::remote::editors::EditReply::Save(text.into()),
+                    None => crate::remote::editors::EditReply::Cancel,
+                })
+            );
+            let id = editor.id.clone();
+            drop(editor);
+            assert!(
+                matches!(receiver.try_recv().unwrap().event, UiEvent::EditorDone { id: closed } if closed == id)
+            );
+            assert!(!shared.editors.reply(&id, &reply));
+        }
+        let editor = RemoteEditor::open(&shared, &bus, "File", "original").unwrap();
+        let id = editor.id.clone();
+        drop(editor);
+        assert!(!shared.editors.reply(&id, &serde_json::json!("late save")));
+        assert!(
+            RemoteEditor::open(
+                &shared,
+                &bus,
+                "File",
+                &"x".repeat(crate::remote::editors::DOCUMENT_BYTES + 1)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_editors_refuse_changed_memory_before_writing() {
+        let dir = scratch_dir("remote-memory-conflict");
+        let path = dir.join("memory.md");
+        std::fs::write(&path, "original\n").unwrap();
+        let sources = vec![crate::memory::Source {
+            scope: crate::memory::Scope::Project,
+            path: path.clone(),
+        }];
+        let initial = crate::memory::combine(&sources);
+        let edited = initial.replace("original", "edited");
+        apply_gui_memory_edit(&sources, &initial, &edited).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited\n");
+        std::fs::write(&path, "external change\n").unwrap();
+        assert!(apply_gui_memory_edit(&sources, &initial, &edited).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external change\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gui_controls_include_loaded_skills_templates_and_named_agents() {
+        let dir = scratch_dir("gui-controls-catalog");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.skills.push(crate::skills::Skill {
+            name: "review".into(),
+            description: "Review project".into(),
+            argument_hint: "<path>".into(),
+            body: "review $ARGUMENTS".into(),
+            dir: dir.clone(),
+        });
+        agent.templates.push(crate::templates::Template {
+            name: "triage".into(),
+            description: "Triage bugs".into(),
+            argument_hint: "<issue>".into(),
+            body: "triage {{issue}} in {{project}}; {{issue}}".into(),
+            path: dir.join("triage.md"),
+        });
+        agent.agents.push(crate::agents::AgentDef {
+            name: "research".into(),
+            description: "Research helper".into(),
+            body: "Research this".into(),
+            path: dir.join("research.md"),
+            engine: None,
+            auto: true,
+            isolate: false,
+        });
+        let catalog = agent.gui_controls();
+        for (kind, expected) in [
+            ("skills", "review"),
+            ("templates", "triage"),
+            ("agents", "research"),
+            ("mcp", "no servers configured"),
+            ("plugins", "no plugins loaded"),
+            ("hooks", "no hooks configured"),
+        ] {
+            let snapshot = agent.extensions_snapshot(kind).unwrap();
+            assert_eq!(snapshot.kind, kind);
+            assert!(snapshot.report.contains(expected), "{}", snapshot.report);
+            assert_eq!(
+                snapshot.enabled.is_some(),
+                matches!(kind, "skills" | "hooks")
+            );
+            let wire =
+                crate::remote::control::ServerMsg::from_event(&UiEvent::Extensions(snapshot))
+                    .unwrap();
+            let json = serde_json::to_value(wire).unwrap();
+            assert_eq!(json["type"], "extensions");
+            assert_eq!(json["snapshot"]["kind"], kind);
+        }
+        assert!(agent.extensions_snapshot("unknown").is_none());
+        let commands = catalog["commands"].as_array().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .find(|command| command["name"] == "/triage")
+                .unwrap()["parameters"],
+            serde_json::json!(["issue", "project"])
+        );
+        assert!(commands.iter().any(|command| {
+            command["name"] == "/mtp"
+                && command["requirement"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("draft model"))
+        }));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["name"] == "/review" && command["requirement"].is_null())
+        );
+        let features = catalog["features"].as_array().unwrap();
+        for (name, available) in [
+            ("wasm", cfg!(feature = "plugins")),
+            ("terminal_editor", cfg!(feature = "builtin_editor")),
+            ("documents", cfg!(feature = "docparse")),
+            ("images", cfg!(feature = "images")),
+            ("speculation", false),
+            ("steering", false),
+            ("vision", false),
+            ("structured", false),
+            ("aside", false),
+            ("forked_aside", false),
+            ("multiplexing", false),
+            ("decisions", false),
+            ("gpu_release", false),
+            ("gpu_restore", false),
+            ("exact_kv", false),
+            ("parallel_backend", false),
+            ("local_inference", false),
+        ] {
+            assert!(
+                features
+                    .iter()
+                    .any(|feature| feature["name"] == name && feature["available"] == available),
+                "{name}"
+            );
+        }
+        for (name, source) in [
+            ("/commands", "builtin"),
+            ("/review", "skill"),
+            ("/triage", "template"),
+            ("/subagent:research", "agent"),
+        ] {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command["name"] == name && command["source"] == source),
+                "{name}"
+            );
+        }
+        assert!(agent.console_input("/commands").unwrap());
+        assert!(agent.console_input("/command").unwrap());
+        assert!(agent.console_input("/temp 0.75").unwrap());
+        assert!(agent.console_input("/power 60").unwrap());
+        let updated = agent.gui_controls();
+        assert_eq!(updated["settings"]["temperature"], 0.75);
+        assert_eq!(updated["settings"]["power_percent"], 60);
+        assert_eq!(updated["settings"]["speculative"], false);
+        assert_eq!(updated["settings"]["speculation_available"], false);
+        assert!(updated["settings"]["steering"].is_null());
+        assert!(agent.session.transcript.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gui_question_answers_require_a_matching_id_and_explicit_text() {
+        assert_eq!(
+            gui_answer("q1", r#"{"id":"q1","answer":"1,2"}"#),
+            Some("1,2".into())
+        );
+        assert_eq!(gui_answer("q1", r#"{"id":"q2","answer":"1"}"#), None);
+        assert_eq!(gui_answer("q1", r#"{"id":"q1"}"#), None);
+        assert_eq!(gui_answer("q1", r#"{"id":"q1","answer":true}"#), None);
+        assert_eq!(gui_answer("q1", "1"), None);
+    }
+
+    #[test]
+    fn gui_capabilities_follow_the_loaded_backend_without_generation() {
+        let dir = scratch_dir("gui-capabilities");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                local: true,
+                exact_kv: true,
+                aside_support: true,
+                fork_aside_support: true,
+                multiplex_support: true,
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let supported = [
+            "local_inference",
+            "exact_kv",
+            "aside",
+            "forked_aside",
+            "multiplexing",
+        ];
+        let catalog = agent.gui_controls();
+        for name in supported {
+            assert!(
+                catalog["features"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|feature| feature["name"] == name && feature["available"] == true),
+                "{name}"
+            );
+        }
+        assert!(agent.session.transcript.is_empty());
+        agent.engine = Box::new(ScriptedEngine::default());
+        let catalog = agent.gui_controls();
+        for name in supported {
+            assert!(
+                catalog["features"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|feature| feature["name"] == name && feature["available"] == false),
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gui_editor_rejects_stale_answers_and_files_changed_during_editing() {
+        assert_eq!(
+            gui_edit_reply("e1", r#"{"id":"e1","text":"hello\n🦀\n"}"#).unwrap(),
+            Some("hello\n🦀\n".into())
+        );
+        assert_eq!(
+            gui_edit_reply("e1", r#"{"id":"e1","text":null}"#).unwrap(),
+            None
+        );
+        assert!(gui_edit_reply("e1", r#"{"id":"e2","text":"wrong"}"#).is_err());
+        assert!(gui_edit_reply("e1", r#"{"id":"e1"}"#).is_err());
+        let dir = scratch_dir("gui-editor-conflict");
+        let file = dir.join("file.rs");
+        std::fs::write(&file, "initial\n").unwrap();
+        assert!(apply_gui_file_edit(&file, "initial\n", "explicit change\n").unwrap());
+        assert!(!apply_gui_file_edit(&file, "explicit change\n", "explicit change\n").unwrap());
+        assert!(apply_gui_file_edit(&file, "initial\n", "overwrite\n").is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "explicit change\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -32846,6 +37563,99 @@ mod tests {
     /// on every session blob with "vanished from disk", and on a coincidental
     /// match acted on a different body entirely.
     #[test]
+    fn kvcache_entry_handles_target_duplicate_payloads_and_reject_replaced_identity() {
+        let dir = scratch_dir("kvcache-entry-handles");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let fingerprint = "shared-payload";
+        let keys: Vec<_> = ["a-session", "z-session"]
+            .into_iter()
+            .map(|id| {
+                let key = crate::session::KvKey::Session {
+                    id: id.into(),
+                    fp: fingerprint.into(),
+                };
+                agent
+                    .store
+                    .kv_store_labeled(
+                        &key,
+                        &crate::kvcache::KVCache::new(
+                            vec![1, 2, 3],
+                            crate::ds4tokens::TokenTranscript::new(),
+                        ),
+                        None,
+                        "m",
+                        &crate::kvmeta::KvLabel::Session {
+                            name: id.into(),
+                            title: "Duplicate payload".into(),
+                        },
+                    )
+                    .unwrap();
+                key
+            })
+            .collect();
+        let paths: Vec<_> = keys.iter().map(|key| agent.store.kv_path(key)).collect();
+        let handles: Vec<_> = paths
+            .iter()
+            .map(|path| crate::remote::control::cache_entry_handle(path))
+            .collect();
+        assert_ne!(handles[0], handles[1]);
+        let snapshot = agent.cache_snapshot(1);
+        assert_eq!(snapshot.rows.len(), 2);
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .all(|row| row.entry.is_some() && row.fingerprint.as_deref() == Some(fingerprint))
+        );
+        assert!(
+            agent
+                .kvcache_apply("pin", fingerprint)
+                .contains("ambiguous")
+        );
+        let pin = agent.kvcache_text_command(&format!("pin --entry {} {fingerprint}", handles[1]));
+        assert!(pin.contains("pinned"), "{pin}");
+        assert!(!crate::kvmeta::load(&paths[0]).unwrap().pinned);
+        assert!(crate::kvmeta::load(&paths[1]).unwrap().pinned);
+        assert!(
+            agent
+                .kvcache_apply_entry("rm", &handles[0], fingerprint)
+                .is_ok()
+        );
+        assert!(!paths[0].exists());
+        // Removing a preceding file changes scan indexes, never stable handles.
+        assert!(
+            agent
+                .kvcache_apply_entry("unpin", &handles[1], fingerprint)
+                .is_ok()
+        );
+        let stale = crate::kvmeta::load(&paths[1]).unwrap();
+        let mut replaced = stale.clone();
+        replaced.fingerprint = "replacement".into();
+        crate::kvmeta::store(&paths[1], &replaced).unwrap();
+        for action in ["pin", "unpin", "rm"] {
+            assert!(
+                agent
+                    .kvcache_apply_entry(action, &handles[1], fingerprint)
+                    .is_err()
+            );
+            assert!(mutate_cache_blob(action, &paths[1], &stale, fingerprint).is_err());
+            assert!(paths[1].exists());
+            assert_eq!(
+                crate::kvmeta::load(&paths[1]).unwrap().fingerprint,
+                "replacement"
+            );
+        }
+        assert!(
+            agent
+                .kvcache_apply_entry("rm", &handles[0], fingerprint)
+                .is_err()
+        );
+        assert!(agent.kvcache_apply_entry("rm", "bad", fingerprint).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn kvcache_mutations_act_on_a_real_session_payload() {
         let dir = scratch_dir("kvcache-session-mutate");
         let cfg = test_cfg();
@@ -32878,6 +37688,14 @@ mod tests {
             .unwrap();
         let path = agent.store.kv_path(&key);
         assert!(path.exists());
+        let snapshot = crate::remote::control::CacheWire::capture(&agent.kvcache_pane(), 99);
+        assert_eq!(snapshot.page, 1);
+        assert_eq!(snapshot.total, 1);
+        assert_eq!(snapshot.rows[0].fingerprint.as_deref(), Some(fp.as_str()));
+        assert!(!snapshot.rows[0].pinned);
+        let before = agent.session.transcript.len();
+        assert!(agent.console_input("/kvcache --page 1").unwrap());
+        assert_eq!(agent.session.transcript.len(), before);
 
         // The pane names the blob by its scan index, which resolves straight
         // back to this path.
@@ -32905,6 +37723,9 @@ mod tests {
         assert!(line.contains("pinned"), "{line}");
         let meta = crate::kvmeta::load(&path).expect("a sidecar");
         assert!(meta.pinned, "pin took effect on disk");
+        assert!(
+            crate::remote::control::CacheWire::capture(&agent.kvcache_pane(), 1).rows[0].pinned
+        );
         assert_eq!(meta.hits, hits, "pin must not revert a concurrent hit bump");
 
         let line = agent.kvcache_apply_idx("unpin", idx, &row_fp);
@@ -32924,6 +37745,10 @@ mod tests {
         let line = agent.kvcache_apply("rm", &fp[..8]);
         assert!(line.contains("removed"), "{line}");
         assert!(!path.exists(), "rm unlinked the body");
+        assert_eq!(
+            crate::remote::control::CacheWire::capture(&agent.kvcache_pane(), 1).total,
+            0
+        );
         assert!(
             !crate::kvmeta::sidecar_path(&path).exists(),
             "and its sidecar"
@@ -34843,6 +39668,8 @@ mod tests {
         };
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.tool_ctx = ToolContext::new(dir.clone());
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
         let (tx, rx) = std::sync::mpsc::channel();
         agent.sub_sink = SubSinkTarget::Events(tx);
         let out = agent.run_agent_tool(&agent_call("edit a.txt", None));
@@ -34876,11 +39703,50 @@ mod tests {
             self::edit_previews_empty(&agent),
             "nothing leaks to the parent turn"
         );
+        let (remote_events, _) = remote.bus.scrollback_since(None);
+        assert!(remote_events.iter().any(|event| matches!(&event.event,
+            UiEvent::Metrics(crate::remote::control::MetricsWire::Subagents { rows, .. })
+                if rows[0].output.as_ref().is_some_and(|text| text.contains("a.txt") && text.contains("beta") && text.contains("gamma")))));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     fn edit_previews_empty(agent: &Agent<'_>) -> bool {
         agent.tool_ctx.edit_previews.is_empty()
+    }
+
+    #[test]
+    fn subagent_tool_notices_keep_plans_warnings_and_parent_sink_ownership() {
+        let dir = scratch_dir("subagent-tool-notices");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
+        let parent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&parent);
+        agent.tool_ctx.status_sink = Some(Box::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        agent.tool_ctx.hook_warnings.push("hook warning".into());
+        agent.subagent_tool_batch(&[], "worker", "Inspect code");
+        assert!(agent.tool_ctx.subagent_label.is_none());
+        agent.tool_ctx.status_sink.as_ref().unwrap()("parent status");
+        assert_eq!(parent.load(Ordering::Relaxed), 1);
+        agent.tool_ctx.subagent_label = Some("worker".into());
+        let status = agent.subagent_tool_sink(false).unwrap();
+        let plan = agent.subagent_tool_sink(true).unwrap();
+        status("Searching repository");
+        plan("## Plan\nInspect and test");
+        drop(status);
+        drop(plan);
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event,
+            UiEvent::Metrics(crate::remote::control::MetricsWire::Subagents { rows, .. })
+                if rows[0].output.as_ref().is_some_and(|text| text.contains("hook warning") && text.contains("Searching repository") && text.contains("## Plan")))));
+        assert!(!events.iter().any(|event| matches!(
+            &event.event,
+            UiEvent::SystemStatus(_) | UiEvent::Markdown(_) | UiEvent::EditCard(_)
+        )));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -35782,9 +40648,18 @@ mod tests {
             ..ScriptedEngine::default()
         };
         let opts = crate::engine::GenerationOptions::default();
+        let channel = Arc::new(crate::console_input::ConsoleInput::default());
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let receiver = remote.bus.subscribe();
+        channel.subagent_event(&UiEvent::SubStart {
+            label: "pass".into(),
+            task: "Generate report".into(),
+        });
+        let progress = channel.progress("pass", false, Some(remote));
         let ctx = PassCtx {
             opts: &opts,
             think_off: true,
+            remote: None,
             thinking_tool_calls: false,
             display: PassDisplay {
                 show_thinking: true,
@@ -35799,6 +40674,7 @@ mod tests {
             "[user]\nhi\n",
             None,
             &ctx,
+            progress,
             Box::new(NullSink),
             |_call| Ok(()),
         )
@@ -35810,6 +40686,107 @@ mod tests {
         );
         assert!(pass.calls.is_empty());
         assert!(pass.tool_error.is_none());
+        let events: Vec<_> = receiver.try_iter().map(|event| event.event).collect();
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::Metrics(crate::remote::control::MetricsWire::Subagents { rows, .. })
+                if rows[0].live.as_ref().is_some_and(|live| live.generated > 0))));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, UiEvent::Status(_))),
+            "child-only progress must not replace the main status"
+        );
+    }
+
+    #[test]
+    fn quiet_remote_stop_is_sticky_across_passes_and_honors_identified_cancellation() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let opts = crate::engine::GenerationOptions::default();
+        let ctx = PassCtx {
+            opts: &opts,
+            remote: Some(Arc::clone(&remote)),
+            think_off: true,
+            thinking_tool_calls: false,
+            display: PassDisplay {
+                show_thinking: true,
+                show_tool_calls: true,
+                think_status: false,
+            },
+            tool_names: Vec::new(),
+            status: None,
+        };
+        let mut engine = ScriptedEngine {
+            replies: vec!["partial reply".into(), "later reply".into()],
+            quiet_remote_stop: Some(Arc::clone(&remote.shared)),
+            ..ScriptedEngine::default()
+        };
+        let Err(stopped) = generate_pass(
+            &mut engine,
+            "prompt",
+            None,
+            &ctx,
+            None,
+            Box::new(NullSink),
+            |_| Ok(()),
+        ) else {
+            panic!("quiet pass accepted a remote stop")
+        };
+        assert_eq!(stopped.error, QUIET_ABORT_INTERRUPTED);
+        assert!(stopped.partial.contains("partial reply"));
+        assert!(remote.shared.interrupt.load(Ordering::Relaxed));
+        assert!(
+            generate_pass(
+                &mut engine,
+                "another slot",
+                None,
+                &ctx,
+                None,
+                Box::new(NullSink),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(
+            engine.prompts.lock().unwrap().len(),
+            1,
+            "another pass cannot consume the shared stop"
+        );
+        remote.shared.interrupt.store(false, Ordering::Relaxed);
+        remote
+            .shared
+            .push_prompt_request("cancelled".into(), "prompt".into())
+            .unwrap();
+        remote.shared.take_prompt_requests();
+        assert!(remote.shared.begin_prompt_request("cancelled"));
+        assert!(!remote.shared.cancel_prompt_request("cancelled"));
+        remote.shared.interrupt.store(false, Ordering::Relaxed);
+        assert!(
+            generate_pass(
+                &mut engine,
+                "cancelled batch",
+                None,
+                &ctx,
+                None,
+                Box::new(NullSink),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(engine.prompts.lock().unwrap().len(), 1);
+        remote.shared.finish_prompt_request("cancelled");
+        assert!(
+            generate_pass(
+                &mut engine,
+                "later input",
+                None,
+                &ctx,
+                None,
+                Box::new(NullSink),
+                |_| Ok(())
+            )
+            .is_ok()
+        );
     }
 
     /// The wiring the blink depends on: a pass on a local engine must mark itself
@@ -35835,6 +40812,7 @@ mod tests {
         let ctx = PassCtx {
             opts: &opts,
             think_off: true,
+            remote: None,
             thinking_tool_calls: false,
             display: PassDisplay {
                 show_thinking: true,
@@ -35849,6 +40827,7 @@ mod tests {
             "[user]\nhi\n",
             None,
             &ctx,
+            None,
             Box::new(NullSink),
             |_call| Ok(()),
         )
@@ -35875,6 +40854,7 @@ mod tests {
             "[user]\nhi\n",
             None,
             &ctx,
+            None,
             Box::new(NullSink),
             |_call| Ok(()),
         )
@@ -36808,15 +41788,43 @@ or the user's next message aborts before its first token"
                 // Reply 1 is the sidechain's report; reply 2 is the follow-up
                 // turn the report triggers.
                 replies: vec!["the report\n".to_string(), "acting on it\n".to_string()],
+                think_tags: true,
+                pass_usages: vec![
+                    crate::engine::TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        ..crate::engine::TokenUsage::default()
+                    },
+                    crate::engine::TokenUsage {
+                        input_tokens: 300,
+                        output_tokens: 20,
+                        ..crate::engine::TokenUsage::default()
+                    },
+                ],
                 prompts: std::sync::Arc::clone(&prompts),
                 ..ScriptedEngine::default()
             },
             &cfg,
         );
 
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        agent.remote = Some(Arc::clone(&remote));
         agent
             .slash("/subagent do a thing")
             .expect("the command ran");
+
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert!(events.iter().any(|event| matches!(&event.event,
+            UiEvent::Metrics(crate::remote::control::MetricsWire::Subagents { rows, total:1, running:0 })
+                if rows.len() == 1 && rows[0].task == "do a thing" && !rows[0].running
+                    && rows[0].prefill == 100 && rows[0].generated == 10 && rows[0].live.is_none()
+                    && rows[0].output.as_deref().is_some_and(|output| output.contains("the report") && !output.contains("acting on it"))
+                    && rows[0].report.as_deref().is_some_and(|report| report.contains("the report") && !report.contains("acting on it")))));
+        assert_eq!(
+            agent.stats.output_tokens, 30,
+            "parent and child usage are separate from roster display ownership"
+        );
+        assert!(agent.tool_ctx.subagent_label.is_none());
 
         let seen = prompts.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "sidechain, then a turn on its report");
@@ -38043,6 +43051,47 @@ or the user's next message aborts before its first token"
         assert!(agent.process_memory_job(), "runs at the next idle moment");
         assert!(!agent.memory_jobs_pending());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn quiet_remote_stop_requeues_memory_without_spending_an_attempt() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let _auto_extract_on = enable_auto_extract_for_test();
+        for error_style in [false, true] {
+            let dir = scratch_dir(&format!("memory-remote-stop-{error_style}"));
+            let cfg = test_cfg();
+            let remote = crate::remote::control::RemoteState::test_bridge();
+            let engine = ScriptedEngine {
+                replies: vec!["[]".into(), "[]".into()],
+                quiet_remote_stop: Some(Arc::clone(&remote.shared)),
+                quiet_remote_error: error_style,
+                ..ScriptedEngine::default()
+            };
+            let prompts = Arc::clone(&engine.prompts);
+            let mut agent = test_agent(&dir, engine, &cfg);
+            agent.remote = Some(Arc::clone(&remote));
+            agent.session.push(Message::user("hello"));
+            agent.session.push(Message::assistant("hi"));
+            let depth = agent.session.transcript.len();
+            assert!(agent.enqueue_memory_job(std::time::Duration::MAX));
+            assert!(!agent.process_memory_job());
+            assert_eq!(agent.memory_jobs.len(), 1);
+            assert_eq!(agent.memory_jobs.front().unwrap().attempts, 0);
+            assert_eq!(agent.sidechain_depth, 0);
+            assert_eq!(agent.session.transcript.len(), depth);
+            assert!(
+                !agent.process_memory_job(),
+                "a stopped job waits for dispatcher cleanup"
+            );
+            assert_eq!(prompts.lock().unwrap().len(), 1);
+            crate::interrupt::request();
+            agent.finish_console_dispatch();
+            assert!(!crate::interrupt::pending());
+            assert!(agent.process_memory_job());
+            assert!(!agent.memory_jobs_pending());
+            assert_eq!(prompts.lock().unwrap().len(), 2);
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     /// A job whose engine keeps failing is dropped after the attempt cap, so
@@ -39617,6 +44666,113 @@ or the user's next message aborts before its first token"
         assert_eq!(img.get_pixel(0, 2).0, [205, 0, 0, 255]);
         // An untouched blank cell (Reset bg) stays black.
         assert_eq!(img.get_pixel(2, 0).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn console_startup_reply_reader_does_not_read_ahead_into_agent_input() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        let (rx, mut tx) = std::os::unix::net::UnixStream::pair().unwrap();
+        tx.write_all(b"{\"type\":\"dialog_reply\",\"id\":\"startup\",\"answer\":\"1\"}\nQueued agent prompt\n").unwrap();
+        tx.shutdown(std::net::Shutdown::Write).unwrap();
+        let answer = gui_reply_line_from(rx.as_raw_fd()).unwrap().unwrap();
+        assert_eq!(gui_answer("startup", &answer).as_deref(), Some("1"));
+        let mut eof = false;
+        assert_eq!(
+            read_batched_from(rx.as_raw_fd(), &mut eof, 50)
+                .unwrap()
+                .as_deref(),
+            Some("Queued agent prompt\n")
+        );
+        assert!(eof);
+        let (bad, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(&[0xff, b'\n']).unwrap();
+        assert!(gui_reply_line_from(bad.as_raw_fd()).is_err());
+    }
+
+    #[test]
+    fn console_confirmations_require_explicit_consent_and_preserve_queued_prompts() {
+        let input = crate::console_input::ConsoleInput::default();
+        let request = console_confirmation("Trust this publisher?");
+        assert_eq!(request.options[0].label, "Yes");
+        assert_eq!(request.options[1].label, "No");
+        let mut read = false;
+        let answer = input
+            .question("confirm", &request, false, |eof| {
+                if read {
+                    *eof = true;
+                    Ok(None)
+                } else {
+                    read = true;
+                    Ok(Some(b"yes\nA model prompt\n".to_vec()))
+                }
+            })
+            .unwrap();
+        assert_eq!(answer, crate::tools::ask::AskOutcome::Declined);
+        assert_eq!(
+            input
+                .prompt(|_| panic!("queued input must survive unconfirmed trust"))
+                .unwrap()
+                .as_deref(),
+            Some("yes\nA model prompt\n")
+        );
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let input = crate::console_input::ConsoleInput::default();
+        input.attach(Some(Arc::clone(&remote)));
+        let answer = input
+            .question(
+                "overwrite",
+                &console_confirmation("Overwrite saved session?"),
+                false,
+                |_| {
+                    assert!(remote.shared.questions.answer("overwrite", "1"));
+                    Ok(None)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            answer,
+            crate::tools::ask::AskOutcome::Answered(vec!["Yes".into()])
+        );
+        assert!(!remote.shared.questions.answer("overwrite", "1"));
+    }
+
+    #[test]
+    fn console_dialog_pipe_preserves_prompts_and_exact_unicode_document_text() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        let (rx, mut tx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let text = "café 🦀\n日本語\n";
+        let mut bytes = b"Queued user prompt\n".to_vec();
+        bytes.extend(
+            serde_json::to_vec(&serde_json::json!({"type":"dialog_reply","id":"e1","text":text}))
+                .unwrap(),
+        );
+        bytes.push(b'\n');
+        tx.write_all(&bytes).unwrap();
+        tx.shutdown(std::net::Shutdown::Write).unwrap();
+        let input = crate::console_input::ConsoleInput::default();
+        let edited = input
+            .edit("e1", "Document", "initial", false, |eof| {
+                read_batched_bytes_from(
+                    rx.as_raw_fd(),
+                    eof,
+                    50,
+                    Some(crate::console_input::BATCH_BYTES),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(edited.as_deref(), Some(text));
+        assert!(input.eof());
+        assert_eq!(
+            input
+                .prompt(|_| panic!("queued prompts must survive dialog EOF"))
+                .unwrap()
+                .as_deref(),
+            Some("Queued user prompt\n")
+        );
+        assert!(!input.has_pending());
     }
 
     /// Regression: `read_quiet_batched` used to read through `std::io::stdin()`,

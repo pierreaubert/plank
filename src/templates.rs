@@ -208,13 +208,19 @@ pub fn load_default(cwd: &Path) -> Vec<Template> {
 
 /// Splits an argument string into whitespace-separated words, honouring
 /// double quotes so `title="two words"` and `"two words"` stay one word.
+/// Inside quotes, `\"` and `\\` preserve literal quotes and backslashes.
 fn split_words(arg: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
     let mut started = false;
-    for c in arg.chars() {
+    let mut chars = arg.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            '\\' if quoted && chars.peek().is_some_and(|next| matches!(next, '"' | '\\')) => {
+                cur.push(chars.next().expect("escaped character was peeked"));
+                started = true;
+            }
             '"' => {
                 quoted = !quoted;
                 started = true;
@@ -397,6 +403,20 @@ pub fn render_list(templates: &[Template]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn template_forms_preserve_quoted_values_backslashes_and_explicit_empty_values() {
+        let template = tpl("review", "{{path}}|{{text}}|{{blank}}");
+        let rendered = render(
+            &template,
+            r#"path="C:\\repo\\file.rs" text="say \"hello\"" blank="""#,
+        )
+        .unwrap();
+        assert_eq!(rendered, "C:\\repo\\file.rs|say \"hello\"|");
+        assert_eq!(
+            render(&tpl("path", "{{path}}"), r"path=C:\repo\file.rs").unwrap(),
+            r"C:\repo\file.rs"
+        );
+    }
     use super::*;
 
     fn write_template(root: &Path, file: &str, content: &str) {

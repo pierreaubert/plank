@@ -1982,10 +1982,7 @@ pub fn segment_text(state: &State) -> String {
         Phase::Rehashing => format!("⇩ model {pos} resuming"),
         Phase::Verifying => format!("⇩ model {pos} verifying"),
         Phase::Downloading => {
-            let pct = (100 * state.done_bytes)
-                .checked_div(state.total_bytes)
-                .unwrap_or(0)
-                .min(100);
+            let pct = percent_done(state.done_bytes, state.total_bytes);
             if state.rate_bps == 0 {
                 format!("⇩ model {pos} {pct}%")
             } else {
@@ -2003,6 +2000,13 @@ fn in_flight(phase: Phase) -> bool {
     )
 }
 
+fn percent_done(done: u64, total: u64) -> u128 {
+    (u128::from(done) * 100)
+        .checked_div(u128::from(total))
+        .unwrap_or(0)
+        .min(100)
+}
+
 /// Multi-line answer to `/model`, for both UI paths, reading state under `root`.
 #[must_use]
 pub fn status_report_in(root: &Path) -> String {
@@ -2011,12 +2015,7 @@ pub fn status_report_in(root: &Path) -> String {
     let Some(state) = live_state_in(root) else {
         return "No model download is running.".to_string();
     };
-    let pct = state
-        .done_bytes
-        .saturating_mul(100)
-        .checked_div(state.total_bytes)
-        .unwrap_or(0)
-        .min(100);
+    let pct = percent_done(state.done_bytes, state.total_bytes);
     let mut out = format!("Model download, manifest version {}:\n", state.version);
     match state.phase {
         Phase::Staged => {
@@ -2209,8 +2208,24 @@ pub fn spawn_watcher() {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
         std::thread::spawn(|| {
+            let mut last_gui_poll: Option<Instant> = None;
+            let mut last_gui_snapshot = None;
             loop {
                 crate::status::set_download_segment(live_state().as_ref().map(segment_text));
+                if crate::ui::gui_protocol_enabled()
+                    && last_gui_poll
+                        .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1))
+                {
+                    let snapshot = crate::remote::control::DownloadsWire::capture();
+                    if last_gui_snapshot.as_ref() != Some(&snapshot) {
+                        eprintln!(
+                            "+PLANK_TELEMETRY {}",
+                            serde_json::json!({"type":"downloads", "snapshot":snapshot})
+                        );
+                        last_gui_snapshot = Some(snapshot);
+                    }
+                    last_gui_poll = Some(Instant::now());
+                }
                 std::thread::sleep(PUBLISH_EVERY);
             }
         });

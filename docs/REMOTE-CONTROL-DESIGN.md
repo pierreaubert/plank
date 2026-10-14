@@ -338,7 +338,7 @@ or one remote session.
   a `prompt` carrying a slash line) is checked against
   `config::slash_command_remote_refusal` before it reaches the queue, and a
   refusal comes back as `control_denied` with the reason. Two families qualify:
-  commands that would take over the *local* terminal (`/open`, and the bare
+  commands that would take over the *local* terminal (the bare
   interactive forms of `/kvcache` and `/resume` — the same commands with an
   argument are non-interactive and stay allowed), and commands that would saw off
   the branch the client sits on (`/rc`, `/remote-control`, `/quit`, `/exit`, plus
@@ -346,6 +346,15 @@ or one remote session.
 - A non-controller's `prompt`/`interrupt`/`command` frames get `control_denied`.
   `btw` is allowed from mirrors (it is ephemeral and read-only by construction —
   see BTW-DESIGN §4.2), giving read-only observers a safe way to ask questions.
+- **Document editing uses explicit controller replies.** Remote `/open` text
+  files, `/memory`, and `/edit-profile` publish an `editor` frame with
+  `request: {id, title, text}`. The client returns an `edit` frame containing
+  `document_id` and an explicit string `text` to save, or `text: null` to cancel.
+  Missing content, outdated identities, oversized text, and non-controller
+  replies are rejected with `edit_rejected`; they never enter the prompt queue.
+  `editor_done` closes the form on submission or host cancellation. Sources are
+  checked for changes before writing. Documents are limited to 256 KiB. Remote
+  HTML previews and profile restarts are not yet bridged.
 
 Rationale for single-controller over full multiplex: plank has **one** engine
 session and one transcript; concurrent prompt submission would interleave turns

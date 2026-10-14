@@ -42,7 +42,7 @@ See [Sessions](06-sessions.md).
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
 | `/toks` | two braille line charts side by side, generation speed and prefill speed, one sample per second of decoding. Works mid-turn and redraws as the model types |
-| `/jobs` | the background bash job table: id, pid, elapsed, state and output file. A live panel in the TUI, also mid-turn; clicking `⧗ N jobs` in the status bar toggles it |
+| `/jobs [output\|stop <id>]` | the background bash job table: id, pid, elapsed, state and output file. Bare `/jobs` opens a live TUI panel, also mid-turn; clicking `⧗ N jobs` toggles it. `output ID` reports the final 32 KiB; `stop ID` terminates the job's process group and reports its output. These actions run while idle and preserve the model's pending completion notification. |
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/memory` | open user and project memory as one buffer in the built-in editor; edits are split back to the right file on save |
@@ -87,7 +87,7 @@ See [Extending plank](09-extending.md).
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/mtp [on\|off]` | turn speculative decoding (multi-token prediction) on or off for this session; bare `/mtp` reports the state |
 | `/temp [0..100]` | set the sampling temperature; refused while `/mtp` is on, which pins it at 0 |
-| `/engines` | open the engine menu, download the one you pick if it is missing, and restart into it, resuming this session when the new engine's family has its transcript |
+| `/engines [--page N]` | bare, open the engine menu, download the one you pick if missing, and restart into it, resuming this session when the new engine's family has its transcript. `--page N` reads the host's catalog and availability in 32-row pages without switching; remote clients may use this report, while remote engine restart remains unavailable. |
 | `/steer [name] [-100..100]` | alone, list the steering directions stored for this model in `~/.plank/models/vectors.json`, the loaded one starred; with a scale, retarget the loaded direction (a name is required when the model has more than one); with another direction's name, restart into it and resume this session. See [Steering](08-configuration.md#steering) |
 | `/loopguard [on\|off]`, `/lg` | arm or silence the loop guards. Works mid-turn |
 | `/mc [on\|off]` | turn micro-compaction on or off for this session; bare `/mc` reports the state. Works mid-turn |
