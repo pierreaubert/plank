@@ -149,8 +149,10 @@ pub const SIDECHAIN_DUMPS_KEPT: usize = 8;
 /// One finished sub-agent sidechain, kept for the `/repro` sidecar. Images are
 /// stripped from the messages: the embeddings are large and cannot be shown in
 /// a text dump anyway.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SidechainDump {
+    /// Stable run identity within this agent's retained history.
+    pub history_id: u64,
     /// Roster label: the agent name, or `sub-agent`.
     pub label: String,
     /// The plain delegated task (not the framed envelope).
@@ -161,15 +163,75 @@ pub struct SidechainDump {
     /// sidecar can be lined up against the main dump.
     pub fork_at: usize,
     /// The sidechain's messages, framed task first, in order.
+    #[serde(with = "archive_messages")]
     pub messages: Vec<crate::session::Message>,
     /// The ordinal of the console window this sidechain streamed to (its name
     /// is `label`, or `subagent-<ordinal>` when the label was empty), so a
     /// console attaching later can reopen the same window.
+    #[serde(skip)]
     pub ordinal: usize,
     /// Whether that window was connected when the sidechain ended. A dump
     /// that was never mirrored is what a late console gets backfilled with;
     /// set once the backfill has been written so it is sent only once.
+    #[serde(skip)]
     pub mirrored: bool,
+}
+
+mod archive_messages {
+    use crate::session::{Message, Role};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Borrowed<'a> {
+        role: &'static str,
+        text: &'a str,
+        at: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum StoredRole {
+        User,
+        Assistant,
+    }
+
+    #[derive(Deserialize)]
+    struct Owned {
+        role: StoredRole,
+        text: String,
+        at: u64,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        messages: &[Message],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(messages.iter().map(|message| Borrowed {
+            role: match message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            },
+            text: &message.text,
+            at: message.at,
+        }))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Message>, D::Error> {
+        Ok(Vec::<Owned>::deserialize(deserializer)?
+            .into_iter()
+            .map(|message| Message {
+                role: match message.role {
+                    StoredRole::User => Role::User,
+                    StoredRole::Assistant => Role::Assistant,
+                },
+                text: message.text,
+                at: message.at,
+                images: Vec::new(),
+            })
+            .collect())
+    }
 }
 
 impl SidechainDump {
@@ -184,6 +246,7 @@ impl SidechainDump {
         mirrored: bool,
     ) -> Self {
         Self {
+            history_id: 0,
             label: label.to_owned(),
             task: task.to_owned(),
             outcome: "ended".to_owned(),

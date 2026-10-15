@@ -2,8 +2,8 @@
 //! dimmed with their reason. Runs before any engine is created, on its own
 //! alternate screen like the download screen.
 //!
-//! Everything but [`run`] is pure, so the trigger, the keys and the cursor are
-//! tested without a terminal.
+//! Trigger, keys, cursor and structured choice navigation are tested without
+//! a terminal or loaded model.
 
 use std::time::Duration;
 
@@ -107,8 +107,40 @@ pub fn run(rows: &[EngineRow], current: Option<&str>) -> Result<Option<String>, 
     result
 }
 
+/// Shows engine choices locally and through an optionally restored remote listener.
+///
+/// Remote startup uses the existing compact question bridge before an agent
+/// exists. Terminal users can answer the same paged question locally. Without
+/// a listener, the ordinary terminal or GUI chooser remains unchanged.
+///
+/// # Errors
+/// Returns terminal errors from the ordinary chooser.
+pub fn run_with_remote(
+    rows: &[EngineRow],
+    current: Option<&str>,
+    remote: Option<&crate::remote::control::RemoteState>,
+) -> Result<Option<String>, String> {
+    let Some(remote) = remote else {
+        return run(rows, current);
+    };
+    Ok(run_structured(rows, current, |question, options| {
+        crate::ui::startup_question(remote, question, "Engine", options)
+            .map(|index| (index + 1).to_string())
+    }))
+}
+
 /// Uses the GUI's existing compact answer controls without initializing a terminal.
 fn run_gui(rows: &[EngineRow], current: Option<&str>) -> Option<String> {
+    run_structured(rows, current, |question, options| {
+        crate::ui::gui_question(question, "Engine", options, false)
+    })
+}
+
+fn run_structured(
+    rows: &[EngineRow],
+    current: Option<&str>,
+    mut ask: impl FnMut(&str, &[serde_json::Value]) -> Option<String>,
+) -> Option<String> {
     // Two slots remain for page navigation below the GUI's 32-choice limit.
     const PAGE_SIZE: usize = 28;
     let choices = gui_choices(rows, current);
@@ -144,7 +176,7 @@ fn run_gui(rows: &[EngineRow], current: Option<&str>) -> Option<String> {
             choices.len().div_ceil(PAGE_SIZE),
             unavailable
         );
-        let answer = crate::ui::gui_question(&question, "Engine", &options, false)?;
+        let answer = ask(&question, &options)?;
         let index = answer.parse::<usize>().ok()?;
         if Some(index) == next {
             page += 1;
@@ -250,6 +282,40 @@ fn draw(frame: &mut Frame, rows: &[EngineRow], state: &mut ListState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_engine_questions_navigate_pages_and_reject_invalid_choices() {
+        let rows: Vec<_> = (0..60)
+            .map(|index| EngineRow {
+                name: format!("engine-{index}"),
+                notes: "fixture".into(),
+                fit: Fit::Installed,
+            })
+            .collect();
+        let mut calls = 0;
+        let selected = run_structured(&rows, Some("engine-29"), |_, options| {
+            calls += 1;
+            assert!(options.len() <= 30);
+            match calls {
+                1 | 3 => Some("29".into()), // next from page one
+                2 => Some("30".into()),     // previous from page two
+                4 => {
+                    assert!(options[1]["label"].as_str().unwrap().contains("current"));
+                    Some("2".into())
+                }
+                _ => panic!("unexpected extra question"),
+            }
+        });
+        assert_eq!(selected.as_deref(), Some("engine-29"));
+        assert_eq!(calls, 4);
+        for invalid in ["0", "31", "1,2", "engine-29", ""] {
+            assert_eq!(
+                run_structured(&rows, None, |_, _| Some(invalid.into())),
+                None
+            );
+        }
+        assert_eq!(run_structured(&rows, None, |_, _| None), None);
+    }
+
     #[test]
     fn gui_engine_choices_exclude_disabled_rows_and_describe_current_state() {
         let choices = super::gui_choices(&rows(), Some("d"));

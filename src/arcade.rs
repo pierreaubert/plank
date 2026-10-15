@@ -1134,6 +1134,11 @@ impl Arcade {
         self.open.is_some()
     }
 
+    /// Identifies the explicit game; idle screensavers have no command.
+    pub(crate) fn command(&self) -> Option<&'static str> {
+        (self.is_open() && !self.screensaver).then_some(Self::COMMANDS[self.open_slot])
+    }
+
     /// Whether `arg` asks for a fresh game rather than the parked one.
     ///
     /// Word-wise, not whole-string, because the arguments compose:

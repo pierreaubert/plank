@@ -57,7 +57,7 @@ pub fn fetch_interruptible(url: &str, interrupted: &dyn Fn() -> bool) -> Result<
         match BROWSER.try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(std::sync::TryLockError::Poisoned(_)) => panic!("obscura browser mutex poisoned"),
         }

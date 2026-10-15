@@ -266,16 +266,24 @@ pub fn run_frame_blocking(
     file: &str,
     bytes: &[u8],
 ) -> FrameResult {
-    let Some(bridge) = ctx.frame_bridge.clone() else {
-        return FrameResult::Refused("editors need the interactive TUI".to_string());
-    };
+    let bridge = ctx.frame_bridge.clone();
+    let remote_frame = ctx.remote_frame;
+    if bridge.is_none() && !crate::ui::gui_protocol_enabled() && !remote_frame {
+        return FrameResult::Refused(
+            "editors need a graphical client or the interactive TUI".to_string(),
+        );
+    }
     if let Some(reason) = ctx.editor_refusal.clone() {
         return FrameResult::Refused(reason);
     }
     if ctx.subagent_depth > 0 {
         return FrameResult::Refused("editors cannot open inside a sub-agent".to_string());
     }
-    if bridge.is_pending() || ctx.wasm.frame_is_open() {
+    if bridge
+        .as_ref()
+        .is_some_and(crate::framebridge::FrameBridge::is_pending)
+        || ctx.wasm.frame_is_open()
+    {
         return FrameResult::Refused("an editor is already open".to_string());
     }
     if let Err(reason) = ctx.wasm.check_editor(component) {
@@ -284,13 +292,21 @@ pub fn run_frame_blocking(
     if let Err(reason) = ctx.wasm.stage_editor_file(component, file, bytes) {
         return FrameResult::Refused(reason);
     }
-    let session = std::mem::take(&mut ctx.wasm);
-    let req = FrameRequest {
-        component: component.to_string(),
-        file: file.to_string(),
+    let close = if let Some(bridge) = bridge.filter(|_| !remote_frame) {
+        let session = std::mem::take(&mut ctx.wasm);
+        let req = FrameRequest {
+            component: component.to_string(),
+            file: file.to_string(),
+        };
+        let (session, close) = bridge.lend(session, req);
+        ctx.wasm = session;
+        close
+    } else {
+        match crate::ui::run_console_frame_session(&mut ctx.wasm, &ctx.console, component, file) {
+            Ok(()) => FrameClose::Closed,
+            Err(error) => FrameClose::Failed(error),
+        }
     };
-    let (session, close) = bridge.lend(session, req);
-    ctx.wasm = session;
     let collected = ctx.wasm.collect_editor_file(component, file, bytes);
     match close {
         FrameClose::Closed => collected,
@@ -445,7 +461,7 @@ mod tests {
         let mut c = editor_ctx();
         assert_eq!(
             run_frame_blocking(&mut c, ID, "data.csv", b"a\n"),
-            FrameResult::Refused("editors need the interactive TUI".into())
+            FrameResult::Refused("editors need a graphical client or the interactive TUI".into())
         );
     }
 

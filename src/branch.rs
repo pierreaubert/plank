@@ -309,13 +309,15 @@ impl BranchTree {
     /// Every leaf is a branch tip, plus the active node when it is not one —
     /// which is exactly the state right after a `/fork`, where the active
     /// branch is a prefix of the branch it forked away from.
+    /// An empty active branch after a root fork also counts while old nodes remain.
     #[must_use]
     pub fn branch_count(&self) -> usize {
         let leaves = self.leaves();
         let active_is_interior = self
             .active
             .is_some_and(|a| !self.nodes[a].children.is_empty());
-        leaves.len() + usize::from(active_is_interior)
+        leaves.len()
+            + usize::from(active_is_interior || (self.active.is_none() && !self.nodes.is_empty()))
     }
 
     /// Fork points on the active path: the real (non-tool-result) user
@@ -390,6 +392,9 @@ pub fn render_tree(tree: &BranchTree, color: bool) -> String {
         tree.branch_count(),
         if tree.branch_count() == 1 { "" } else { "es" }
     );
+    if active.is_empty() {
+        let _ = writeln!(out, "{mark_on}*{reset} {dim}[0 msgs]{reset} (empty branch)");
+    }
     for root in tree_roots(tree) {
         render_run(tree, root, 0, &active, color, &mut out);
     }
@@ -440,7 +445,9 @@ fn render_run(
     let mut run = vec![start];
     let mut cur = start;
     while let Some(node) = tree.node(cur) {
-        if node.children.len() != 1 {
+        // An active interior cursor is a branch endpoint even before the user
+        // sends a replacement prompt. Do not label its old tail as active.
+        if node.children.len() != 1 || active.last() == Some(&cur) {
             break;
         }
         cur = node.children[0];
@@ -744,6 +751,31 @@ mod tests {
              *  2. hand-roll it instead\n\
              Use /fork <n> to branch from a point, /clone to duplicate this branch.\n"
         );
+    }
+
+    #[test]
+    fn render_stops_at_a_rewound_cursor_before_a_new_branch_prompt() {
+        let mut tree = linear();
+        tree.fork_at(2).unwrap();
+        let rendered = render_tree(&tree, false);
+        assert!(rendered.contains("* [2 msgs] one\n"), "{rendered}");
+        assert!(rendered.contains("    [2 msgs] two\n"), "{rendered}");
+        assert!(!rendered.contains("* [4 msgs] two"), "{rendered}");
+        let (messages, off) = tree.into_parts();
+        assert_eq!(
+            render_tree(&BranchTree::from_parts(&messages, &off), false),
+            rendered
+        );
+    }
+
+    #[test]
+    fn render_shows_an_empty_active_branch_after_forking_at_the_root() {
+        let mut tree = linear();
+        tree.fork_at(0).unwrap();
+        assert_eq!(tree.branch_count(), 2);
+        let rendered = render_tree(&tree, false);
+        assert!(rendered.contains("* [0 msgs] (empty branch)"), "{rendered}");
+        assert!(rendered.contains("  [4 msgs] two"), "{rendered}");
     }
 
     #[test]

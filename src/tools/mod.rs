@@ -204,6 +204,8 @@ pub struct ToolContext {
     /// Set by the agent before each dispatch when an editor must not open for
     /// a reason only the agent knows (a sidechain, a remote-driven turn).
     pub editor_refusal: Option<String>,
+    /// Selects remote inline frame driving only for a remote-owned turn.
+    pub(crate) remote_frame: bool,
     /// Live browser session for the web tools, created lazily on first web use
     /// and reused across turns (like the C agent keeping Chrome alive). Only on
     /// `ds4_engine` builds; the curl path needs no handle.
@@ -403,6 +405,7 @@ impl ToolContext {
             ask_bridge: None,
             frame_bridge: None,
             editor_refusal: None,
+            remote_frame: false,
             #[cfg(ds4_engine)]
             web_browser: None,
             wrote_memory: false,
@@ -2299,7 +2302,10 @@ mod tests {
         ctx.grid_routes
             .insert("chatbgt".into(), "dev.plank.csvedit".into());
         let out = grid_observation(&mut ctx, "(no output)\n".into(), vec![staging()]);
-        assert_eq!(out, "grid not opened: editors need the interactive TUI\n");
+        assert_eq!(
+            out,
+            "grid not opened: editors need a graphical client or the interactive TUI\n"
+        );
     }
 
     /// A route to a component that is not loaded is refused by the editor

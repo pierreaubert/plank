@@ -23,6 +23,8 @@ pub enum Purpose {
     Conversation,
     /// The complete standalone Insights report.
     Insights,
+    /// An HTML file requested with `/open` on the client.
+    Preview,
 }
 
 /// One event in a complete export transfer.
@@ -93,7 +95,7 @@ impl Transfer {
                         .chars()
                         .any(|c| c.is_control() || matches!(c, '/' | '\\'))
                     && matches!(format.as_str(), "md" | "html")
-                    && (*purpose != Purpose::Insights || format == "html")
+                    && (*purpose == Purpose::Conversation || format == "html")
                     && sha256.len() == 64
                     && sha256
                         .bytes()

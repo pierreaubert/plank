@@ -4,10 +4,11 @@
 //! `/buddy on|off|install`: an animated buddy standing on the rule above the
 //! prompt while plank is idle.
 //!
-//! It does nothing, which is the point. Only terminals that speak the kitty
-//! graphics protocol can show it: kitty and Ghostty, which also implement its
-//! Unicode placeholders, and Warp, which does not ([`Mode`]). Everywhere else
-//! the command says so and leaves the screen alone.
+//! It does nothing, which is the point. Graphical consoles consume the original
+//! PNG frames directly. Terminals need the kitty graphics protocol: kitty and
+//! Ghostty implement its Unicode placeholders, while Warp does not ([`Mode`]).
+//! Connected graphical subscribers can also show it without host terminal
+//! graphics; remote-only playback leaves the terminal screen alone.
 //!
 //! A buddy is a folder of `.mp4` clips in the public
 //! [`REPO`](https://github.com/aovestdipaperino/plank-buddies) repository.
@@ -50,7 +51,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -122,8 +123,8 @@ const MARKER: &str = "\u{2800}";
 /// Whether the buddy is on (for this run only; nothing is saved).
 static SHOWN: AtomicBool = AtomicBool::new(false);
 
-/// Whether the running buddy is in [`Mode::Direct`] (meaningful while on).
-static DIRECT: AtomicBool = AtomicBool::new(false);
+/// Presentation selected when the buddy was enabled (meaningful while on).
+static PRESENTATION: AtomicU8 = AtomicU8::new(0);
 
 /// Set by a finished install; the next [`render`], on the UI thread, clears
 /// the old buddy off the screen and starts the new one.
@@ -145,7 +146,8 @@ pub fn shown() -> bool {
 /// tick rather than its idle rate.
 #[must_use]
 pub fn animating() -> bool {
-    shown()
+    mode() != Mode::Remote
+        && shown()
         && PLAYER
             .lock()
             .ok()
@@ -153,8 +155,9 @@ pub fn animating() -> bool {
             .unwrap_or(false)
 }
 
-/// How the terminal is told where the picture goes.
+/// Where and how the buddy is presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Mode {
     /// Unicode placeholder cells (kitty, Ghostty): the picture is part of the
     /// cell grid.
@@ -162,20 +165,30 @@ pub enum Mode {
     /// An image placed at the cursor (Warp), kept in step with the frame by
     /// [`after_draw`].
     Direct,
+    /// Graphical clients consume PNGs; the host terminal is untouched.
+    Remote,
 }
 
 fn mode() -> Mode {
-    if DIRECT.load(Ordering::Relaxed) {
-        Mode::Direct
-    } else {
-        Mode::Placeholders
+    match PRESENTATION.load(Ordering::Relaxed) {
+        1 => Mode::Direct,
+        2 => Mode::Remote,
+        _ => Mode::Placeholders,
     }
 }
 
-/// How this process's terminal can show the buddy, if at all; see
-/// [`supported_by`].
+fn playback_mode(terminal: Option<Mode>, graphical_viewer: bool) -> Option<Mode> {
+    terminal.or_else(|| graphical_viewer.then_some(Mode::Remote))
+}
+
+/// The local presentation, if available; graphical consoles need no terminal.
+/// See [`supported_by`] for terminal capability detection.
 #[must_use]
 pub fn supported() -> Option<Mode> {
+    if crate::ui::gui_protocol_enabled() {
+        // The graphical driver consumes PNGs directly; no kitty escapes are sent.
+        return Some(Mode::Remote);
+    }
     let var = |k| std::env::var(k).ok();
     supported_by(
         var("TERM").as_deref(),
@@ -216,7 +229,7 @@ pub fn supported_by(
 }
 
 const UNSUPPORTED: &str =
-    "/buddy needs a terminal with kitty graphics (kitty, Ghostty or Warp, outside tmux)";
+    "/buddy needs a graphical client or kitty graphics (kitty, Ghostty or Warp, outside tmux)";
 
 /// The escapes that hand `png` to the terminal as image `id` with a virtual
 /// placement of [`COLS`] x [`ROWS`] cells (`U=1`), split into chunks as the
@@ -255,6 +268,9 @@ pub fn delete_sequence(id: u32) -> String {
 
 fn write_to_terminal(seq: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+    if crate::ui::gui_protocol_enabled() || mode() == Mode::Remote {
+        return Ok(());
+    }
     let mut out = std::io::stdout().lock();
     out.write_all(seq.as_bytes())?;
     out.flush()
@@ -274,7 +290,13 @@ pub enum Outcome {
 }
 
 /// `/buddy [on|off|install [name]]`. Bare, it reports the state.
+#[must_use]
 pub fn command(arg: &str) -> Outcome {
+    command_for_viewer(arg, false)
+}
+
+pub(crate) fn command_for_viewer(arg: &str, graphical_viewer: bool) -> Outcome {
+    let presentation = playback_mode(supported(), graphical_viewer);
     let mut words = arg.split_whitespace();
     let verb = words.next().unwrap_or_default();
     let name = words.next();
@@ -293,7 +315,7 @@ pub fn command(arg: &str) -> Outcome {
             if shown() {
                 return Outcome::Say("buddy already on".to_owned());
             }
-            let Some(mode) = supported() else {
+            let Some(mode) = presentation else {
                 return Outcome::Say(UNSUPPORTED.to_owned());
             };
             match installed {
@@ -305,7 +327,7 @@ pub fn command(arg: &str) -> Outcome {
             Some(name) => format!("Which buddy should replace {name}?"),
             None => "Which buddy?".to_owned(),
         }),
-        ("install", Some(name)) => Outcome::Say(chosen(name)),
+        ("install", Some(name)) => Outcome::Say(chosen_for_viewer(name, graphical_viewer)),
         _ => Outcome::Say(format!(
             "/buddy: expected on|off|install [name], got `{arg}`"
         )),
@@ -339,7 +361,12 @@ fn pick(question: &str) -> Outcome {
 
 /// Installs the buddy `name` from the repository in the background, replacing
 /// the installed one, and turns the buddy on where the terminal can show it.
+#[must_use]
 pub fn chosen(name: &str) -> String {
+    chosen_for_viewer(name, false)
+}
+
+pub(crate) fn chosen_for_viewer(name: &str, graphical_viewer: bool) -> String {
     if !valid_name(name) {
         return format!("/buddy: `{name}` is not a buddy name");
     }
@@ -363,17 +390,19 @@ pub fn chosen(name: &str) -> String {
         }
     });
     let started = format!("downloading {name} from {REPO}; it appears once ready");
-    match supported() {
+    match playback_mode(supported(), graphical_viewer) {
         Some(mode) if !shown() => turn_on(mode, &started),
         Some(_) => started,
-        None => format!("{started}, in a terminal that can show it ({UNSUPPORTED})"),
+        None => format!(
+            "{started}; connect a graphical client or use a supported terminal ({UNSUPPORTED})"
+        ),
     }
 }
 
 /// Turns the buddy on in `mode`, returning `reply` with any note about the
 /// clips appended.
 fn turn_on(mode: Mode, reply: &str) -> String {
-    DIRECT.store(mode == Mode::Direct, Ordering::Relaxed);
+    PRESENTATION.store(mode as u8, Ordering::Relaxed);
     SHOWN.store(true, Ordering::Relaxed);
     format!("{reply}{}", start_player())
 }
@@ -905,6 +934,175 @@ impl Player {
     }
 }
 
+/// Latest-only PNG cursor, independent of terminal image placement.
+#[derive(Default)]
+pub(crate) struct Graphical {
+    player: std::sync::Weak<Mutex<Vec<Clip>>>,
+    last: Option<(usize, usize)>,
+    visible: bool,
+    revision: u64,
+}
+
+impl Graphical {
+    /// Captures the terminal PNG or advances a remote-only player.
+    pub(crate) fn capture(
+        &mut self,
+        buffer: &Buffer,
+        output: Rect,
+        unobscured: bool,
+    ) -> Option<GraphicalUpdate> {
+        if mode() == Mode::Remote {
+            let mut player = PLAYER.lock().ok()?;
+            return self.update(player.as_mut(), shown() && unobscured, Instant::now());
+        }
+        let Some(at) = placement(output) else {
+            return self.clear();
+        };
+        // Keep the same lock order as after_draw: release direct state before PLAYER.
+        let direct = DIRECT_STATE.lock().ok()?.placed;
+        let player = PLAYER.lock().ok()?;
+        let due = player
+            .as_ref()
+            .filter(|_| shown())
+            .and_then(|player| visible_terminal_frame(player, buffer, at, mode(), direct));
+        match (player.as_ref(), due) {
+            (Some(player), Some(due)) => self.load(player, due),
+            _ => self.clear(),
+        }
+    }
+
+    pub(crate) fn dismiss(&mut self) -> Option<GraphicalUpdate> {
+        self.clear()
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.visible
+    }
+
+    pub(crate) fn poll(&mut self) -> Option<GraphicalUpdate> {
+        self.poll_observed(false)
+    }
+
+    /// Advances playback for an attached graphical remote observer.
+    pub(crate) fn poll_remote(&mut self) -> Option<GraphicalUpdate> {
+        self.poll_observed(true)
+    }
+
+    fn poll_observed(&mut self, remote: bool) -> Option<GraphicalUpdate> {
+        if refresh_player() {
+            self.last = None;
+        }
+        let observing = remote
+            || std::env::var_os("PLANK_GUI_FOCUS_CONTROL").is_none_or(|path| {
+                crate::guifocus::read_focused(Path::new(&path), crate::guifocus::now_ms())
+            });
+        let mut player = PLAYER.lock().ok()?;
+        self.update(player.as_mut(), shown() && observing, Instant::now())
+    }
+
+    fn update(
+        &mut self,
+        player: Option<&mut Player>,
+        visible: bool,
+        now: Instant,
+    ) -> Option<GraphicalUpdate> {
+        let due = player.filter(|_| visible).and_then(|player| {
+            let due = player.due(now)?;
+            Some((player, due))
+        });
+        let Some((player, due)) = due else {
+            return self.clear();
+        };
+        self.load(player, due)
+    }
+
+    fn load(&mut self, player: &Player, due: (usize, usize)) -> Option<GraphicalUpdate> {
+        let identity = Arc::downgrade(&player.clips);
+        if !self.player.ptr_eq(&identity) {
+            self.last = None;
+            self.player = identity;
+        }
+        if self.last == Some(due) {
+            return None;
+        }
+        let Some(frame) = read_graphical_frame(player, due, self.revision.checked_add(1)?) else {
+            return self.clear();
+        };
+        self.revision = frame.revision;
+        self.last = Some(due);
+        self.visible = true;
+        Some(GraphicalUpdate::Frame(frame))
+    }
+
+    fn clear(&mut self) -> Option<GraphicalUpdate> {
+        self.last = None;
+        self.visible.then(|| {
+            self.visible = false;
+            GraphicalUpdate::Clear
+        })
+    }
+}
+
+fn visible_terminal_frame(
+    player: &Player,
+    buffer: &Buffer,
+    at: Rect,
+    presentation: Mode,
+    direct: Option<(Rect, (usize, usize), usize)>,
+) -> Option<(usize, usize)> {
+    if presentation == Mode::Remote {
+        return None;
+    }
+    if presentation == Mode::Direct {
+        return direct
+            .filter(|(placed, _, _)| *placed == at && markers_intact(buffer, at))
+            .map(|(_, due, _)| due);
+    }
+    let (due, slot) = player.on_screen?;
+    let [_, r, g, b] = CLIP_IDS[slot].to_be_bytes();
+    (0..at.height)
+        .all(|row| {
+            (0..at.width).all(|column| {
+                buffer
+                    .cell((at.x + column, at.y + row))
+                    .is_some_and(|cell| {
+                        cell.symbol() == cell_symbol(row, column) && cell.fg == Color::Rgb(r, g, b)
+                    })
+            })
+        })
+        .then_some(due)
+}
+
+fn read_graphical_frame(
+    player: &Player,
+    due: (usize, usize),
+    revision: u64,
+) -> Option<crate::buddyframe::Frame> {
+    use std::io::Read as _;
+    let path = player
+        .clips
+        .lock()
+        .ok()?
+        .get(due.0)?
+        .frames
+        .get(due.1)?
+        .clone();
+    let mut png = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(crate::buddyframe::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut png)
+        .ok()?;
+    let frame = crate::buddyframe::Frame { revision, png };
+    frame.is_valid().then_some(frame)
+}
+
+#[derive(Debug)]
+pub(crate) enum GraphicalUpdate {
+    Frame(crate::buddyframe::Frame),
+    Clear,
+}
+
 /// [`Mode::Direct`] bookkeeping between a draw and its [`after_draw`].
 struct DirectState {
     /// Where and which `(clip, frame)` this frame's [`render`] asked for,
@@ -1045,6 +1243,11 @@ fn cell_symbol(row: u16, col: u16) -> String {
 /// the frame is transmitted from inside the draw, before ratatui writes the
 /// frame, on the same thread, so the two never interleave.
 pub fn render(buf: &mut Buffer, output: Rect) {
+    refresh_player();
+    render_current(buf, output);
+}
+
+fn refresh_player() -> bool {
     if RELOAD.swap(false, Ordering::Relaxed) {
         // A new buddy was installed: the old one's images go, and so does its
         // player, whose clip indices mean nothing now.
@@ -1055,6 +1258,14 @@ pub fn render(buf: &mut Buffer, output: Rect) {
         if shown() {
             start_player();
         }
+        return true;
+    }
+    false
+}
+
+fn render_current(buf: &mut Buffer, output: Rect) {
+    if mode() == Mode::Remote {
+        return;
     }
     let Some(at) = placement(output).filter(|_| shown()) else {
         return;
@@ -1107,6 +1318,338 @@ fn paint(buf: &mut Buffer, at: Rect, id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_buddy_tracks_terminal_placement_and_rejects_overlaid_or_busy_buffers() {
+        let at = Rect::new(2, 2, COLS, ROWS);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 20));
+        let mut player = Player::new(1);
+        player.on_screen = Some(((0, 7), 0));
+        paint(&mut buffer, at, CLIP_IDS[0]);
+        assert_eq!(
+            visible_terminal_frame(&player, &buffer, at, Mode::Placeholders, None),
+            Some((0, 7))
+        );
+        buffer.cell_mut((at.x, at.y)).unwrap().set_symbol("menu");
+        assert_eq!(
+            visible_terminal_frame(&player, &buffer, at, Mode::Placeholders, None),
+            None
+        );
+        for y in at.top()..at.bottom() {
+            for x in at.left()..at.right() {
+                buffer.cell_mut((x, y)).unwrap().set_symbol(MARKER);
+            }
+        }
+        let direct = Some((at, (1, 2), 0));
+        assert_eq!(
+            visible_terminal_frame(&player, &buffer, at, Mode::Direct, direct),
+            Some((1, 2))
+        );
+        buffer.cell_mut((at.x, at.y)).unwrap().set_symbol("prompt");
+        assert_eq!(
+            visible_terminal_frame(&player, &buffer, at, Mode::Direct, direct),
+            None
+        );
+        let blank = Buffer::empty(buffer.area);
+        assert_eq!(
+            visible_terminal_frame(&player, &blank, at, Mode::Direct, direct),
+            None
+        );
+        assert_eq!(
+            visible_terminal_frame(&player, &blank, at, Mode::Placeholders, None),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_buddy_new_player_republishes_even_when_clip_indices_match() {
+        let path = std::env::temp_dir().join(format!(
+            "plank-buddy-reload-{}.png",
+            crate::remote::control::replay_instance_id().unwrap()
+        ));
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let make = || {
+            let player = Player::new(1);
+            player.clips.lock().unwrap().push(Clip {
+                kind: Kind::Letter,
+                frames: vec![path.clone()],
+            });
+            player
+        };
+        let mut cursor = Graphical::default();
+        let Some(GraphicalUpdate::Frame(first)) = cursor.load(&make(), (0, 0)) else {
+            panic!("first image")
+        };
+        assert!(
+            matches!(cursor.load(&make(), (0, 0)), Some(GraphicalUpdate::Frame(next)) if next.revision > first.revision)
+        );
+        assert!(matches!(cursor.dismiss(), Some(GraphicalUpdate::Clear)));
+        assert!(cursor.dismiss().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn graphical_buddy_uses_original_frames_and_coalesces_ticks_and_hiding() {
+        let path = std::env::temp_dir().join(format!(
+            "plank-buddy-frame-{}.png",
+            crate::remote::control::replay_instance_id().unwrap()
+        ));
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 40, 80, 128]))
+            .save(&path)
+            .unwrap();
+        let expected = std::fs::read(&path).unwrap();
+        let mut player = Player::new(1);
+        player.clips.lock().unwrap().push(Clip {
+            kind: Kind::Letter,
+            frames: vec![path.clone(), path.clone()],
+        });
+        player.decoded.store(true, Ordering::Relaxed);
+        let mut cursor = Graphical::default();
+        let now = Instant::now();
+        let Some(GraphicalUpdate::Frame(first)) = cursor.update(Some(&mut player), true, now)
+        else {
+            panic!("first PNG")
+        };
+        assert_eq!(first.png, expected);
+        assert!(first.is_valid());
+        assert!(cursor.update(Some(&mut player), true, now).is_none());
+        let Some(GraphicalUpdate::Frame(next)) =
+            cursor.update(Some(&mut player), true, now + Duration::from_millis(84))
+        else {
+            panic!("next PNG")
+        };
+        assert!(next.revision > first.revision);
+        assert_eq!(next.png, first.png);
+        assert!(matches!(
+            cursor.update(Some(&mut player), false, now),
+            Some(GraphicalUpdate::Clear)
+        ));
+        assert!(cursor.update(Some(&mut player), false, now).is_none());
+        assert!(matches!(
+            cursor.update(Some(&mut player), true, now + Duration::from_millis(168)),
+            Some(GraphicalUpdate::Frame(_))
+        ));
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(
+            cursor.update(Some(&mut player), true, now + Duration::from_millis(252)),
+            Some(GraphicalUpdate::Clear)
+        ));
+        assert!(
+            cursor
+                .update(Some(&mut player), true, now + Duration::from_millis(336))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn graphical_buddy_commands_work_without_terminal_graphics_or_model_input() {
+        let root = std::env::temp_dir().join(format!(
+            "plank-buddy-gui-{}",
+            crate::remote::control::replay_instance_id().unwrap()
+        ));
+        std::fs::create_dir_all(root.join(".plank/buddy")).unwrap();
+        for observing in [true, false] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "buddy::tests::graphical_buddy_command_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HOME", &root)
+                .env("PLANK_GUI_PROTOCOL", "1")
+                .env_remove("PLANK_GUI_FOCUS_CONTROL");
+            if !observing {
+                child.env("PLANK_GUI_FOCUS_CONTROL", root.join("missing-focus.json"));
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !output.stdout.contains(&27),
+                "graphical stdout contains no terminal graphics escapes"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "isolated GUI buddy fixture, invoked by its parent test"]
+    fn graphical_buddy_command_fixture() {
+        fixture_player();
+        assert!(matches!(command("on"), Outcome::Say(line) if line.contains("reporting for duty")));
+        let mut cursor = Graphical::default();
+        let observing = std::env::var_os("PLANK_GUI_FOCUS_CONTROL").is_none();
+        assert_eq!(
+            matches!(cursor.poll(), Some(GraphicalUpdate::Frame(_))),
+            observing
+        );
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        remote.poll_console_buddy();
+        assert!(remote.test_buddy_snapshot().is_none());
+        let viewer = remote.test_buddy_viewer();
+        remote.poll_console_buddy();
+        assert!(
+            remote
+                .test_buddy_snapshot()
+                .is_some_and(|frame| frame.is_valid())
+        );
+        assert!(remote.buddy_animating());
+        remote.dismiss_buddy();
+        assert!(remote.test_buddy_snapshot().is_none());
+        remote.poll_console_buddy();
+        assert!(
+            remote.test_buddy_snapshot().is_some(),
+            "static frames must return after a busy turn"
+        );
+        drop(viewer);
+        remote.poll_console_buddy();
+        assert!(remote.test_buddy_snapshot().is_none());
+        assert!(!remote.buddy_animating());
+        let _viewer = remote.test_buddy_viewer();
+        remote.poll_console_buddy();
+        assert!(remote.test_buddy_snapshot().is_some());
+        assert!(
+            matches!(command(""), Outcome::Say(line) if line.contains("buddy on") && line.contains("fixture installed"))
+        );
+        assert!(matches!(command("off"), Outcome::Say(line) if line == "buddy dismissed"));
+        assert_eq!(
+            matches!(cursor.poll(), Some(GraphicalUpdate::Clear)),
+            observing
+        );
+        remote.poll_console_buddy();
+        assert!(remote.test_buddy_snapshot().is_none());
+        assert!(
+            matches!(command("invalid"), Outcome::Say(line) if line.contains("expected on|off|install"))
+        );
+    }
+
+    fn fixture_player() {
+        let home = crate::home::plank_home();
+        std::fs::write(home.join("buddy/.name"), "fixture").unwrap();
+        std::fs::write(home.join("buddy/clip1.mp4"), []).unwrap();
+        let path = home.join("buddy/frame.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let player = Player::new(1);
+        player.clips.lock().unwrap().push(Clip {
+            kind: Kind::Letter,
+            frames: vec![path],
+        });
+        player.decoded.store(true, Ordering::Relaxed);
+        *PLAYER.lock().unwrap() = Some(player);
+    }
+
+    #[test]
+    fn remote_buddy_presentation_preserves_terminal_modes_and_requires_a_viewer_for_fallback() {
+        assert_eq!(playback_mode(None, false), None);
+        assert_eq!(playback_mode(None, true), Some(Mode::Remote));
+        for mode in [Mode::Placeholders, Mode::Direct] {
+            assert_eq!(playback_mode(Some(mode), false), Some(mode));
+            assert_eq!(playback_mode(Some(mode), true), Some(mode));
+        }
+    }
+
+    #[test]
+    fn remote_buddy_without_terminal_graphics_streams_only_to_active_viewers() {
+        let root = std::env::temp_dir().join(format!(
+            "plank-buddy-remote-{}",
+            crate::remote::control::replay_instance_id().unwrap()
+        ));
+        std::fs::create_dir_all(root.join(".plank/buddy")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "buddy::tests::remote_buddy_graphics_free_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HOME", &root)
+            .env("PLANK_GUI_PROTOCOL", "0")
+            .env("TERM", "dumb")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("KITTY_WINDOW_ID")
+            .env("TMUX", "fixture")
+            .env("PLANK_REMOTE_BUDDY_FIXTURE", "1")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.contains(&27),
+            "remote-only playback writes no terminal graphics escapes"
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated graphics-free remote buddy fixture, invoked by its parent test"]
+    fn remote_buddy_graphics_free_fixture() {
+        assert_eq!(
+            std::env::var("PLANK_REMOTE_BUDDY_FIXTURE").as_deref(),
+            Ok("1")
+        );
+        fixture_player();
+        assert_eq!(supported(), None);
+        assert!(matches!(command("on"), Outcome::Say(line) if line == UNSUPPORTED));
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let viewer = remote.test_buddy_viewer();
+        assert!(
+            matches!(command_for_viewer("on", remote.has_buddy_viewers()), Outcome::Say(line) if line.contains("reporting for duty"))
+        );
+        assert_eq!(mode(), Mode::Remote);
+        assert!(
+            !animating(),
+            "the host terminal must not request animation ticks"
+        );
+        let output = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(output);
+        let before = buffer.clone();
+        render(&mut buffer, output);
+        after_draw(&buffer);
+        assert_eq!(
+            buffer, before,
+            "remote-only playback does not paint terminal cells"
+        );
+        remote.capture_buddy(&buffer, output, true);
+        assert!(
+            remote
+                .test_buddy_snapshot()
+                .is_some_and(|frame| frame.is_valid())
+        );
+        assert!(remote.buddy_animating());
+        remote.capture_buddy(&buffer, output, false);
+        assert!(remote.test_buddy_snapshot().is_none());
+        assert!(!remote.buddy_animating());
+        remote.capture_buddy(&buffer, output, true);
+        assert!(remote.test_buddy_snapshot().is_some());
+        drop(viewer);
+        remote.capture_buddy(&buffer, output, true);
+        assert!(remote.test_buddy_snapshot().is_none());
+        assert!(!remote.buddy_animating());
+        let _viewer = remote.test_buddy_viewer();
+        remote.capture_buddy(&buffer, output, true);
+        assert!(remote.test_buddy_snapshot().is_some());
+        remote.dismiss_buddy();
+        assert!(remote.test_buddy_snapshot().is_none());
+        assert!(
+            matches!(command_for_viewer("off", true), Outcome::Say(line) if line == "buddy dismissed")
+        );
+        remote.capture_buddy(&buffer, output, true);
+        assert!(remote.test_buddy_snapshot().is_none());
+    }
 
     #[test]
     fn kitty_ghostty_and_warp_outside_tmux_are_supported() {

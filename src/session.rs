@@ -375,6 +375,9 @@ pub struct Session {
     /// tree (issue #65). Every existing caller keeps treating this as the
     /// whole conversation.
     pub transcript: Vec<Message>,
+    /// Completed delegated conversations, saved independently of model-visible turns.
+    /// Copy-on-write storage keeps generation/fork snapshots cheap.
+    pub sidechains: std::sync::Arc<std::collections::VecDeque<crate::repro::SidechainDump>>,
     /// Off-path nodes of the session tree — the branches `/fork` and `/clone`
     /// left behind ([`crate::branch`]). Empty for a linear session, in which
     /// case nothing extra is written and the file stays byte-identical to one
@@ -496,6 +499,7 @@ impl Session {
             tag: String::new(),
             cwd: String::new(),
             transcript: Vec::new(),
+            sidechains: std::sync::Arc::default(),
             branches: Vec::new(),
             tasks: crate::tasks::TaskList::new(),
             goal: None,
@@ -1363,6 +1367,14 @@ impl SessionStore {
     /// I/O error if the file cannot be written.
     #[allow(clippy::too_many_lines)]
     pub fn save(&self, session: &mut Session) -> Result<String> {
+        if session.sidechains.len() > crate::repro::SIDECHAIN_DUMPS_KEPT
+            || session.sidechains.iter().enumerate().any(|(index, dump)| {
+                dump.history_id == 0
+                    || (index > 0 && session.sidechains[index - 1].history_id >= dump.history_id)
+            })
+        {
+            return Err(SessionError::new("invalid completed agent history"));
+        }
         if !session.transcript.iter().any(|m| m.role == Role::User) && session.tasks.is_empty() {
             return Err(SessionError::new("nothing to save"));
         }
@@ -1455,6 +1467,13 @@ impl SessionStore {
                 g.status.tag()
             );
             body.extend_from_slice(g.objective.as_bytes());
+            body.push(b'\n');
+        }
+        for dump in session.sidechains.iter() {
+            let record =
+                serde_json::to_vec(dump).map_err(|error| SessionError::new(error.to_string()))?;
+            let _ = writeln!(body, "sidechain {}", record.len());
+            body.extend_from_slice(&record);
             body.push(b'\n');
         }
         // Rendering switches at save time; omitted when never recorded so an
@@ -2653,6 +2672,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
     let title = take(&data, &mut pos, title_len)?;
 
     let mut transcript = Vec::new();
+    let mut sidechains = std::collections::VecDeque::<crate::repro::SidechainDump>::new();
     let mut tag = String::new();
     let mut cwd = String::new();
     let mut tasks: Vec<crate::tasks::Task> = Vec::new();
@@ -2709,6 +2729,22 @@ fn read_session_file(path: &Path) -> Result<Session> {
         if let Some(rest) = header.strip_prefix("cwd ") {
             let len: usize = rest.trim().parse().map_err(|_| corrupt())?;
             cwd = take(&data, &mut pos, len)?;
+            continue;
+        }
+        if let Some(rest) = header.strip_prefix("sidechain ") {
+            let len: usize = rest.trim().parse().map_err(|_| corrupt())?;
+            let body = take(&data, &mut pos, len)?;
+            let dump: crate::repro::SidechainDump =
+                serde_json::from_str(&body).map_err(|_| corrupt())?;
+            if dump.history_id == 0
+                || sidechains
+                    .back()
+                    .is_some_and(|last| last.history_id >= dump.history_id)
+                || sidechains.len() >= crate::repro::SIDECHAIN_DUMPS_KEPT
+            {
+                return Err(corrupt());
+            }
+            sidechains.push_back(dump);
             continue;
         }
         // Rendering switches at save time; absent in older files.
@@ -2774,6 +2810,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         tag,
         cwd,
         transcript,
+        sidechains: std::sync::Arc::new(sidechains),
         branches,
         tasks: crate::tasks::TaskList::from_parts(tasks, tasks_next_id),
         goal,
@@ -4291,6 +4328,60 @@ hello\n";
             sha1_hex(&[b'a'; 200]),
             "e61cfffe0d9195a525fc6cf06ca2d77119c24a40"
         );
+    }
+
+    #[test]
+    fn subagent_history_round_trips_and_failed_saves_preserve_the_committed_file() {
+        let directory = temp_dir("subagent-history-save");
+        let store = SessionStore::open(&directory).unwrap();
+        let mut session = Session::new();
+        session.id = store.mint_id();
+        session.push(Message::user("parent"));
+        let mut dump = crate::repro::SidechainDump::new(
+            "review",
+            "task",
+            1,
+            &[Message::assistant(
+                "日🦀\n<tool_result>complete</tool_result>",
+            )],
+            5,
+            true,
+        );
+        dump.history_id = 1;
+        dump.messages[0].at = 42;
+        std::sync::Arc::make_mut(&mut session.sidechains).push_back(dump);
+        let id = store.save(&mut session).unwrap();
+        let path = store.path_for_id(&id);
+        let committed = fs::read(&path).unwrap();
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(
+            loaded.sidechains[0].messages,
+            session.sidechains[0].messages
+        );
+        assert_eq!(loaded.sidechains[0].history_id, 1);
+        assert_eq!(loaded.sidechains[0].ordinal, 0);
+        assert!(!loaded.sidechains[0].mirrored);
+        let mut copied = loaded.clone();
+        copied.id = "history-copy".into();
+        let copied_id = store.save(&mut copied).unwrap();
+        assert_eq!(store.load(&copied_id).unwrap().sidechains[0].history_id, 1);
+        store.delete(&copied_id).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        std::sync::Arc::make_mut(&mut session.sidechains)[0].history_id = 0;
+        assert!(store.save(&mut session).is_err());
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        std::sync::Arc::make_mut(&mut session.sidechains)[0].history_id = 1;
+        std::sync::Arc::make_mut(&mut session.sidechains)[0].outcome = "failed: disk test".into();
+        let temporary = directory.join(format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        fs::create_dir(&temporary).unwrap();
+        assert!(store.save(&mut session).is_err());
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        assert_eq!(store.load(&id).unwrap().sidechains[0].outcome, "ended");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

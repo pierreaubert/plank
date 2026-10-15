@@ -1117,7 +1117,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/history",
-        args: "",
+        args: "[turns]",
         desc: "show the prompt history for this directory",
     },
     SlashCommand {
@@ -1177,7 +1177,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/frame",
-        args: "[id]",
+        args: "[id [face]]",
         desc: "open a wasm frame component, or list the openable ones",
     },
     SlashCommand {
@@ -1252,8 +1252,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/buddy",
-        args: "[on|off|install]",
-        desc: "an animated buddy on the prompt rule while idle (kitty, Ghostty, Warp)",
+        args: "[on|off|install [name]]",
+        desc: "show an animated buddy while idle (graphical UI or kitty graphics)",
     },
     SlashCommand {
         name: "/loopguard",
@@ -1267,7 +1267,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/jobs",
-        args: "[output|stop <id>]",
+        args: "[output <id> [--page N]|follow <id>|unfollow|stop <id>]",
         desc: "list background bash jobs, read output, or stop a job",
     },
     SlashCommand {
@@ -1309,6 +1309,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/repro",
         args: "[path]",
         desc: "write a reproducer bundle for the current session",
+    },
+    SlashCommand {
+        name: "/subagent-history",
+        args: "[run-id [--page N]]",
+        desc: "browse retained completed sub-agent conversations",
     },
     SlashCommand {
         name: "/debug",
@@ -1372,110 +1377,23 @@ pub fn slash_command_known(cmd: &str) -> bool {
 /// answers are testable without touching the process-wide settings.
 #[must_use]
 pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
-    matches!(
-        cmd,
-        "/help"
-            | "/commands"
-            | "/save"
-            | "/list"
-            | "/retitle"
-            | "/quit"
-            | "/exit"
-            | "/new"
-            | "/clear"
-            | "/mcp"
-            | "/context"
-            | "/usage"
-            | "/toks"
-            | "/init"
-            | "/plugins"
-            | "/install-claude-plugin"
-            | "/install-profile"
-            | "/edit-profile"
-            | "/engines"
-            | "/frame"
-            | "/templates"
-            | "/tasks"
-            | "/jobs"
-            | "/memory"
-            | "/agent"
-            | "/remote-control"
-            | "/rc"
-            | "/remote"
-            | "/grant"
-            | "/version"
-            | "/tree"
-            | "/clone"
-    )
-        // Easter eggs (`crate::arcade`). Known so the dispatcher runs them
-        // instead of forwarding the line to the model, but deliberately left
-        // out of `usage()` and the completion popup. They take an argument
-        // (`new`), so they go through the with-args form. Kept in sync with
-        // `Arcade::COMMANDS` by a test in that module. With `ui.easterEggs`
-        // off they stop being known at all, so the line reaches the model as
-        // an ordinary prompt rather than being recognized and refused.
+    // Use the advertised catalog for built-ins so aliases and argument forms
+    // cannot disappear from dispatch while remaining visible in the menu.
+    // A command advertised without arguments is known only in its bare form.
+    SLASH_COMMANDS.iter().any(|command| {
+        if command.args.is_empty() {
+            cmd == command.name
+        } else {
+            slash_command_with_args(cmd, command.name)
+        }
+    })
         || (easter_eggs
-            && crate::arcade::Arcade::COMMANDS
-                .iter()
-                .any(|egg| slash_command_with_args(cmd, egg)))
-        // `/compact` takes optional extra summarization instructions, so it goes
-        // through the with-args form: bare `/compact` and
-        // `/compact focus on the parser bug` are both valid invocations.
-        || slash_command_with_args(cmd, "/compact")
-        || slash_command_with_args(cmd, "/config")
-        || slash_command_with_args(cmd, "/jobs")
-        || slash_command_with_args(cmd, "/tasks")
-        || slash_command_with_args(cmd, "/engines")
-        || slash_command_with_args(cmd, "/fork")
-        || slash_command_with_args(cmd, "/btw")
-        // `/subagent` also takes a `:<name>` suffix selecting a definition, so
-        // it needs its own recognizer rather than the plain with-args form.
-        // Any name is *known* here; whether it exists is dispatch's business,
-        // and reporting a bad name beats silently forwarding the line to the
-        // model as an ordinary prompt.
+        && crate::arcade::Arcade::COMMANDS
+            .iter()
+            .any(|egg| slash_command_with_args(cmd, egg)))
+        // Named subagents select a runtime definition with a colon suffix.
+        // Keep unknown names in dispatch so they report errors, not model prompts.
         || crate::agents::is_subagent_command(first_token(cmd))
-        || slash_command_with_args(cmd, "/remember")
-        || slash_command_with_args(cmd, "/forget")
-        || slash_command_with_args(cmd, "/repro")
-        || slash_command_with_args(cmd, "/debug")
-        || slash_command_with_args(cmd, "/mtp")
-        || slash_command_with_args(cmd, "/temp")
-        || slash_command_with_args(cmd, "/steer")
-        || slash_command_with_args(cmd, "/mc")
-        || slash_command_with_args(cmd, "/hints")
-        || slash_command_with_args(cmd, "/buddy")
-        || slash_command_with_args(cmd, "/loopguard")
-        || slash_command_with_args(cmd, "/lg")
-        || slash_command_with_args(cmd, "/export")
-        || slash_command_with_args(cmd, "/open")
-        || slash_command_with_args(cmd, "/insights")
-        || slash_command_with_args(cmd, "/stats")
-        || slash_command_with_args(cmd, "/resume")
-        || slash_command_with_args(cmd, "/tag")
-        || slash_command_with_args(cmd, "/rename")
-        || slash_command_with_args(cmd, "/rate")
-        || slash_command_with_args(cmd, "/power")
-        || slash_command_with_args(cmd, "/think")
-        // `/hooks` takes an optional `on`/`off` runtime toggle.
-        || slash_command_with_args(cmd, "/hooks")
-        // And `/skills`, the same way: without this, `/skills off` is not a
-        // known command and the whole line is forwarded to the model.
-        || slash_command_with_args(cmd, "/skills")
-        || slash_command_with_args(cmd, "/switch")
-        || slash_command_with_args(cmd, "/del")
-        || slash_command_with_args(cmd, "/strip")
-        || slash_command_with_args(cmd, "/kvcache")
-        || slash_command_with_args(cmd, "/model")
-        || slash_command_with_args(cmd, "/history")
-        || slash_command_with_args(cmd, "/checkpoint")
-        || slash_command_with_args(cmd, "/rollback")
-        || slash_command_with_args(cmd, "/notify")
-        || slash_command_with_args(cmd, "/goal")
-        || slash_command_with_args(cmd, "/remote-control")
-        || slash_command_with_args(cmd, "/rc")
-        // `/grant` takes an optional session id (`/grant 3`) as well as the bare
-        // form that answers the oldest waiting request.
-        || slash_command_with_args(cmd, "/grant")
 }
 
 /// Why a slash command cannot be run from a remote client, or `None` if it can.
@@ -1493,13 +1411,20 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
 pub fn slash_command_remote_refusal(line: &str) -> Option<&'static str> {
     let mut it = line.split_whitespace();
     let cmd = it.next().unwrap_or("");
-    if matches!(cmd, "/remote-control" | "/rc") && it.clone().eq(["status"]) {
-        // Reporting host policy cannot change ownership or disconnect clients.
+    if matches!(cmd, "/remote-control" | "/rc")
+        && (it.clone().eq(["status"])
+            || it.clone().count() == 1
+                && it
+                    .clone()
+                    .next()
+                    .is_some_and(|arg| arg.eq_ignore_ascii_case("off")))
+    {
+        // Explicit stop is acknowledged before closing the controller's connection.
         return None;
     }
     let bare = it.next().is_none();
     match cmd {
-        "/engines" if line.split_whitespace().nth(1) != Some("--page") => Some(
+        "/engines" if !cfg!(unix) && line.split_whitespace().nth(1) != Some("--page") => Some(
             "remote engine restart is not available; use /engines --page N to inspect the host catalog",
         ),
         "/grant" => Some(
@@ -3250,6 +3175,13 @@ mod tests {
             );
             assert!(c.name.starts_with('/'), "{}", c.name);
             assert!(!c.desc.is_empty(), "{} has no description", c.name);
+            if !c.args.is_empty() {
+                let invocation = format!("{} argument", c.name);
+                assert!(
+                    slash_command_known_with(&invocation, true),
+                    "{invocation} is advertised with arguments but unknown to dispatch"
+                );
+            }
         }
     }
 
@@ -3308,7 +3240,10 @@ mod tests {
         assert!(slash_command_known("/jobs output 1"));
         assert!(slash_command_known("/jobs stop 1"));
         assert!(slash_command_known("/engines --page 1"));
-        assert!(slash_command_remote_refusal("/engines").is_some());
+        assert_eq!(
+            slash_command_remote_refusal("/engines").is_none(),
+            cfg!(unix)
+        );
         assert!(slash_command_remote_refusal("/engines --page 1").is_none());
         assert!(!slash_command_known("/enginesx --page 1"));
         assert!(!slash_command_known("/jobsx output 1"));
@@ -3389,6 +3324,8 @@ mod tests {
             "/open",
             "/open src/ui.rs",
             "/rc status",
+            "/rc off",
+            " /remote-control OFF ",
             " /remote-control  status ",
             "hello",
         ] {
@@ -3402,7 +3339,7 @@ mod tests {
             "/grant",
             "/grant 3",
             "/rc",
-            "/rc off",
+            "/rc off extra",
             "/rc on",
             "/rc ask",
             "/rc status off",

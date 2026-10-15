@@ -31,6 +31,8 @@ use ratatui::widgets::{Clear, Gauge, Paragraph};
 use crate::arcade;
 use crate::arcade::breakout::Breakout;
 
+pub mod foreground;
+
 const MESSAGES: [&str; 200] = [
     "Summoning alien intelligence from the void...",
     "Negotiating with billions of sleeping neurons...",
@@ -301,7 +303,7 @@ fn size_text(bytes: Option<u64>, decimals: usize) -> String {
 /// the whole set are the manifest's business (`check_manifest_at_startup`).
 ///
 /// # Errors
-/// Declined prompt, no terminal, unmanaged role, or a failed download.
+/// Declined prompt, no interactive frontend, unmanaged role, or a failed download.
 pub fn ensure_role(sel: &crate::engines::Selection, role: &str, path: &Path) -> Result<(), String> {
     ensure_role_with(
         sel,
@@ -335,7 +337,8 @@ fn ensure_role_with(
     let Some((url, bytes)) = role_offer(sel, role) else {
         return Err(format!("no {label} at {}", path.display()));
     };
-    if !is_tty {
+    let gui = crate::ui::gui_protocol_enabled();
+    if !is_tty && !gui {
         let hatch = if role == "mtp" {
             "; pass --mtp-model <path> or turn speculation off with --mtp-off"
         } else {
@@ -356,6 +359,14 @@ fn ensure_role_with(
     };
     let bytes = Some(bytes);
     let resuming = partial_bytes(path) > 0;
+    if gui {
+        if !crate::ui::gui_startup_confirm(&missing_download_question(
+            label, path, &url, bytes, resuming,
+        )) {
+            return Err(format!("{label} download declined"));
+        }
+        return download(&url, path);
+    }
     eprintln!("No {label} found at {}.", path.display());
     if resuming {
         eprintln!(
@@ -702,8 +713,8 @@ fn main_offer_with(
 ///
 /// # Errors
 /// Returns an error string when the file is not a managed engine's `main`,
-/// when the user declines, when stdin is not a terminal (so no prompt is
-/// possible), or when the download fails.
+/// when the user declines, when no terminal or GUI can answer the prompt,
+/// or when the download fails.
 pub fn ensure_model(sel: &crate::engines::Selection) -> Result<(), String> {
     let path = sel.main.as_path();
     if path.exists() {
@@ -755,7 +766,8 @@ fn ensure_model_in_with(
             path.display()
         ));
     };
-    if !is_tty {
+    let gui = crate::ui::gui_protocol_enabled();
+    if !is_tty && !gui {
         return Err(if sel.managed_main {
             format!(
                 "no model at {}; pass --model <name|path> or download it first",
@@ -779,6 +791,14 @@ fn ensure_model_in_with(
     let label = sel.id.map_or("the model", |id| id.as_str());
     // A leftover .part file means a previous download can be resumed.
     let resuming = partial_bytes(path) > 0;
+    if gui {
+        if !crate::ui::gui_startup_confirm(&missing_download_question(
+            label, path, &url, bytes, resuming,
+        )) {
+            return Err("model download declined".into());
+        }
+        return download(&url, path);
+    }
     eprintln!("No model found at {}.", path.display());
     if resuming {
         eprintln!(
@@ -805,6 +825,26 @@ fn ensure_model_in_with(
         );
     }
     download(&url, path)
+}
+
+/// Describes the exact startup transfer before requesting graphical consent.
+fn missing_download_question(
+    label: &str,
+    path: &Path,
+    url: &str,
+    bytes: Option<u64>,
+    resuming: bool,
+) -> String {
+    format!(
+        "No {label} found at {}. {} {label} ({}) from {url}? Partial files are kept if cancelled.",
+        path.display(),
+        if resuming {
+            "Resume downloading"
+        } else {
+            "Download"
+        },
+        size_text(bytes, 1)
+    )
 }
 
 /// Size of the partial download alongside `dest`, or 0 if none.
@@ -878,6 +918,21 @@ pub fn install_engine_in(
 ) -> Result<(), String> {
     for (url, dest) in missing_roles(catalog, sel, &|p| p.exists())? {
         download(&url, &dest)?;
+    }
+    Ok(())
+}
+
+fn install_engine_with_frontend(
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    remote: Option<&crate::remote::control::RemoteState>,
+) -> Result<(), String> {
+    for (url, dest) in missing_roles(catalog, sel, &|path| path.exists())? {
+        if remote.is_some() || crate::ui::gui_protocol_enabled() {
+            download_with_frontend(&url, &dest, remote)?;
+        } else {
+            download(&url, &dest)?;
+        }
     }
     Ok(())
 }
@@ -1061,13 +1116,35 @@ pub fn start_and_wait_in(
     catalog: &crate::engines::Catalog,
     sel: &crate::engines::Selection,
 ) -> Result<WaitOutcome, String> {
+    start_and_wait_in_with_remote(root, catalog, sel, None)
+}
+
+/// Fetches missing engine files with optional remote startup controls.
+///
+/// Remote controllers can leave the helper running or cancel while keeping
+/// partial files. Progress uses the existing bounded download snapshots.
+///
+/// # Errors
+/// Returns the same download, staging, and installation errors as [`start_and_wait_in`].
+pub fn start_and_wait_in_with_remote(
+    root: &Path,
+    catalog: &crate::engines::Catalog,
+    sel: &crate::engines::Selection,
+    remote: Option<&crate::remote::control::RemoteState>,
+) -> Result<WaitOutcome, String> {
+    let wait = |root: &Path, set, manifest: &crate::manifest::Manifest| {
+        wait_screen_with_remote(root, set, manifest, remote)
+    };
+    let foreground = |catalog: &crate::engines::Catalog, selection: &crate::engines::Selection| {
+        install_engine_with_frontend(catalog, selection, remote)
+    };
     start_and_wait_with(
         root,
         catalog,
         sel,
         &crate::downloader::launch_helper,
-        &wait_screen,
-        &install_engine_in,
+        &wait,
+        &foreground,
     )
 }
 
@@ -1142,7 +1219,213 @@ fn start_and_wait_with(
 }
 
 /// Downloads `url` to `dest` via `ureq`, showing the animated progress bar.
+fn download_with_frontend(
+    url: &str,
+    dest: &Path,
+    remote: Option<&crate::remote::control::RemoteState>,
+) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if partial_bytes(dest) > 0 && !part_matches_url(dest, url) {
+        discard_stale_part(dest);
+    }
+    std::fs::write(part_url_path(dest), url).map_err(|error| error.to_string())?;
+    let mut command =
+        std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
+    command.arg(foreground::WORKER_ARG);
+    let mut transfer = foreground::Transfer::start(command, url, &dest.with_extension("part"))
+        .map_err(|error| error.to_string())?;
+    let dialogs = ForegroundDialogs::open(remote);
+    let waiting = run_foreground(&mut transfer, dest, &dialogs);
+    let stopped = transfer.cancel().map_err(|error| error.to_string());
+    let result = stopped.and(waiting).and_then(|()| {
+        foreground::finalize(dest, transfer.total()).map_err(|error| error.to_string())
+    });
+    if let Err(error) = &result
+        && let Some(remote) = remote
+    {
+        remote
+            .bus
+            .broadcast(crate::worker::UiEvent::Error(format!("{error}\n")));
+    }
+    result?;
+    finish(dest);
+    Ok(())
+}
+
+struct ForegroundDialogs<'a> {
+    remote: Option<&'a crate::remote::control::RemoteState>,
+    question: Option<crate::ui::RemoteQuestion<'a>>,
+    gui: Option<GuiWaitQuestion>,
+}
+
+impl<'a> ForegroundDialogs<'a> {
+    fn open(remote: Option<&'a crate::remote::control::RemoteState>) -> Self {
+        let request = crate::tools::ask::AskRequest {
+            header: "Model download".into(),
+            question: "Downloading a model file. Cancelling keeps partial files for resuming."
+                .into(),
+            multi: false,
+            allow_chat: false,
+            options: vec![crate::tools::ask::AskOption {
+                label: "Cancel download".into(),
+                description: "Keep partial files".into(),
+            }],
+        };
+        let question = remote.map(|remote| {
+            crate::ui::RemoteQuestion::open(&remote.shared, Some(&remote.bus), &request)
+        });
+        let gui = crate::ui::gui_protocol_enabled().then(|| GuiWaitQuestion(crate::ui::gui_send_question(
+            &request.question, &request.header,
+            &[serde_json::json!({"label":"Cancel download", "description":"Keep partial files"})], false)));
+        Self {
+            remote,
+            question,
+            gui,
+        }
+    }
+
+    fn publish(&self, dest: &Path, total: Option<u64>) {
+        let current = partial_bytes(dest);
+        if self.gui.is_some() {
+            eprintln!(
+                "+PLANK_PROGRESS {}",
+                serde_json::json!({"label":"Downloading model", "current":current, "total":total.unwrap_or(0)})
+            );
+        }
+        let name: String = dest
+            .file_name()
+            .map_or_else(
+                || "model".into(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(64)
+            .collect();
+        let snapshot = crate::remote::control::DownloadsWire {
+            foreground: true,
+            pending: false,
+            cancel_requested: None,
+            state: Some(crate::remote::control::DownloadStateWire {
+                set: "Local model".into(),
+                version: 0,
+                current: name,
+                index: 1,
+                of: 1,
+                done_bytes: current.min(total.unwrap_or(0)),
+                total_bytes: total.unwrap_or(0),
+                rate_bps: 0,
+                phase: "downloading".into(),
+                partials_kept: None,
+                error: None,
+            }),
+        };
+        if self.gui.is_some() {
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"downloads", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = self.remote {
+            remote.foreground_download(Some(snapshot.clone()));
+            remote
+                .bus
+                .broadcast(crate::worker::UiEvent::Downloads(snapshot));
+        }
+    }
+}
+
+impl Drop for ForegroundDialogs<'_> {
+    fn drop(&mut self) {
+        if self.gui.is_some() {
+            let snapshot = crate::remote::control::DownloadsWire::capture();
+            eprintln!(
+                "+PLANK_TELEMETRY {}",
+                serde_json::json!({"type":"downloads", "snapshot":snapshot})
+            );
+        }
+        if let Some(remote) = self.remote {
+            remote.foreground_download(None);
+            remote.bus.broadcast(crate::worker::UiEvent::Downloads(
+                remote.downloads_snapshot(),
+            ));
+        }
+    }
+}
+
+fn run_foreground(
+    transfer: &mut foreground::Transfer,
+    dest: &Path,
+    dialogs: &ForegroundDialogs<'_>,
+) -> Result<(), String> {
+    let part = dest.with_extension("part");
+    let started = Instant::now();
+    let done = partial_bytes(dest);
+    let mut last_publish = None;
+    let mut reply = dialogs
+        .gui
+        .as_ref()
+        .map(|question| crate::ui::GuiStartupReply::new(question.0.clone(), libc::STDIN_FILENO));
+    let mut tick = || {
+        let complete = transfer.poll().map_err(|error| error.to_string())?;
+        if complete
+            || last_publish.is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1))
+        {
+            dialogs.publish(dest, transfer.total());
+            last_publish = Some(Instant::now());
+        }
+        if complete {
+            return Ok((
+                Progress::of_part(&part, transfer.total(), started, done),
+                Some(()),
+            ));
+        }
+        let interrupted = crate::interrupt::pending()
+            || dialogs
+                .question
+                .as_ref()
+                .is_some_and(|question| question.poll().is_some());
+        let gui_cancelled = if let Some(reply) = &mut reply {
+            match reply.poll().map_err(|error| error.to_string())? {
+                crate::ui::StartupReply::Closed => true,
+                crate::ui::StartupReply::Answer(answer) => matches!(answer.as_str(), "0" | "1"),
+                crate::ui::StartupReply::Pending => false,
+            }
+        } else {
+            false
+        };
+        if interrupted || gui_cancelled {
+            return Err("download cancelled; partial file retained".into());
+        }
+        Ok((
+            Progress::of_part(&part, transfer.total(), started, done),
+            None,
+        ))
+    };
+    if dialogs.gui.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let mut terminal = ratatui::try_init().map_err(|error| error.to_string())?;
+        let result = screen_loop(&mut terminal, &mut tick, || {
+            Err("download cancelled; partial file retained".into())
+        });
+        ratatui::restore();
+        result
+    } else {
+        loop {
+            if tick()?.1.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Downloads `url` to `dest` via `ureq`, showing the animated progress bar.
 fn download(url: &str, dest: &Path) -> Result<(), String> {
+    if crate::ui::gui_protocol_enabled() {
+        return download_with_frontend(url, dest, None);
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1546,22 +1829,148 @@ fn wait_screen(
     result
 }
 
+fn wait_screen_with_remote(
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+    remote: Option<&crate::remote::control::RemoteState>,
+) -> Result<Waited, String> {
+    use std::io::IsTerminal as _;
+    let Some(remote) = remote else {
+        return wait_screen(root, set, manifest);
+    };
+    let request = download_question(set);
+    let question = crate::ui::RemoteQuestion::open(&remote.shared, Some(&remote.bus), &request);
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let mut terminal = ratatui::init();
+        let result = wait_ui_with_remote(
+            &mut terminal,
+            root,
+            set,
+            manifest,
+            Some((remote, &question)),
+        );
+        ratatui::restore();
+        result
+    } else {
+        wait_remote(root, set, remote, &question)
+    }
+}
+
+const CANCEL_DOWNLOAD: &str = "Cancel download";
+
+fn download_question(set: crate::manifest::EngineId) -> crate::tools::ask::AskRequest {
+    use crate::tools::ask::{AskOption, AskRequest};
+    AskRequest {
+        question: format!(
+            "Downloading {set}. Leave it running to resume the previous engine, or cancel and keep partial files."
+        ),
+        header: "Model download".into(),
+        multi: false,
+        allow_chat: false,
+        options: vec![
+            AskOption {
+                label: "Leave downloading".into(),
+                description: String::new(),
+            },
+            AskOption {
+                label: CANCEL_DOWNLOAD.into(),
+                description: "Keep partial files for resuming".into(),
+            },
+        ],
+    }
+}
+
+fn finish_download_question(
+    root: &Path,
+    answer: crate::tools::ask::AskOutcome,
+) -> Result<Waited, String> {
+    if matches!(answer, crate::tools::ask::AskOutcome::Answered(answers) if answers == [CANCEL_DOWNLOAD])
+    {
+        crate::downloader::request_cancel_in(root, crate::downloader::Cancel::Keep)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(Waited::Detached)
+}
+
+fn publish_wait_downloads(
+    root: &Path,
+    remote: &crate::remote::control::RemoteState,
+    last: &mut Option<crate::remote::control::DownloadsWire>,
+    last_poll: &mut Option<Instant>,
+    force: bool,
+) {
+    if !force && last_poll.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        return;
+    }
+    let snapshot = crate::remote::control::DownloadsWire::capture_in(root);
+    if last.as_ref() != Some(&snapshot) {
+        remote
+            .bus
+            .broadcast(crate::worker::UiEvent::Downloads(snapshot.clone()));
+        *last = Some(snapshot);
+    }
+    *last_poll = Some(Instant::now());
+}
+
+fn wait_remote(
+    root: &Path,
+    set: crate::manifest::EngineId,
+    remote: &crate::remote::control::RemoteState,
+    question: &crate::ui::RemoteQuestion<'_>,
+) -> Result<Waited, String> {
+    let started = Instant::now();
+    let mut last = None;
+    let mut last_poll = None;
+    loop {
+        let state = crate::downloader::read_state_in(root);
+        let movement = next_move(
+            state.as_ref(),
+            set.as_str(),
+            crate::downloader::running_in(root),
+            started.elapsed() >= HELPER_GRACE,
+            crate::downloader::is_staged_in(root, set),
+            &crate::downloader::log_path_in(root),
+        );
+        publish_wait_downloads(
+            root,
+            remote,
+            &mut last,
+            &mut last_poll,
+            !matches!(movement, Move::Wait),
+        );
+        // A completed helper wins over an answer accepted during its last tick.
+        match movement {
+            Move::Install => return Ok(Waited::Staged),
+            Move::Fail(error) => return Err(error),
+            Move::Wait => {}
+        }
+        if let Some(answer) = question.poll() {
+            let result = finish_download_question(root, answer);
+            publish_wait_downloads(root, remote, &mut last, &mut last_poll, true);
+            return result;
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
+}
+
 /// Streams helper progress while the GUI can leave or cancel the download.
 fn wait_gui(
     root: &Path,
     set: crate::manifest::EngineId,
     manifest: &crate::manifest::Manifest,
 ) -> Result<Waited, String> {
+    let definition = download_question(set);
+    let options: Vec<_> = definition
+        .options
+        .iter()
+        .map(|option| serde_json::json!({"label": option.label, "description": option.description}))
+        .collect();
     let request = GuiWaitQuestion(crate::ui::gui_send_question(
-        &format!(
-            "Downloading {set}. Leave it running to resume the previous engine, or cancel and keep partial files."
-        ),
-        "Model download",
-        &[
-            serde_json::json!({"label":"Leave downloading"}),
-            serde_json::json!({"label":"Cancel download", "description":"Keep partial files for resuming"}),
-        ],
-        false,
+        &definition.question,
+        &definition.header,
+        &options,
+        definition.multi,
     ));
     let started = Instant::now();
     let mut eof = false;
@@ -1622,6 +2031,19 @@ fn wait_ui(
     set: crate::manifest::EngineId,
     manifest: &crate::manifest::Manifest,
 ) -> Result<Waited, String> {
+    wait_ui_with_remote(terminal, root, set, manifest, None)
+}
+
+fn wait_ui_with_remote(
+    terminal: &mut ratatui::DefaultTerminal,
+    root: &Path,
+    set: crate::manifest::EngineId,
+    manifest: &crate::manifest::Manifest,
+    remote: Option<(
+        &crate::remote::control::RemoteState,
+        &crate::ui::RemoteQuestion<'_>,
+    )>,
+) -> Result<Waited, String> {
     let started = Instant::now();
     let log = crate::downloader::log_path_in(root);
     let staged_manifest = crate::manifest::staged_manifest_path_in(root, set);
@@ -1638,6 +2060,8 @@ fn wait_ui(
     // disk is not counted as fetched in no time.
     let mut baseline: Option<(u64, Instant)> = None;
     let mut last_poll: Option<Instant> = None;
+    let mut last_downloads = None;
+    let mut download_poll = None;
     screen_loop(
         terminal,
         &mut || {
@@ -1663,20 +2087,43 @@ fn wait_ui(
                     ..shown
                 };
             }
-            match next_move(
+            let movement = next_move(
                 state.as_ref(),
                 set.as_str(),
                 crate::downloader::running_in(root),
                 started.elapsed() >= HELPER_GRACE,
                 staged_manifest.exists(),
                 &log,
-            ) {
-                Move::Wait => Ok((shown, None)),
+            );
+            if let Some((remote, _)) = remote {
+                publish_wait_downloads(
+                    root,
+                    remote,
+                    &mut last_downloads,
+                    &mut download_poll,
+                    !matches!(movement, Move::Wait),
+                );
+            }
+            match movement {
+                Move::Wait => {
+                    let ended = remote
+                        .and_then(|(_, question)| question.poll())
+                        .map(|answer| finish_download_question(root, answer))
+                        .transpose()?;
+                    Ok((shown, ended))
+                }
                 Move::Install => Ok((shown, Some(Waited::Staged))),
                 Move::Fail(e) => Err(e),
             }
         },
-        || Ok(Waited::Detached),
+        || {
+            remote.map_or(Ok(Waited::Detached), |(_, question)| {
+                finish_download_question(
+                    root,
+                    question.finish(crate::tools::ask::AskOutcome::Declined),
+                )
+            })
+        },
     )
 }
 
@@ -2286,10 +2733,25 @@ pub fn check_manifest_at_startup(sel: &crate::engines::Selection) {
     );
 }
 
-/// The real confirmation: `None` when there is no controlling terminal to ask
-/// (a piped or headless run), `Some(answer)` from the blocking `[y/N]` prompt
-/// otherwise.
+/// Requests explicit graphical consent or uses the terminal's `[y/N]` prompt.
+/// Returns `None` when neither interactive frontend is available.
 fn real_confirm(manifest: &crate::manifest::Manifest, from: u32) -> Option<bool> {
+    if crate::ui::gui_protocol_enabled() {
+        let bytes = manifest
+            .files
+            .values()
+            .fold(0_u64, |total, file| total.saturating_add(file.bytes));
+        return Some(crate::ui::gui_startup_confirm(&format!(
+            "A newer model is available (version {from} → {}). Download {} in the background?{}",
+            manifest.version,
+            size_text(Some(bytes), 1),
+            if manifest.notes.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", manifest.notes)
+            }
+        )));
+    }
     if !std::io::stdin().is_terminal() {
         return None;
     }
@@ -2300,6 +2762,326 @@ fn real_confirm(manifest: &crate::manifest::Manifest, from: u32) -> Option<bool>
 mod tests {
     use super::*;
     use crate::manifest::EngineId;
+
+    #[test]
+    fn graphical_startup_downloads_require_explicit_matching_consent_without_read_ahead() {
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+        for (kind, answer, stale) in [
+            ("main", "1", false),
+            ("role", "0", false),
+            ("update", "1", false),
+            ("update", "2", false),
+            ("update", "2", true),
+        ] {
+            let root = crate::downloader::tests::tempdir();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "download::tests::graphical_startup_download_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PLANK_GUI_PROTOCOL", "1")
+                .env("PLANK_DOWNLOAD_PROMPT_PROBE", kind)
+                .env(
+                    "PLANK_DOWNLOAD_EXPECT_APPROVED",
+                    if answer == "2" && !stale { "1" } else { "0" },
+                )
+                .env("HOME", &root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            let mut events = std::io::BufReader::new(child.stderr.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(
+                    events.read_line(&mut line).unwrap(),
+                    0,
+                    "child exited before question"
+                );
+                if line.starts_with("+PLANK_QUESTION ") {
+                    break;
+                }
+            }
+            let question: serde_json::Value =
+                serde_json::from_str(line.trim().strip_prefix("+PLANK_QUESTION ").unwrap())
+                    .unwrap();
+            assert_eq!(question["options"][0]["label"], "No");
+            assert_eq!(question["options"][1]["label"], "Yes");
+            assert!(
+                question["question"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if kind == "update" {
+                        "background"
+                    } else {
+                        "https://"
+                    })
+            );
+            let id = if stale {
+                serde_json::json!("stale-request")
+            } else {
+                question["id"].clone()
+            };
+            writeln!(
+                input,
+                "{}\nlater prompt",
+                serde_json::json!({"id":id,"answer":answer})
+            )
+            .unwrap();
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(!root.join("models/mine.gguf.part").exists());
+            assert!(!root.join("models/mine-vision.gguf.part").exists());
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated graphical startup stdin fixture, invoked by its parent test"]
+    fn graphical_startup_download_fixture() {
+        assert!(crate::ui::gui_protocol_enabled());
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let (catalog, selection) = local_url_selection(&root);
+        match std::env::var("PLANK_DOWNLOAD_PROMPT_PROBE")
+            .unwrap()
+            .as_str()
+        {
+            "main" => assert!(
+                ensure_model_in_with(&catalog, &selection, false, |_| Some(1_500_000_000))
+                    .unwrap_err()
+                    .contains("declined")
+            ),
+            "role" => assert!(
+                ensure_role_with(
+                    &selection,
+                    "vision",
+                    selection.vision.as_ref().unwrap(),
+                    false,
+                    |_| Some(1_500_000_000)
+                )
+                .unwrap_err()
+                .contains("declined")
+            ),
+            "update" => {
+                let manifest = crate::manifest::parse(&manifest_text(4, 1_500_000_000)).unwrap();
+                assert_eq!(
+                    real_confirm(&manifest, 3),
+                    Some(std::env::var("PLANK_DOWNLOAD_EXPECT_APPROVED").unwrap() == "1")
+                );
+            }
+            other => panic!("unknown fixture {other}"),
+        }
+        let mut next = String::new();
+        std::io::stdin().read_line(&mut next).unwrap();
+        assert_eq!(next, "later prompt\n");
+        assert!(!selection.main.exists());
+        assert!(!selection.vision.unwrap().exists());
+    }
+
+    #[test]
+    fn foreground_url_download_remote_dialog_cancels_owned_process_and_restores_helper_scope() {
+        let _guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let root = crate::downloader::tests::tempdir();
+        let dest = root.join("local.gguf");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "download::foreground::tests::worker_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PLANK_FOREGROUND_TEST_MODE", "stall");
+        let mut transfer = foreground::Transfer::start(
+            command,
+            "https://fixture.invalid",
+            &dest.with_extension("part"),
+        )
+        .unwrap();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        remote.shared.push_queued("later prompt".into());
+        let events = remote.bus.subscribe();
+        let request = crate::tools::ask::AskRequest {
+            header: "Download".into(),
+            question: "Cancel?".into(),
+            multi: false,
+            allow_chat: false,
+            options: vec![crate::tools::ask::AskOption {
+                label: "Cancel".into(),
+                description: String::new(),
+            }],
+        };
+        let dialogs = ForegroundDialogs {
+            remote: Some(&remote),
+            question: Some(crate::ui::RemoteQuestion::open(
+                &remote.shared,
+                Some(&remote.bus),
+                &request,
+            )),
+            gui: None,
+        };
+        let crate::worker::UiEvent::Question(wire) = events.try_recv().unwrap().event else {
+            panic!("question missing")
+        };
+        let id = wire["id"].as_str().unwrap();
+        assert!(!remote.shared.questions.answer("stale", "1"));
+        assert!(remote.shared.questions.answer(id, "1"));
+        assert!(
+            run_foreground(&mut transfer, &dest, &dialogs)
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        transfer.cancel().unwrap();
+        let snapshot = remote.downloads_snapshot();
+        assert!(snapshot.foreground && !snapshot.pending);
+        assert_eq!(snapshot.state.unwrap().set, "Local model");
+        assert!(!dest.exists());
+        drop(dialogs);
+        assert!(!remote.downloads_snapshot().foreground);
+        assert!(!remote.shared.questions.answer(id, "1"));
+        assert_eq!(remote.shared.take_queued(), vec!["later prompt"]);
+        assert!(events.try_iter().any(|event| matches!(event.event, crate::worker::UiEvent::QuestionDone { id: done } if done == id)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_download_questions_leave_cancel_and_finish_without_consuming_prompts() {
+        use crate::downloader::{Cancel, Phase};
+        use crate::worker::UiEvent;
+        let _guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let set = EngineId::new("e").unwrap();
+        for (phase, reply, expected, cancel) in [
+            (Phase::Downloading, Some("1"), Ok(Waited::Detached), None),
+            (Phase::Downloading, Some("0"), Ok(Waited::Detached), None),
+            (
+                Phase::Downloading,
+                Some("2"),
+                Ok(Waited::Detached),
+                Some(Cancel::Keep),
+            ),
+            (Phase::Downloading, None, Ok(Waited::Detached), None),
+            (Phase::Staged, Some("2"), Ok(Waited::Staged), None),
+            (
+                Phase::Failed,
+                Some("2"),
+                Err("fixture failure".to_owned()),
+                None,
+            ),
+        ] {
+            let root = crate::downloader::tests::tempdir();
+            let mut state = a_state(set.as_str(), phase);
+            if phase == Phase::Failed {
+                state.error = Some("fixture failure".into());
+            }
+            crate::downloader::write_state_in(&root, &state).unwrap();
+            let remote = crate::remote::control::RemoteState::test_bridge();
+            remote.shared.push_queued("untouched prompt".into());
+            let events = remote.bus.subscribe();
+            let question = crate::ui::RemoteQuestion::open(
+                &remote.shared,
+                Some(&remote.bus),
+                &download_question(set),
+            );
+            let UiEvent::Question(wire) = events.try_recv().unwrap().event else {
+                panic!("missing question")
+            };
+            let id = wire["id"].as_str().unwrap();
+            assert_eq!(wire["options"].as_array().unwrap().len(), 2);
+            assert!(!remote.shared.questions.answer("outdated", "2"));
+            assert!(!remote.shared.questions.answer(id, "3"));
+            if let Some(reply) = reply {
+                assert!(remote.shared.questions.answer(id, reply));
+            } else {
+                remote
+                    .shared
+                    .interrupt
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            assert_eq!(wait_remote(&root, set, &remote, &question), expected);
+            drop(question);
+            assert_eq!(crate::downloader::read_cancel_in(&root), cancel);
+            assert_eq!(remote.shared.take_queued(), vec!["untouched prompt"]);
+            assert!(!remote.shared.questions.answer(id, "2"));
+            let retained: Vec<_> = events.try_iter().map(|event| event.event).collect();
+            assert!(
+                retained
+                    .iter()
+                    .any(|event| matches!(event, UiEvent::QuestionDone { id: done } if done == id))
+            );
+            assert!(retained.iter().any(|event| matches!(event, UiEvent::Downloads(snapshot) if snapshot.state.as_ref().is_some_and(|state| state.set == set.as_str()))));
+            if cancel.is_some() {
+                assert!(retained.iter().any(|event| matches!(event, UiEvent::Downloads(snapshot) if snapshot.cancel_requested.as_deref() == Some("keep"))));
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_download_questions_publish_bounded_progress_and_close_on_cancel_write_failure() {
+        use crate::downloader::Phase;
+        use crate::worker::UiEvent;
+        let _guard = crate::interrupt::test_guard();
+        crate::interrupt::clear();
+        let root = crate::downloader::tests::tempdir();
+        let remote = crate::remote::control::RemoteState::test_bridge();
+        let events = remote.bus.subscribe();
+        let mut last = None;
+        let mut last_poll = None;
+        let mut state = a_state("e", Phase::Downloading);
+        crate::downloader::write_state_in(&root, &state).unwrap();
+        publish_wait_downloads(&root, &remote, &mut last, &mut last_poll, false);
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            UiEvent::Downloads(_)
+        ));
+        publish_wait_downloads(&root, &remote, &mut last, &mut last_poll, true);
+        assert!(events.try_recv().is_err());
+        state.done_bytes = 6;
+        crate::downloader::write_state_in(&root, &state).unwrap();
+        last_poll = Some(Instant::now());
+        publish_wait_downloads(&root, &remote, &mut last, &mut last_poll, false);
+        assert!(events.try_recv().is_err());
+        publish_wait_downloads(&root, &remote, &mut last, &mut last_poll, true);
+        assert!(
+            matches!(events.try_recv().unwrap().event, UiEvent::Downloads(snapshot) if snapshot.state.as_ref().is_some_and(|state| state.done_bytes == 6))
+        );
+        // A file where the downloads directory must be makes cancellation fail.
+        std::fs::remove_dir_all(crate::manifest::downloads_dir_in(&root)).unwrap();
+        std::fs::write(crate::manifest::downloads_dir_in(&root), "blocked").unwrap();
+        let set = EngineId::new("e").unwrap();
+        let question = crate::ui::RemoteQuestion::open(
+            &remote.shared,
+            Some(&remote.bus),
+            &download_question(set),
+        );
+        let UiEvent::Question(wire) = events.try_recv().unwrap().event else {
+            panic!("missing question")
+        };
+        let id = wire["id"].as_str().unwrap();
+        assert!(remote.shared.questions.answer(id, "2"));
+        assert!(wait_remote(&root, set, &remote, &question).is_err());
+        drop(question);
+        assert!(!remote.shared.questions.answer(id, "2"));
+        assert!(
+            events.try_iter().any(
+                |event| matches!(event.event, UiEvent::QuestionDone { id: done } if done == id)
+            )
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn two_role_catalog() -> crate::engines::Catalog {
         let mut w = Vec::new();

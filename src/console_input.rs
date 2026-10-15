@@ -20,14 +20,24 @@ use serde_json::Value;
 // Match the daemon's escaped-document frame bound; cap preserved input separately.
 const FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const BATCH_BYTES: usize = 4 * 1024 * 1024;
+// An incomplete UTF-8 scalar retains at most three bytes between reads.
+const UTF8_TAIL_BYTES: usize = 3;
 const PENDING_BYTES: usize = BATCH_BYTES;
 const PENDING_COUNT: usize = 64;
+// Match the terminal aside FIFO depth, without displacing previously accepted questions.
+const ASIDE_COUNT: usize = 20;
+const ASIDE_BYTES: usize = 64 * 1024;
+// Two crossed-cell pointer samples fit even on the largest supported grid.
+const FRAME_INPUT_COUNT: usize = 512;
 pub(crate) mod output;
 
 #[derive(Debug, Default)]
 struct Inbox {
+    live: VecDeque<crate::livecontrol::LiveControl>,
     prompts: VecDeque<String>,
     bytes: usize,
+    asides: VecDeque<String>,
+    aside_bytes: usize,
     fragment: String,
     eof: bool,
     dialogs: VecDeque<String>,
@@ -36,18 +46,20 @@ struct Inbox {
 
 impl Inbox {
     fn feed(&mut self, bytes: &[u8], id: Option<&str>) -> Result<Vec<Value>, String> {
-        if self.utf8.len().saturating_add(bytes.len()) > BATCH_BYTES {
+        if bytes.len() > BATCH_BYTES || self.utf8.len() > UTF8_TAIL_BYTES {
             return Err("Console input batch exceeds 4 MiB".into());
         }
         self.utf8.extend_from_slice(bytes);
-        if let Err(error) = std::str::from_utf8(&self.utf8) {
-            if error.error_len().is_none() && !self.eof {
-                return Ok(Vec::new());
-            }
-            return Err("Console input contains invalid or incomplete UTF-8".into());
-        }
-        let batch =
-            String::from_utf8(std::mem::take(&mut self.utf8)).map_err(|error| error.to_string())?;
+        let valid = match std::str::from_utf8(&self.utf8) {
+            Ok(_) => self.utf8.len(),
+            Err(error) if error.error_len().is_none() && !self.eof => error.valid_up_to(),
+            Err(_) => return Err("Console input contains invalid or incomplete UTF-8".into()),
+        };
+        // Route the valid prefix now. Retaining an entire batch for one split
+        // scalar would make the next bounded read exceed the scratch limit.
+        let tail = self.utf8.split_off(valid);
+        let batch = String::from_utf8(std::mem::replace(&mut self.utf8, tail))
+            .map_err(|error| error.to_string())?;
         self.route(&batch, id)
     }
     fn push(&mut self, prompt: String) -> Result<(), String> {
@@ -55,7 +67,11 @@ impl Inbox {
             return Ok(());
         }
         if self.prompts.len() >= PENDING_COUNT
-            || self.bytes.saturating_add(prompt.len()) > PENDING_BYTES
+            || self
+                .bytes
+                .saturating_add(self.aside_bytes)
+                .saturating_add(prompt.len())
+                > PENDING_BYTES
         {
             return Err("Console pending input limit exceeded".into());
         }
@@ -65,7 +81,7 @@ impl Inbox {
     }
 
     fn route(&mut self, batch: &str, id: Option<&str>) -> Result<Vec<Value>, String> {
-        if batch.len() > PENDING_BYTES {
+        if batch.len() > BATCH_BYTES + UTF8_TAIL_BYTES {
             return Err("Console input batch exceeds 4 MiB".into());
         }
         let mut replies = Vec::new();
@@ -101,6 +117,79 @@ impl Inbox {
         replies: &mut Vec<Value>,
     ) -> Result<(), String> {
         let value = serde_json::from_str::<Value>(frame).ok();
+        if let Some(value) = value
+            .as_ref()
+            .filter(|value| value["type"] == "live_control")
+        {
+            let control = serde_json::from_value(value["request"].clone())
+                .map_err(|_| "Invalid live control")?;
+            if self.live.len() >= PENDING_COUNT {
+                return Err("Live control queue is full".into());
+            }
+            self.live.push_back(control);
+            return Ok(());
+        }
+        if value.is_none() && frame.contains("\"type\"") && frame.contains("\"live_control\"") {
+            return Err("Malformed live control frame".into());
+        }
+        if value
+            .as_ref()
+            .is_some_and(|value| value["type"] == "prompt")
+        {
+            self.push(std::mem::take(prompt))?;
+            let text = value
+                .as_ref()
+                .and_then(|value| value["text"].as_str())
+                .ok_or("Console prompt requires text")?;
+            // Treat the body as opaque input, never recursively as a dialog,
+            // frame control or side question, even when it resembles JSON.
+            self.push(text.into())?;
+            return Ok(());
+        }
+        if value.is_none() && frame.contains("\"type\"") && frame.contains("\"prompt\"") {
+            return Err("Malformed console prompt frame".into());
+        }
+        if value
+            .as_ref()
+            .is_some_and(|value| value["type"] == "frame_input")
+        {
+            self.push(std::mem::take(prompt))?;
+            if let Some(value) = value.filter(|value| id.is_some() && value["id"].as_str() == id) {
+                if replies.len() >= FRAME_INPUT_COUNT {
+                    return Err("Console frame input batch is full".into());
+                }
+                replies.push(value);
+            }
+            return Ok(());
+        }
+        if value.is_none() && frame.contains("\"type\"") && frame.contains("\"frame_input\"") {
+            return Err("Malformed console frame input".into());
+        }
+        if value.as_ref().is_some_and(|value| value["type"] == "btw") {
+            self.push(std::mem::take(prompt))?;
+            let question = value
+                .as_ref()
+                .and_then(|value| value["text"].as_str())
+                .ok_or("Console side question requires text")?;
+            if question.trim().is_empty() || question.len() > ASIDE_BYTES {
+                return Err("Console side question must contain 1–65536 bytes of text".into());
+            }
+            if self.asides.len() >= ASIDE_COUNT
+                || self
+                    .bytes
+                    .saturating_add(self.aside_bytes)
+                    .saturating_add(question.len())
+                    > PENDING_BYTES
+            {
+                return Err("Console side question queue is full".into());
+            }
+            self.aside_bytes += question.len();
+            self.asides.push_back(question.into());
+            return Ok(());
+        }
+        if value.is_none() && frame.contains("\"type\"") && frame.contains("\"btw\"") {
+            return Err("Malformed console side question frame".into());
+        }
         let known_id = id
             .into_iter()
             .chain(self.dialogs.iter().map(String::as_str))
@@ -133,11 +222,24 @@ impl Inbox {
         self.bytes -= prompt.len();
         Some(prompt)
     }
+
+    fn pop_aside(&mut self) -> Option<String> {
+        let question = self.asides.pop_front()?;
+        self.aside_bytes -= question.len();
+        Some(question)
+    }
+
+    fn pop_input(&mut self) -> Option<String> {
+        self.pop_aside()
+            .map(|question| format!("/btw {question}"))
+            .or_else(|| self.pop())
+    }
 }
 
 /// Owns pending stdin and the optional bridge for one console agent.
 #[derive(Default)]
 pub(crate) struct ConsoleInput {
+    controls: Mutex<Option<Value>>,
     inbox: Mutex<Inbox>,
     remote: Mutex<Option<Arc<RemoteState>>>,
     questions: Questions,
@@ -253,6 +355,7 @@ impl std::fmt::Debug for ConsoleInput {
         let inbox = self.inbox.lock().expect("console inbox poisoned");
         f.debug_struct("ConsoleInput")
             .field("pending", &inbox.prompts.len())
+            .field("pending_asides", &inbox.asides.len())
             .field("eof", &inbox.eof)
             .finish_non_exhaustive()
     }
@@ -397,7 +500,7 @@ impl ConsoleInput {
             })
     }
 
-    fn remote(&self) -> Option<Arc<RemoteState>> {
+    pub(crate) fn remote(&self) -> Option<Arc<RemoteState>> {
         self.remote.lock().expect("console bridge poisoned").clone()
     }
 
@@ -407,7 +510,37 @@ impl ConsoleInput {
 
     pub(crate) fn has_pending(&self) -> bool {
         let inbox = self.inbox.lock().expect("console inbox poisoned");
-        !inbox.prompts.is_empty() || !inbox.fragment.is_empty() || !inbox.utf8.is_empty()
+        !inbox.prompts.is_empty()
+            || !inbox.asides.is_empty()
+            || !inbox.fragment.is_empty()
+            || !inbox.utf8.is_empty()
+    }
+
+    /// Polls owned input without consuming ordinary prompts or dialog replies.
+    pub(crate) fn poll_asides(
+        &self,
+        mut read: impl FnMut(&mut bool) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<(), String> {
+        if !self.eof() {
+            self.read(None, &mut read)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_asides(&self) -> bool {
+        !self
+            .inbox
+            .lock()
+            .expect("console inbox poisoned")
+            .asides
+            .is_empty()
+    }
+
+    pub(crate) fn pop_aside(&self) -> Option<String> {
+        self.inbox
+            .lock()
+            .expect("console inbox poisoned")
+            .pop_aside()
     }
 
     fn read(
@@ -419,7 +552,62 @@ impl ConsoleInput {
         let batch = read(&mut eof)?;
         let mut inbox = self.inbox.lock().expect("console inbox poisoned");
         inbox.eof |= eof;
-        inbox.feed(batch.as_deref().unwrap_or(&[]), id)
+        let replies = inbox.feed(batch.as_deref().unwrap_or(&[]), id)?;
+        let live = std::mem::take(&mut inbox.live);
+        drop(inbox);
+        for control in live {
+            self.apply_live_control(control);
+        }
+        Ok(replies)
+    }
+
+    pub(crate) fn remember_controls(&self, value: &Value) {
+        let mut controls = self.controls.lock().expect("console controls poisoned");
+        if controls.as_ref() != Some(value) {
+            *controls = Some(value.clone());
+        }
+    }
+
+    fn apply_live_control(&self, control: crate::livecontrol::LiveControl) {
+        let reply = crate::ui::apply_live_control(control);
+        let mut cache = self.controls.lock().expect("console controls poisoned");
+        if let Some(controls) = &mut *cache {
+            crate::ui::refresh_live_settings(controls);
+            if crate::ui::gui_protocol_enabled() {
+                eprintln!("+PLANK_CONTROLS {controls}");
+            }
+            if let Some(remote) = self.remote() {
+                remote
+                    .bus
+                    .broadcast(crate::worker::UiEvent::Controls(controls.clone()));
+            }
+        }
+        drop(cache);
+        eprintln!("{reply}");
+        if let Some(remote) = self.remote() {
+            remote.bus.broadcast(crate::worker::UiEvent::Dim(reply));
+        }
+    }
+
+    /// Polls frame controls while preserving ordinary prompts and side questions.
+    pub(crate) fn frame_inputs(
+        &self,
+        id: &str,
+        mut read: impl FnMut(&mut bool) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<Vec<crate::guiframe::Request>, String> {
+        self.read(Some(id), &mut read)?
+            .into_iter()
+            .filter(|value| value["type"] == "frame_input")
+            .map(|value| {
+                let request: crate::guiframe::Request =
+                    serde_json::from_value(value).map_err(|e| e.to_string())?;
+                if request.is_valid() {
+                    Ok(request)
+                } else {
+                    Err("Invalid frame input".into())
+                }
+            })
+            .collect()
     }
 
     /// Returns preserved input before reading; stale replies never become prompts.
@@ -427,13 +615,22 @@ impl ConsoleInput {
         &self,
         mut read: impl FnMut(&mut bool) -> Result<Option<Vec<u8>>, String>,
     ) -> Result<Option<String>, String> {
-        if let Some(prompt) = self.inbox.lock().expect("console inbox poisoned").pop() {
+        if let Some(prompt) = self
+            .inbox
+            .lock()
+            .expect("console inbox poisoned")
+            .pop_input()
+        {
             return Ok(Some(prompt));
         }
         if !self.eof() {
             self.read(None, &mut read)?;
         }
-        Ok(self.inbox.lock().expect("console inbox poisoned").pop())
+        Ok(self
+            .inbox
+            .lock()
+            .expect("console inbox poisoned")
+            .pop_input())
     }
 
     /// Opens one question identity for local and authenticated remote replies.
@@ -482,10 +679,25 @@ impl ConsoleInput {
         gui: bool,
         mut read: impl FnMut(&mut bool) -> Result<Option<Vec<u8>>, String>,
     ) -> Result<Option<String>, String> {
-        if text.len() > crate::remote::editors::DOCUMENT_BYTES {
-            return Err("Document exceeds the 256 KiB editing limit".into());
-        }
         let remote = self.remote();
+        let streaming = gui
+            && std::env::var_os("PLANK_GUI_EDITOR_STREAM").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+        let limit = if streaming {
+            crate::documenttransfer::DOCUMENT_BYTES
+        } else {
+            remote
+                .as_ref()
+                .map_or(crate::remote::editors::DOCUMENT_BYTES, |remote| {
+                    remote.editor_limit()
+                })
+        };
+        if text.len() > limit {
+            return Err(format!(
+                "Document exceeds this client's {} KiB editing limit",
+                limit / 1024
+            ));
+        }
         let editors = remote
             .as_ref()
             .map_or(&self.editors, |remote| &remote.shared.editors);
@@ -559,7 +771,7 @@ impl Slot<'_> {
                 .is_some_and(|answer| questions.answer(id, answer)),
             Self::Editor(editors) => value
                 .get("text")
-                .is_some_and(|text| editors.reply(id, text)),
+                .is_some_and(|text| editors.reply_console(id, text)),
         }
     }
     fn take(&self, id: &str) -> Option<Reply> {
@@ -591,15 +803,38 @@ impl Dialog<'_> {
             Slot::Editor(_) => "EDITOR",
         };
         if self.gui {
-            eprintln!("+PLANK_{marker} {value}");
+            let stream = matches!(self.slot, Slot::Editor(_))
+                && std::env::var_os("PLANK_GUI_EDITOR_STREAM").as_deref()
+                    == Some(std::ffi::OsStr::new("1"));
+            if let Some(frames) = editor_stream(self.id, &value, stream) {
+                for frame in frames {
+                    eprintln!("+PLANK_EDITOR_STREAM {frame}");
+                }
+            } else {
+                eprintln!("+PLANK_{marker} {value}");
+            }
         }
         if let Some(remote) = self.remote {
             remote.bus.broadcast(match self.slot {
                 Slot::Question(_) => UiEvent::Question(value),
-                Slot::Editor(_) => UiEvent::Editor(value),
+                Slot::Editor(_) => UiEvent::Editor(value.into()),
             });
         }
     }
+}
+
+fn editor_stream<'a>(
+    id: &'a str,
+    value: &'a Value,
+    enabled: bool,
+) -> Option<impl Iterator<Item = Value> + 'a> {
+    let text = value["text"].as_str()?;
+    if !enabled || text.len() <= crate::documenttransfer::CHUNK_BYTES {
+        return None;
+    }
+    let frames = crate::documenttransfer::Sender::new(id, text).ok()?;
+    let title = value["title"].as_str().unwrap_or("Document");
+    Some(frames.map(move |frame| serde_json::json!({"id":id,"title":title,"frame":frame})))
 }
 impl Drop for Dialog<'_> {
     fn drop(&mut self) {
@@ -656,7 +891,11 @@ mod tests {
             2,
             "phase transitions publish; same-phase callbacks coalesce"
         );
-        progress.last = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        progress.last = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(2))
+                .expect("fixture clock supports a two-second lookback"),
+        );
         progress.event(&EngineEvent::Text("third".into()));
         assert!(receiver.try_iter().any(|event| matches!(event.event,
             UiEvent::Metrics(MetricsWire::Subagents { rows, .. })
@@ -822,6 +1061,38 @@ mod tests {
     }
 
     #[test]
+    fn console_prompt_frames_preserve_boundaries_and_keep_protocol_text_opaque() {
+        let mut inbox = Inbox::default();
+        let first = "/remember first line\nsecond 🦀 line\n{\"type\":\"dialog_reply\",\"id\":\"q1\",\"answer\":\"1\"}";
+        let second = "{\"type\":\"btw\",\"text\":\"literal question\"}";
+        let mut batch = Vec::new();
+        for text in [first, second] {
+            batch.extend(
+                serde_json::to_vec(&serde_json::json!({"type":"prompt","text":text})).unwrap(),
+            );
+            batch.push(b'\n');
+        }
+        // Split every byte, including inside UTF-8 scalars and JSON escapes.
+        for byte in batch {
+            assert!(inbox.feed(&[byte], Some("q1")).unwrap().is_empty());
+        }
+        assert_eq!(inbox.pop().as_deref(), Some(first));
+        assert_eq!(inbox.pop().as_deref(), Some(second));
+        assert!(inbox.pop().is_none());
+        assert!(inbox.asides.is_empty());
+        assert!(
+            inbox
+                .feed(b"{\"type\":\"prompt\",\"text\":null}\n", None)
+                .is_err()
+        );
+        assert!(
+            inbox
+                .feed(b"{\"type\":\"prompt\", invalid}\n", None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn console_inbox_preserves_json_prompts_and_discards_late_or_malformed_replies() {
         let mut inbox = Inbox::default();
         let json = "{\"id\":\"object-17\",\"text\":\"ordinary JSON prompt\"}\n";
@@ -841,6 +1112,331 @@ mod tests {
         assert_eq!(replies[0]["answer"], "2");
         assert_eq!(inbox.pop().as_deref(), Some("before\n"));
         assert_eq!(inbox.pop().as_deref(), Some("after\n"));
+    }
+
+    #[test]
+    fn console_live_frames_are_bounded_and_never_become_prompts_or_dialog_replies() {
+        let mut inbox = Inbox::default();
+        let frame = serde_json::to_vec(&serde_json::json!({"type":"live_control","request":{"control":"micro_compaction","enabled":false}})).unwrap();
+        for byte in frame.iter().copied().chain(*b"\n") {
+            assert!(inbox.feed(&[byte], Some("q1")).unwrap().is_empty());
+        }
+        assert_eq!(
+            inbox.live.pop_front(),
+            Some(crate::livecontrol::LiveControl::MicroCompaction(false))
+        );
+        assert!(inbox.pop().is_none());
+        assert!(inbox.asides.is_empty());
+        for invalid in [
+            "{\"type\":\"live_control\", broken}\n",
+            "{\"type\":\"live_control\",\"request\":{\"control\":\"quit\",\"enabled\":true}}\n",
+            "{\"type\":\"live_control\",\"request\":{\"control\":\"loop_guard\",\"enabled\":\"off\"}}\n",
+        ] {
+            assert!(inbox.feed(invalid.as_bytes(), None).is_err());
+        }
+        assert!(inbox.pop().is_none());
+        let mut batch = frame;
+        batch.push(b'\n');
+        for _ in 0..PENDING_COUNT {
+            inbox.feed(&batch, None).unwrap();
+        }
+        assert!(inbox.feed(&batch, None).is_err());
+        assert_eq!(inbox.live.len(), PENDING_COUNT);
+    }
+
+    #[test]
+    fn console_side_questions_keep_fragmented_unicode_out_of_main_input() {
+        let input = ConsoleInput::default();
+        let question = "Explain 🦀.\nThen say why.";
+        let frame = format!("{}\n", serde_json::json!({"type":"btw","text":question}));
+        let split = frame
+            .as_bytes()
+            .windows(4)
+            .position(|bytes| bytes == "🦀".as_bytes())
+            .unwrap()
+            + 1;
+        let mut reads = VecDeque::from([
+            Some(frame.as_bytes()[..split].to_vec()),
+            None,
+            Some(frame.as_bytes()[split..].to_vec()),
+        ]);
+        assert!(
+            input
+                .prompt(|_| Ok(reads.pop_front().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            input
+                .prompt(|_| Ok(reads.pop_front().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            input.prompt(|_| Ok(reads.pop_front().unwrap())).unwrap(),
+            Some(format!("/btw {question}"))
+        );
+        assert!(!input.has_pending());
+        assert!(input.inbox.lock().unwrap().prompts.is_empty());
+    }
+
+    #[test]
+    fn graphical_frame_inputs_reject_stale_and_malformed_controls_without_creating_model_prompts() {
+        let mut inbox = Inbox::default();
+        let bytes = b"{\"type\":\"frame_input\",\"id\":\"old\",\"event\":\"close\"}\n{\"type\":\"frame_input\",\"id\":\"current\",\"event\":\"key\",\"code\":\"a\",\"text\":\"a\"}\n";
+        let replies = inbox.feed(bytes, Some("current")).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert!(inbox.pop().is_none());
+        assert!(
+            inbox
+                .feed(b"{\"type\":\"frame_input\",broken}\n", None)
+                .is_err()
+        );
+        assert!(inbox.pop().is_none());
+        assert!(inbox.feed(bytes, None).unwrap().is_empty());
+        assert!(inbox.pop().is_none());
+    }
+
+    #[test]
+    fn console_side_questions_survive_editor_replies_without_answering_the_dialog() {
+        let input = ConsoleInput::default();
+        let batch = format!(
+            "ordinary prompt\n{}\n{}\n",
+            serde_json::json!({"type":"btw","text":"secret side question"}),
+            serde_json::json!({"type":"dialog_reply","id":"e1","text":"edited"})
+        );
+        let mut reads = VecDeque::from([Some(batch.into_bytes())]);
+        assert_eq!(
+            input
+                .edit("e1", "Editor", "original", false, |_| Ok(reads
+                    .pop_front()
+                    .expect("the matching reply must finish the editor")))
+                .unwrap()
+                .as_deref(),
+            Some("edited")
+        );
+        let debug = format!("{input:?}");
+        assert!(debug.contains("pending_asides: 1"));
+        assert!(!debug.contains("secret side question"));
+        assert_eq!(
+            input
+                .prompt(|_| panic!("aside is already buffered"))
+                .unwrap()
+                .as_deref(),
+            Some("/btw secret side question")
+        );
+        assert_eq!(
+            input
+                .prompt(|_| panic!("main input must be preserved"))
+                .unwrap()
+                .as_deref(),
+            Some("ordinary prompt\n")
+        );
+        assert!(!input.has_pending());
+    }
+
+    #[test]
+    fn console_side_question_limits_refuse_overflow_without_evicting_accepted_questions() {
+        let mut inbox = Inbox::default();
+        for index in 0..ASIDE_COUNT {
+            let frame = format!(
+                "{}\n",
+                serde_json::json!({"type":"btw","text":format!("question {index}")})
+            );
+            inbox.feed(frame.as_bytes(), None).unwrap();
+        }
+        let extra = b"{\"type\":\"btw\",\"text\":\"extra\"}\n";
+        assert!(inbox.feed(extra, None).is_err());
+        for index in 0..ASIDE_COUNT {
+            assert_eq!(inbox.pop_aside(), Some(format!("question {index}")));
+        }
+        assert_eq!(inbox.aside_bytes, 0);
+        assert!(inbox.prompts.is_empty());
+        inbox.feed(extra, None).unwrap();
+        assert_eq!(inbox.pop_aside().as_deref(), Some("extra"));
+        for text in [String::new(), " ".to_owned(), "x".repeat(ASIDE_BYTES + 1)] {
+            let frame = format!("{}\n", serde_json::json!({"type":"btw","text":text}));
+            assert!(inbox.feed(frame.as_bytes(), None).is_err());
+        }
+        for frame in [
+            b"{\"type\":\"btw\",\"text\":false}\n".as_slice(),
+            b"{\"type\":\"btw\",bad}\n",
+        ] {
+            assert!(inbox.feed(frame, None).is_err());
+        }
+        assert!(inbox.prompts.is_empty());
+        assert!(inbox.asides.is_empty());
+        inbox.push("p".repeat(PENDING_BYTES)).unwrap();
+        assert!(inbox.feed(extra, None).is_err());
+        assert_eq!(inbox.pop().unwrap().len(), PENDING_BYTES);
+    }
+
+    #[test]
+    fn console_editor_opening_protocol_requires_explicit_gui_client_opt_in() {
+        for enabled in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "console_input::tests::console_editor_opening_wire_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PLANK_EDITOR_OPEN_FIXTURE", "1");
+            if enabled {
+                command.env("PLANK_GUI_EDITOR_STREAM", "1");
+            } else {
+                command.env_remove("PLANK_GUI_EDITOR_STREAM");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let streamed = stderr
+                .lines()
+                .filter(|line| line.starts_with("+PLANK_EDITOR_STREAM "))
+                .count();
+            let inline = stderr
+                .lines()
+                .filter(|line| line.starts_with("+PLANK_EDITOR "))
+                .count();
+            assert!(if enabled {
+                streamed > 3 && inline == 0
+            } else {
+                streamed == 0 && inline == 1
+            });
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.starts_with("+PLANK_EDITOR_DONE "))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated graphical protocol fixture invoked by its parent test"]
+    fn console_editor_opening_wire_fixture() {
+        if std::env::var_os("PLANK_EDITOR_OPEN_FIXTURE").is_none() {
+            return;
+        }
+        let input = ConsoleInput::default();
+        let text = "\u{0}🦀\\\r\n".repeat(20_000);
+        assert!(
+            input
+                .edit("e1", "Document", &text, true, |eof| {
+                    *eof = true;
+                    Ok(None)
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn console_editor_opening_streams_require_opt_in_and_preserve_bounded_text() {
+        let text = "\u{0}🦀\\\r\n".repeat(20_000);
+        let value = serde_json::json!({"id":"e1","title":"\u{0}".repeat(4096),"text":text});
+        assert!(editor_stream("e1", &value, false).is_none());
+        assert!(editor_stream("e1", &serde_json::json!({"text":"small"}), true).is_none());
+        let mut receiver = crate::documenttransfer::Receiver::default();
+        let mut complete = None;
+        for value in editor_stream("e1", &value, true).unwrap() {
+            assert_eq!(value["id"], "e1");
+            assert!(value.to_string().len() < crate::documenttransfer::CHUNK_BYTES * 6 + 32 * 1024);
+            let frame = serde_json::from_value(value["frame"].clone()).unwrap();
+            complete = receiver.accept(&frame).unwrap();
+        }
+        assert!(
+            complete.as_deref().is_some_and(|actual| actual == text),
+            "Opening must preserve all document bytes"
+        );
+    }
+
+    #[test]
+    fn console_unicode_carry_does_not_retain_or_overflow_a_complete_batch() {
+        let mut inbox = Inbox::default();
+        let mut prefix = br#"{"type":"dialog_reply","id":"e1","text":""#.to_vec();
+        prefix.push("🦀".as_bytes()[0]);
+        assert!(inbox.feed(&prefix, Some("e1")).unwrap().is_empty());
+        assert_eq!(inbox.utf8.len(), 1);
+        let mut batch = "🦀".as_bytes()[1..].to_vec();
+        batch.extend_from_slice(b"\"}\n");
+        // Three legal prompt frames fill the next read exactly. A carried
+        // scalar may make its decoded prefix a few bytes larger than the read.
+        for index in 0..3 {
+            let empty = serde_json::json!({"type":"prompt","text":""}).to_string();
+            let text_bytes = if index < 2 {
+                BATCH_BYTES / 3
+            } else {
+                BATCH_BYTES - batch.len() - empty.len() - 1
+            };
+            let frame = serde_json::json!({"type":"prompt","text":"x".repeat(text_bytes)});
+            batch.extend_from_slice(frame.to_string().as_bytes());
+            batch.push(b'\n');
+        }
+        assert_eq!(batch.len(), BATCH_BYTES);
+        let replies = inbox.feed(&batch, Some("e1")).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["text"], "🦀");
+        assert!(inbox.utf8.is_empty());
+        assert_eq!(inbox.prompts.len(), 3);
+    }
+
+    #[test]
+    fn console_editor_streams_preserve_fragmented_unicode_and_queued_prompts() {
+        let input = ConsoleInput::default();
+        let text = "🦀\r\n\"\\".repeat(100_000);
+        let mut reads = VecDeque::new();
+        for frame in crate::documenttransfer::Sender::new("save-1", &text).unwrap() {
+            let mut bytes = wire("e1", "text", serde_json::to_value(frame).unwrap());
+            if matches!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["text"]["operation"].as_str(),
+                Some("end")
+            ) {
+                bytes.extend_from_slice(b"queued prompt\n");
+            }
+            reads.extend(bytes.chunks(997).map(|bytes| Some(bytes.to_vec())));
+        }
+        let edited = input
+            .edit("e1", "Document", "initial", false, |_| {
+                Ok(reads
+                    .pop_front()
+                    .expect("only a complete End may resolve the editor"))
+            })
+            .unwrap();
+        assert_eq!(edited.as_deref(), Some(text.as_str()));
+        assert_eq!(
+            input
+                .prompt(|_| panic!("prompt must remain queued"))
+                .unwrap()
+                .as_deref(),
+            Some("queued prompt\n")
+        );
+        assert!(!input.has_pending());
+    }
+
+    #[test]
+    fn console_editor_streams_never_save_on_eof_before_completion() {
+        let input = ConsoleInput::default();
+        let mut frames =
+            crate::documenttransfer::Sender::new("partial", "unsaved document").unwrap();
+        let mut bytes = Vec::new();
+        for frame in frames.by_ref().take(2) {
+            bytes.extend_from_slice(&wire("e1", "text", serde_json::to_value(frame).unwrap()));
+        }
+        let mut batch = Some(bytes);
+        let edited = input
+            .edit("e1", "Document", "initial", false, |eof| {
+                if batch.is_none() {
+                    *eof = true;
+                }
+                Ok(batch.take())
+            })
+            .unwrap();
+        assert!(edited.is_none());
+        let end = serde_json::to_value(frames.next().unwrap()).unwrap();
+        assert!(!input.editors.reply_console("e1", &end));
     }
 
     #[test]

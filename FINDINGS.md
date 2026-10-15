@@ -19,6 +19,184 @@ test` and review the diff before committing.
 
 ## Part 1 — Wire-format and parity nuances
 
+- **Graphical editor opening needs an explicit client opt-in.** With
+  `PLANK_GUI_EDITOR_STREAM=1`, documents over one chunk emit bounded
+  `+PLANK_EDITOR_STREAM` frames with editor metadata and a checksummed
+  begin/chunk/end transfer. Keep ordinary `+PLANK_EDITOR` requests for small
+  documents and older clients. Remote publication retains its existing format.
+  Consumers must wait for End before exposing a form, discard partial transfers
+  on dialog/context retirement, and include JSON escaping of titles in frame
+  bounds. `console_editor_opening_` verifies opt-in behavior in an isolated process.
+
+- **Chunked editor Saves belong to a controller grant, not just a socket ID.**
+  Remote `edit.text` retains its inline string/null form for old clients, and
+  accepts typed begin/chunk/end objects for negotiated `editor_stream_save`.
+  Completion requires contiguous UTF-8 offsets, bounded chunks, the announced
+  length and SHA-256. Bind the receiver to `ControlStamp`: release/regrant of
+  the same socket must not let it finish an earlier partial Save. Partial data
+  never becomes an accepted editor reply; cancellation and identity replacement
+  discard it. `documenttransfer::tests` and `remote_editors_` cover these paths.
+  Console replies use the same receiver with a separate pipe-owned writer;
+  chunks from a remote grant cannot finish a console attempt or vice versa.
+  Console EOF before End must cancel rather than accept partial text.
+  The console's 4 MiB limit applies to each read batch, not the continuous
+  transfer. Stop reads at that bound without consuming the next batch. Route
+  complete UTF-8 prefixes immediately and retain only the trailing incomplete
+  scalar; otherwise the next full batch overflows the scratch buffer. The real
+  `console_dialog_stream_pipe` fixture crosses the batch limit with escaped
+  Unicode, while the inbox carry regression forces a split scalar boundary.
+
+- **Graphical completion delivery needs an explicit client opt-in.** A GUI
+  daemon that sets `PLANK_GUI_NOTIFICATIONS=1` receives `+PLANK_NOTIFY` events
+  and delivers banners using its own window focus. The engine must skip its
+  terminal notifier in this mode, or the same completion produces two banners.
+  Without opt-in, retain the old terminal delivery path so older GUI consumers
+  do not log an unknown marker or silently lose notifications. Notification-mode
+  controls use their own typed `mode` field; legacy boolean frames retain
+  the same `control`/`enabled` JSON shape.
+
+- **Forks and rollbacks are conversation-replacement boundaries for viewers.**
+  Rewinding only the engine leaves graphical clients' dialogs, exports and
+  remote replay attached to discarded context. Publish the shared reset before
+  bounded retained-history replay, then republish the engine's task state.
+  Preserve checkpoints and off-path branches, and re-arm the hints instruction
+  without changing the user's preference. Tree rendering must stop a linear run
+  at an active interior cursor; otherwise the discarded tail appears active
+  until the next prompt. `history_rewind` and `branch::tests` cover both cases.
+
+- **A graphical host's buddy needs its own remote observer cursor.** Sending
+  PNG telemetry only to local stderr leaves attached clients empty, and using
+  the local focus lease freezes them when the host window loses focus. Poll
+  the original player into the existing remote slot while subscribers exist,
+  include it in the idle tick decision, and dismiss its cursor around turns.
+  Dismissal must reset frame identity so a static image returns afterward.
+
+- **Saved-session history must follow the remote reset boundary.** Printing
+  `/resume` or `/switch` history before adopting the session lets the subsequent
+  reset discard it from remote replay. The shared adoption path now mirrors
+  recent history after reset, in bounded Unicode-safe chunks. Plain-console
+  callers print locally without rebroadcasting it. This preserves one history
+  rendering for live and reconnecting viewers across both front ends.
+
+- **Graphical prompts need an opaque envelope.** Raw multiline input depends
+  on read batching, and a line shaped like a dialog or frame message can enter
+  the control dispatcher. The optional `console_prompts` capability selects
+  JSON `{ "type": "prompt", "text": "..." }` frames. Queue the decoded body
+  directly without recursively routing it. Preserve frame boundaries across
+  UTF-8 fragments and multiple frames in one read. Clients must renegotiate
+  after restart and keep raw input for older engines.
+
+- **An explicit console exit needs acknowledgment after cleanup.** A GUI cannot
+  treat every zero-status process exit as an intentional `/quit`: an unexpected
+  engine exit can also return zero. Emit `+PLANK_EXITING` only for an explicit
+  local `/quit` or `/exit`, after session/hook cleanup, and require successful
+  process exit on the receiving side. EOF and failures must retain the existing
+  context-loss behavior. Receivers should drain final output before deciding
+  whether the marker was present.
+
+- **Graphical shell escapes must bypass inference.** The console dispatcher
+  needs the same `!`/`!!` split as the terminal: single bang retains the bounded
+  escaped result for later context, double bang leaves model history untouched.
+  Stream shell output separately, chunk long Unicode lines for remote frames,
+  and poll the owning remote cancellation state. A stop racing shell exit must
+  prevent a GPU handoff or rerun even when the returned exit status requests it.
+
+- **A remote stop must fence goal verdicts and iteration boundaries.** Engine
+  statistics can report success after a controller stops the final callback.
+  Check the owning shared cancellation state after both the work pass and the
+  verdict pass; otherwise an `ATTAINED` verdict can win the race or the goal
+  can increment and start another iteration. Provider cancellation errors must
+  take the same interrupted exit. Goal banners, closing notices and task-state
+  changes need explicit console mirroring, independent of the answer stream.
+
+- **Compaction cancellation is checked after generation, too.** A controller
+  can stop after the last summary callback while the engine returns successful
+  statistics, or the provider can report cancellation as an error. Both cases
+  must discard the summary and keep the original conversation. Plain-console
+  compaction polls its remote shared state as well as local interruption; the
+  TUI checks its supplied stop predicate again before rebuilding. Leave remote
+  cancellation owned by the command dispatcher so completion retires the right
+  request and the next compaction can run normally.
+
+- **Console hosting must exercise the authenticated controller path.** An
+  input-queue fixture alone cannot prove grant handoff or answer routing.
+  Unix socket WebSockets can run the production authentication/mirror loop
+  without binding a TCP listener. The console-host regression sends `/command`,
+  answers a scripted agent's question and confirms local mutation revokes the
+  remote controller. Visible answer fragments must be concatenated before
+  checking content; callback boundaries are not message boundaries. Graphical
+  start actions advertise `console_host` so older clients/engines keep their
+  existing capability gates.
+
+- **Lifecycle hook feedback needs a console output route.** Printing callback
+  warnings alone leaves remote viewers unaware of startup, prompt-submit,
+  compaction, reset and exit failures. Console callbacks capture their remote
+  bus and child-output route before borrowing the agent for hook dispatch;
+  child notices must not leak into the main transcript. A Stop envelope with
+  `continue:false` must also publish its `stopReason` instead of silently
+  discarding it. Shell-backed UI tests cover warnings, explicit stops and
+  the existing one-continuation limit for exit-2 Stop feedback.
+
+- **Following output must not depend on the model's next poll.** A scoped
+  observer reads a bounded UTF-8-aligned tail at most once per second and emits
+  only changed snapshots. Reader-thread liveness supplies stream EOF without
+  reaping the child or consuming its notification. The observer joins before a
+  context-reset event, fencing late updates; page selection and replacement
+  also cancel it. Initial publication precedes worker startup, and read/spawn
+  failure clears live state. Tests exercise live delivery while the agent is
+  not polling, cancellation, read failure, EOF and context-reset ordering.
+
+- **Job tails are not complete output.** `/jobs output <id>` retains its legacy
+  final-32-KiB report, while optional `--page N` reads an owned job's file in
+  bounded windows. Three bytes of overlap align UTF-8 scalars without omissions
+  or duplication between pages; invalid byte sequences use explicit replacement
+  decoding. Snapshots carry validated byte ranges and omit host paths. Paging
+  leaves completion notifications intact. Tests cover long Unicode/binary files,
+  ownership, dispatch, malformed remote ranges and legacy tail behavior.
+
+- **Child history is conversation state, not agent-lifetime state.** Keeping
+  dumps on `Agent` leaked the previous conversation's archive across `/new` or
+  adoption and lost it at engine exit. Archives now live on `Session`, use
+  copy-on-write snapshots, and save as length-framed `sidechain` JSON records.
+  Completion saves only the parent prefix while retaining the child's complete
+  text separately. Console ordinals/mirroring flags are ephemeral and omitted.
+  Save rejects invalid IDs before replacing files; reload enforces monotonic IDs
+  and the eight-run bound. Tests cover adoption, clear, durable retirement,
+  timestamps/Unicode, copies/deletion, failed writes and legacy roundtrips.
+
+- **Completed child histories need independent identities and bounded pages.**
+  Repeated labels and console ordinals do not identify an archived sidechain.
+  `remember_sidechain` now stamps monotonic history IDs before retiring old
+  entries. `/subagent-history` reads the existing eight-run archive without
+  restoring a fork or changing parent messages. Shared page validation bounds
+  Unicode-safe pieces without truncating conversation text; forged selections
+  are refused. Tests cover long text reconstruction, repeated labels, retirement,
+  command dispatch and remote ingestion.
+
+- **Graphical text commitments are frame input, never prompts.** IME and
+  software-keyboard text uses one bounded `text` event (128 Unicode scalars,
+  512 bytes), validated before dispatch. The host emits ordinary guest key
+  calls with each original character and stops immediately on close or trap.
+  Console and mirrored TUI frames share this path; controller/grant retirement
+  drops the whole queued event. Tests cover combining marks, non-Latin text,
+  emoji, invalid input, early termination and a real client worker transport.
+
+- **The `/notify` command must match the notification-mode setting.** Its
+  catalog advertised a mode and settings supported `always`, `unfocused` and
+  `never`, but the command accepted only on/off. The shared command now uses
+  `NotifyMode::parse`, preserves legacy toggling, rejects unknown modes without
+  mutation, and advertises `notify_modes` to graphical clients. Command and
+  console-dispatch tests cover actual policy changes without model prompts.
+
+- **Component settings must be serialized as well as installed.** The generic
+  settings save path previously omitted `plugin_config`, so a valid
+  `/config pluginConfig.<component>.<option>` edit could report success and
+  disappear at restart. `Settings::save_to` now merges the flat `pluginConfig`
+  map into the file, retaining unknown options. Roundtrip tests and an actual
+  scoped command save cover dotted component IDs, invalid-value rejection and
+  continuity of the selected form. Scoped pages filter exact IDs rather than
+  namespace prefixes.
+
 - **Rust `\` string-literal continuation eats leading whitespace.** A
   backslash at the end of a line inside a `"..."` literal skips the newline
   *and all leading whitespace on the next line*. The tools prompt was written
@@ -1063,6 +1241,120 @@ without the model files).
   (`run_turn`, `worker_turn`) now check on each round past the first.
 
 ## Part 2 — Environment & tooling
+
+### Remote replay IDs belong to one server instance
+
+Input completion must capture its kind and retire its pending identity under
+one lock. Reading the command flag and removing it separately lets a racing
+completion emit a second acknowledgement with the wrong kind. Console/TUI exit
+paths must also finish the current command and explicitly reject undispatched
+batch inputs rather than running them after an exit request. Sending `bye`
+before draining the bus loses queued completion frames; detaching connection
+threads still allows exec to discard that drain. The accept loop now owns and
+joins its connection threads, and HTTP-header/auth waits observe shutdown.
+Slow or failed sockets remain best-effort delivery; joining does not prove
+peer receipt. Model-free regressions cover atomic retirement, exit batches,
+wire ordering and connection ownership. Intentional replacement now sends an
+instance-bound `restarting` control frame after draining completion frames and
+before `bye`; it never enters replay. Release/acquire shutdown ordering makes
+the prepared restart flag visible to connection threads. Fence and retire
+waiting inputs before dropping the agent. The daemon clears live context and
+reconnects as an observer, requiring a fresh grant and a different instance
+before replay ingestion; it never resubmits the old command. Same-instance
+handshakes retry within the original deadline. Retry accepts Stop and rejects
+queued input; missing `bye` cannot leave the UI stuck on the old socket.
+Model-free wire/recipe and duplex transport regressions cover these paths and
+startup choice answers. Unix hosts advertise `remote_restart` for the compact
+Choose action. Windows handover and actual engine/TCP/UI verification remain.
+Remote profile saves now offer an explicit restart through that same handover.
+The TUI document router must distinguish an unhandled command from a handled
+command that requests exit; a single boolean formerly hid that distinction.
+Console profile editing must also accept an attached remote editor without the
+local GUI flag. Validate against the original file snapshot before applying,
+then ask whether to restart. Plan the restart only after saving the conversation;
+retain saved profile files if that save fails or the user chooses Later. Check
+sticky identified-input cancellation before and after confirmation and saving,
+so a reset transient flag cannot resurrect a cancelled restart. Model-free
+filesystem tests cover stale/invalid/unchanged edits, explicit confirmation,
+saved conversation restoration, save failure and cancellation. Profile editing
+does not force the engine chooser. Actual engine/TCP/UI verification remains.
+`/rc off` requires a separate dispatch handoff. It was previously refused at
+remote ingress and in the console despite the GUI exposing Stop host. Explicit
+controller stops now fence new input under the policy lock, mirror their result
+and acknowledge before `remote_off` joins the server. Reject and retire later
+accepted batch inputs before closing. A daemon receiving `bye` must not mark a
+completed stop as an uncertain-input failure; clean detach is allowed only
+without active, waiting or queued input. Model-free source and duplex WebSocket
+regressions cover that ordering; actual TCP/UI interaction still needs verification.
+The shared CLI recognizer also lacked the singular `/command` although both UI
+dispatchers and the menu supported it. Keep every advertised command recognized;
+the existing catalog/dispatcher consistency regression caught this gap and then
+the missing `/search`. Built-in recognition now uses the actual advertised
+catalog, including declared argument forms; hidden games and named subagents
+retain their separate recognition rules.
+
+Private restart IPC also needs a real process-boundary test. On this macOS host,
+setting `SO_RCVTIMEO` on the inherited Unix stream returned `EINVAL`; bounded
+nonblocking reads plus `poll` avoid that dependency. The command must own its
+descriptor rather than capture a bare number whose owner can be dropped before
+spawn. Direct exec needs its own failure cleanup, because a failed in-place exec
+can otherwise leave a private descriptor without close-on-exec. The restart
+transport tests cover those cases without binding a TCP listener.
+Capture the recipe before dropping the agent, but exec only after that drop has
+stopped the old listener, model, MCP servers and shell jobs. Replacement startup
+must consume the numeric descriptor before `record_launch`, otherwise a later
+restart would reuse a stale descriptor number. Restore the original port and
+credentials before model loading, and abort on binding failure rather than
+silently losing the endpoint. The listener restoration regression prints an
+explicit skip when the sandbox forbids TCP bind; this is not runtime verification.
+The engine chooser runs before `Agent` exists, so restoring its listener alone
+does not route questions. Pass the restored state explicitly through config
+resolution and use the same paged choice bridge as the GUI. Before an agent owns
+the console inbox, remote-only questions must not consume stdin or queued model
+prompts. Terminal users retain a local question panel, and diagnostics/one-shots
+must never become remote modal waits. The chooser now covers those paths with
+model-free regressions. Managed background-download waits now own the same
+question guard, preserving the terminal wait screen and sending the existing
+bounded download metadata. Leave/decline/interrupt must not write cancellation;
+only an explicit Cancel writes `keep`. Check helper completion before polling
+answers so a late Cancel cannot leave a flag for an already staged job. Close
+the question on success, failure and cancellation-write error. Startup profile
+install/update confirmations now receive the restored state or local GUI mode explicitly, and
+console component offers no longer disappear merely because the GUI protocol
+flag is absent. The structured confirmation starts at No and accepts only a
+matching explicit Yes; queued prompts, empty replies and bare `yes` text cannot
+become consent. Initialize interruption handling before profile resolution,
+and exclude diagnostics/one-shots from remote modal startup. Model-free tests
+cover those rules. Filesystem regressions also exercise actual local-profile
+install/update: decline writes nothing or preserves local edits, approval installs
+the new version, and current/unattended profiles do not ask again. Local GUI
+startup uses its bounded single-reply reader, preserving later prompt bytes.
+Loaded-component trust and actual GUI/remote confirmation flows still need runtime
+verification. Foreground URL transfers now have a private self-worker mode:
+stdin carries a bounded URI/path recipe and remains a parent lifeline, while
+stdout carries bounded size metadata. Killing/reaping the process makes Cancel
+independent of blocked HTTP reads; parent-pipe EOF terminates an orphan too.
+Keep partial files and require a matching positive length before finalization.
+Pre-agent GUI polling must read only through the reply newline, so completion
+cannot steal a later model prompt. A foreground snapshot must override the
+detached-helper file poll, or reconnect can replace live progress with stale
+helper metadata. Retire that override with the owning dialog. Protocol 29 tells
+the GUI which cancel surface owns the operation; helper toolbar actions are
+hidden during a foreground transfer. Real-process/model-free regressions pass;
+actual HTTP and native/browser interaction remain to verify.
+
+`BroadcastBus` starts its sequence counter again when a remote-control server
+is recreated. A client that persists seen IDs by workspace session alone can
+silently discard a new server's output as old replay. Rebuilt servers include
+an optional, independently generated `instance_id` in the authenticated hello;
+it identifies the replay namespace and carries no credential. Clients must bind
+that namespace before ingesting the snapshot, retain deduplication for the same
+instance, and retire stale host metadata when it changes. Keeping history and
+request receipts does not authorize replaying an uncertain input. Legacy hosts
+without this field cannot identify a restart. The nplank daemon covers these
+cases with store-persistence and model-free WebSocket regressions. Unix restart
+capture, private exec transport and early listener restoration are now connected;
+startup question routing and real host/client restart remain separate requirements.
 
 - **libgit2 reports 0 insertions for untracked files.** `DiffStats::insertions`
   treats untracked files as binary blobs, so the status bar showed `+0` for a
@@ -3584,3 +3876,172 @@ turns) ran straight into the next `<｜User｜>`. With two pirate-voice prefix
 turns the model ignored the style; with the EOS and four turns it answered
 "Arr! …". `reconcile` now appends the EOS for the DSML families only: Qwen's
 template closes its own turns.
+
+
+## Graphical HTML opening belongs to the client
+
+A remote or GUI `/open` must not invoke the host's default browser. HTML files
+now use the negotiated complete-file stream with `purpose: preview`, independently
+of conversation exports and Insights reports. Unsupported clients receive an
+explicit error. Reads require a regular UTF-8 file, check the 32 MiB bound before
+and after reading, and use nonblocking open on Unix to reject a raced-in FIFO.
+Plain local CLI/TUI HTML opening keeps its external-browser behavior. Transfers
+are transient and do not put file bodies into transcript or reconnect replay.
+Client/daemon protocol 30 owns a separate Preview descriptor. The client verifies
+length/checksum again and opens an inert sandboxed page only after user action;
+embedded rendering and physical browser/native interaction remain to verify.
+
+
+## Graphical frames must keep their input out of model prompts
+
+The GUI console now drives the existing WASM session and publishes bounded
+character grids. Its `frame_input` records are recognized before ordinary stdin
+routing, including stale/malformed records, and only the current frame identity
+can consume them. Frame reads must use the live read path rather than paste
+joining. Traps, output failures, interruption and EOF always close the component;
+EOF/interruption return failure so a frame editor cannot commit staged changes.
+Close metadata includes the identity even when the first step fails.
+
+The client uses retained toolkit `GameSurface` scenes. Its default keyboard
+normalizer excludes Tab and system chords and loses original typed character
+case, so frame scenes disable that keyboard channel and use a scoped raw handler.
+Pointer hit testing stays with the toolkit. Feedback is batched to avoid one
+bounded-queue UI acknowledgment per pointer sample. Frame bodies are ephemeral;
+the daemon fences generation/identity and retires the surface when the worker
+ends. Remote-host ownership/input and real bundled guest/native/browser/mobile
+verification remain separate work.
+
+
+## Remote frame input must retain its accepting controller grant
+
+Graphical clients opt into `frame_stream` on auth. Live frame snapshots are
+coalesced in `RemoteState`, outside the replay bus; sockets poll the latest
+revision, including an identity-bound close. The frame input FIFO records the
+controller stamp and checks it again when consumed. Releasing and reacquiring
+with the same client id therefore cannot revive queued keys. The old auth JSON
+omits the new option, and old clients receive no new server frame variants.
+
+Remote frame input/rejection must never finish the main identified command.
+The daemon's duplex fixture covers release/reclaim, observer suppression, stale
+identity, frame closure, and matching parent completion. Remote-owned tool
+frames may use inline driving, but local TUI tool frames must keep their original
+bridge even when a graphical observer is connected. Locally opened TUI frames
+now mirror through a lifetime guard shared by idle and tool-lent drivers. The
+guard follows listener changes, closes its wire identity on drop, and assigns a
+new identity for a reopened frame. Local input invalidates queued controller
+keys; hover does not seize control. Remote resize changes the guest viewport
+until local input restores terminal sizing. Oversized terminal grids are clipped
+to the protocol's bounded viewport while preserving glyph styles. Cancellation
+fails the tool-frame handback rather than accepting staged edits. Real guest,
+TCP, native, browser and mobile interaction/writeback remain to verify.
+
+### Graphical arcade keeps the original game state outside model input
+
+The graphical arcade driver borrows the existing cabinet and uses the frame
+inbox, not a second prompt reader. Raw queued prompts retain their newline;
+consuming them as game keys would silently corrupt the next agent input. Close,
+EOF and failed publication park the game and retire its graphical identity.
+The next ordinary command resumes that cabinet; `new` discards the parked game.
+Terminal BEL must stay out of graphical stdout/transcript framing. Sound and
+transcript-veiling toggles therefore remain terminal-only until adapters exist,
+and the graphical footer omits them. TUI idle and busy loops now mirror games
+through the same channel. Starting games during an active graphical-console
+turn and physical native/browser gameplay still need implementation/verification.
+
+Arcade publication has lower priority than editor frames, checked atomically
+under the frame-slot lock. A producer-specific drain leaves a competing editor's
+input queue untouched. Suspending a game for a question/editor and restoring it
+uses a fresh identity. Local hover does not steer a remotely controlled game;
+keys/clicks seize local control and invalidate already queued controller keys.
+
+Latest-only coalescing can skip an entire intervening frame lifetime. If a
+viewer saw A and the host opened/closed B between polls, sending only close(B)
+left A visible forever in identity-fenced clients. Each socket now remembers
+the last identity it sent and closes that identity when the latest slot is empty.
+This preserves stale-close protection without changing the wire protocol.
+
+### Saved search must preserve the complete query
+
+The old `/search` adapter split on the first whitespace and discarded the rest
+unless it was exactly `--all`. The index itself accepts complete phrases.
+Search now strips only a standalone trailing `--all`, retaining every query
+word. A temporary real index verifies that phrase hits stay project-scoped by
+default and broaden only with the explicit option. `phrase_search` advertises
+this behavior so graphical clients can avoid promising phrases on older hosts.
+
+### Output observation must not depend on the agent's stdin polling
+
+The GUI console polls stdin on the agent thread. Putting `/jobs unfollow` in
+that queue cannot stop an observer while inference or a tool blocks that thread.
+The observer now has a fresh opaque identity and an independent cancellation
+registry. Local workers receive an atomically replaced private mailbox through
+`PLANK_GUI_JOB_CONTROL`; remote stops require the authenticated controller under
+the policy lock. Every one-second sample checks cancellation before reading.
+Retiring a view joins its worker before a replacement or context reset publishes.
+An old identity cannot stop a later view of the same job. Cancellation publishes
+stopped state without interrupting inference, terminating the shell or consuming
+the model's completion notification. Initial snapshots publish before spawning,
+and cancellation retries remain idempotent until the observer retires.
+
+### Graphical notification focus must expire independently of prompt polling
+
+The graphical console does not receive terminal focus events. Sending a focus
+command through stdin would also arrive too late while a tool or inference call
+blocks agent polling. Graphical workers now receive `PLANK_GUI_FOCUS_CONTROL`,
+a private mailbox containing only a focus flag and an expiration time. The
+notification gate reads it at delivery time. Missing, malformed, oversized,
+expired or implausibly future packets never suppress a notification. Always
+and Never bypass focus as before; terminal hosts keep their own focus atomic.
+The daemon aggregates per-window, session-generation-scoped viewing leases,
+and refreshes the file independently of prompt input. Both the lease and packet
+expire, covering client disconnect and a stalled or terminated daemon. This
+controls notifications on the local engine host; it does not yet deliver native
+notifications on a remote graphical client's machine.
+
+### Graphical buddies consume original PNGs without terminal escape sequences
+
+The GUI console now reuses the buddy's existing clip scheduler and decoded PNG
+cache instead of emitting kitty placeholders. Its latest-frame cursor coalesces
+unchanged ticks and emits a single clear when hidden; the original terminal
+renderer retains its own placement state. Graphical commands use the shared
+installer and question bridge, and never write kitty escapes to graphical stdout.
+The idle loop samples at the original frame rate, pausing image publication for
+unobserved GUI sessions through the expiring focus mailbox. Frame payloads and
+dimensions are bounded before transport, with complete PNG decoding and bounded
+allocation on the client. Images are transient telemetry rather than replay or
+conversation content. Terminal-host remote mirroring uses a separate,
+negotiated latest-only channel; putting every PNG in the broadcast log would
+retain animation indefinitely and expose old frames during reconnect replay.
+
+Supported terminal hosts now publish through a negotiated `buddy_stream` slot
+outside that log. The cursor reads the PNG actually placed in the completed
+terminal buffer, without advancing the terminal's clip clock. A single overlaid
+placeholder or Warp marker retires the mirrored picture; busy entry clears it
+as well. Each socket has its own last revision and opts in independently of
+interactive frames or exports. A weak reference identifies the player's clip
+pool, so replacing a player cannot reuse an old `(clip, frame)` cache hit.
+Legacy and unauthenticated peers receive no PNGs. Graphics-free hosts now select
+an explicit remote-only presentation when a graphical subscriber is attached.
+That mode advances the existing player in the stream cursor without painting
+terminal cells or sending kitty escapes. Modal visibility comes from the idle
+UI's overlay state; busy entry still clears the slot. Native kitty/Ghostty/Warp
+presentation remains preferred when supported. No subscribers means no remote
+animation ticks, and reconnecting resumes playback. The local graphical console
+uses the same explicit presentation mode with its existing focus-aware publisher.
+
+## Graphical mid-turn setting controls
+
+The terminal accepts micro-compaction and loop-guard changes while decoding,
+but graphical prompt submission previously required an idle turn. The console
+now accepts bounded typed `live_control` frames for explicit on/off settings
+through its shared inbox. Generation polling applies them without requesting
+interruption or enqueueing another model prompt, and republishes the cached
+control catalog with current settings. The optional `console_live_controls`
+capability is local-console scoped; remote hosts separately advertise
+`remote_live_controls`. Typed remote settings retain their accepting controller
+stamp and revalidate it while applying the side effect. Releasing and regranting
+the same client must invalidate the old queue entry. Settings and their replies
+never retire main prompt identities. Generation and idle polling (including the
+TUI busy loop) apply controls without waiting for ordinary prompt dispatch.
+Isolated process and authenticated socket tests verify uninterrupted generation,
+observer rejection, updated settings, and preservation of matching completions.

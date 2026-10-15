@@ -181,6 +181,13 @@ impl HostWire {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MetricsWire {
+    JobOutput {
+        snapshot: crate::joboutput::Page,
+    },
+    /// Requested read-only pages of completed delegated conversations.
+    SubagentHistory {
+        snapshot: crate::subhistory::Page,
+    },
     /// Delegated runs captured from the shared terminal roster.
     Subagents {
         rows: Vec<SubagentWire>,
@@ -190,6 +197,9 @@ pub enum MetricsWire {
     /// Bounded statistics and prose from the completed insights report.
     Insights {
         markdown: String,
+        /// Deterministic chart data; absent on older hosts.
+        #[serde(default)]
+        charts: Vec<crate::insightchart::Chart>,
         /// Checksum of the completed standalone HTML, linking its download to this view.
         #[serde(default)]
         html_sha256: Option<String>,
@@ -232,6 +242,8 @@ impl MetricsWire {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::JobOutput { .. } => "job_output",
+            Self::SubagentHistory { .. } => "subagent_history",
             Self::Subagents { .. } => "subagents",
             Self::Insights { .. } => "insights",
             Self::Engines { .. } => "engines",
@@ -427,6 +439,9 @@ impl TaskRowWire {
 /// Detached model-update progress, independent of the active model turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DownloadsWire {
+    /// This transfer belongs to a startup dialog rather than the detached helper.
+    #[serde(default)]
+    pub foreground: bool,
     /// Current detached helper, absent when no trustworthy state is available.
     pub state: Option<DownloadStateWire>,
     /// A recorded manifest job can be started or resumed.
@@ -522,6 +537,7 @@ impl DownloadsWire {
                 crate::downloader::Cancel::Delete => "delete".into(),
             });
         Self {
+            foreground: false,
             state,
             pending: crate::downloader::pending_job_in(root).is_some(),
             cancel_requested,
@@ -727,6 +743,12 @@ pub struct HistoryRowWire {
 /// One page of editable engine settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigWire {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub components: Vec<String>,
+    #[serde(default)]
+    pub components_total: usize,
     /// Number of built-in and contributed fields.
     pub total: usize,
     /// One-based page, with 32 rows per page.
@@ -922,6 +944,34 @@ pub struct ScrollbackEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// One negotiated replay entry preceding the final snapshot marker.
+    Replay {
+        /// Original event identity, including bounded document transfer pieces.
+        entry: Box<ScrollbackEntry>,
+    },
+    /// A refused setting change; never completes a model prompt or command.
+    LiveControlRejected {
+        request: crate::livecontrol::LiveControl,
+        reason: String,
+    },
+    /// A negotiated ephemeral PNG; never assigned a replay sequence.
+    Buddy {
+        snapshot: Option<crate::buddyframe::Frame>,
+    },
+    JobOutputRejected {
+        observer: String,
+        reason: String,
+    },
+    /// A negotiated live frame, outside transcript and reconnect replay.
+    Frame {
+        frame_id: String,
+        snapshot: Option<crate::guiframe::Snapshot>,
+    },
+    /// A refused ephemeral input; it does not complete a main command.
+    FrameRejected {
+        frame_id: String,
+        reason: String,
+    },
     /// Sent once on connect.
     Hello {
         /// Protocol version the server speaks.
@@ -930,6 +980,9 @@ pub enum ServerMsg {
         plank_version: String,
         /// Numeric session id assigned to this connection.
         session_id: u64,
+        /// Noncredential identity for the server's current replay sequence space.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
         /// Whether this session currently holds control.
         controller: bool,
         /// Slash commands produce an explicit completion frame.
@@ -1033,9 +1086,13 @@ pub enum ServerMsg {
         snapshot: ConfigWire,
     },
     /// Current remote-host endpoint, policy, and waiting control requests.
-    Host { snapshot: HostWire },
+    Host {
+        snapshot: HostWire,
+    },
     /// Requested context, usage, or throughput snapshot.
-    Metrics { snapshot: MetricsWire },
+    Metrics {
+        snapshot: MetricsWire,
+    },
     /// Detached model-update progress.
     Downloads {
         /// Detached model-update helper state and cancellation status.
@@ -1057,7 +1114,10 @@ pub enum ServerMsg {
         snapshot: HistoryWire,
     },
     /// Rendered side-answer text, explicitly separate from the main conversation.
-    Aside { role: String, text: String },
+    Aside {
+        role: String,
+        text: String,
+    },
     /// Transient complete-file export event; absent from reconnect scrollback.
     Artifact {
         event: crate::export::transfer::Transfer,
@@ -1074,6 +1134,9 @@ pub enum ServerMsg {
         title: String,
         /// Notification body.
         body: String,
+        /// Client-side policy; absent in older hosts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     /// A slash command finished, even when it did not generate a model turn.
     CommandDone {
@@ -1081,9 +1144,13 @@ pub enum ServerMsg {
         text: String,
     },
     /// An identified remote prompt finished its own dispatcher turn.
-    PromptDone { request_id: String },
+    PromptDone {
+        request_id: String,
+    },
     /// An identified slash command completed, independent of matching text.
-    CommandRequestDone { request_id: String },
+    CommandRequestDone {
+        request_id: String,
+    },
     /// Built-in commands and extensions loaded by the running agent.
     Controls {
         /// Versioned engine catalog, independent of the remote transport version.
@@ -1109,6 +1176,11 @@ pub enum ServerMsg {
     /// A document waiting for explicit Save or Cancel.
     Editor {
         /// Editor identity, title and original text.
+        request: serde_json::Value,
+    },
+    /// One negotiated, checksummed document-opening transfer piece.
+    EditorStream {
+        /// Bounded editor identity, title, and document transfer frame.
         request: serde_json::Value,
     },
     /// A document editor closed after submission or interruption.
@@ -1138,6 +1210,11 @@ pub enum ServerMsg {
     },
     /// Reply to a client `ping`.
     Pong,
+    /// The engine will replace this server after completing accepted input.
+    Restarting {
+        /// Replay namespace being retired, independently generated from credentials.
+        instance_id: String,
+    },
     /// The server is closing this session.
     Bye {
         /// Human-readable reason.
@@ -1170,9 +1247,10 @@ impl ServerMsg {
             },
             UiEvent::Plain(t) => Self::Plain { text: t.clone() },
             UiEvent::SessionReset => Self::Reset,
-            UiEvent::Notify { title, body } => Self::Notify {
+            UiEvent::Notify { title, body, mode } => Self::Notify {
                 title: title.clone(),
                 body: body.clone(),
+                mode: mode.clone(),
             },
             UiEvent::CommandDone { text } => Self::CommandDone { text: text.clone() },
             UiEvent::PromptDone { request_id } => Self::PromptDone { request_id: request_id.clone() },
@@ -1180,7 +1258,7 @@ impl ServerMsg {
             UiEvent::Controls(controls) => Self::Controls { controls: controls.clone() },
             UiEvent::Question(request) => Self::Question { request: request.clone() },
             UiEvent::QuestionDone { id } => Self::QuestionDone { question_id: id.clone() },
-            UiEvent::Editor(request) => Self::Editor { request: request.clone() },
+            UiEvent::Editor(request) => inline_editor(request.as_ref()),
             UiEvent::EditorDone { id } => Self::EditorDone { document_id: id.clone() },
             UiEvent::UserEcho(t) => Self::UserEcho { text: t.clone() },
             UiEvent::EndLine => Self::EndLine,
@@ -1291,14 +1369,35 @@ impl ServerFrame {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
+    /// A setting change independent of the ordinary prompt queue.
+    LiveControl {
+        request: crate::livecontrol::LiveControl,
+    },
+    JobOutputStop {
+        observer: String,
+    },
+    /// Ephemeral input scoped to the current graphical frame and controller grant.
+    FrameInput {
+        request: crate::guiframe::Request,
+    },
     /// An ordinary prompt whose completion must be identified unambiguously.
-    SubmitPrompt { request_id: String, text: String },
+    SubmitPrompt {
+        request_id: String,
+        text: String,
+    },
     /// A slash command with an unambiguous completion identity.
-    SubmitCommand { request_id: String, text: String },
+    SubmitCommand {
+        request_id: String,
+        text: String,
+    },
     /// Cancels only the identified input, rather than an unrelated host turn.
-    CancelPrompt { request_id: String },
+    CancelPrompt {
+        request_id: String,
+    },
     /// Authenticates a mirror without acquiring or reclaiming control.
-    ObserveAuth { token: String },
+    ObserveAuth {
+        token: String,
+    },
     /// Mandatory first frame.
     Auth {
         /// Shared bearer token.
@@ -1330,7 +1429,7 @@ pub enum ClientMsg {
     Edit {
         /// Identity from the editor frame.
         document_id: String,
-        /// Explicit string content to save or JSON null to cancel.
+        /// Inline content, a negotiated document-transfer frame, or null to cancel.
         text: serde_json::Value,
     },
     /// A `/slash` command. Queued like a prompt and routed through the local
@@ -1361,6 +1460,15 @@ pub struct ClientFrame {
     /// Opt-in support for complete-file transfer events on the initial auth frame.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub export_stream: Option<bool>,
+    /// Opt-in live graphical snapshots on the initial auth frame.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub frame_stream: Option<bool>,
+    /// Opt-in latest-only buddy PNGs, excluded from reconnect replay.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub buddy_stream: Option<bool>,
+    /// Opt-in chunked document openings and individually framed replay entries.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub editor_stream: Option<bool>,
     /// The message body.
     #[serde(flatten)]
     pub msg: ClientMsg,
@@ -1374,6 +1482,9 @@ impl ClientFrame {
             v: PROTOCOL_VERSION,
             id: None,
             export_stream: None,
+            frame_stream: None,
+            buddy_stream: None,
+            editor_stream: None,
             msg,
         }
     }
@@ -1692,10 +1803,26 @@ impl ControlPolicy {
 
 /// Shared state a running remote server exposes to its connection threads and
 /// to the rest of plank.
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct LiveFrame {
+    revision: u64,
+    id: String,
+    snapshot: Option<crate::guiframe::Snapshot>,
+    arcade: bool,
+    inputs: std::collections::VecDeque<(ControlStamp, crate::guiframe::Request)>,
+}
+
+#[derive(Debug, Default)]
+struct LiveControls {
+    pending: std::collections::VecDeque<(ControlStamp, crate::livecontrol::LiveControl)>,
+    catalog: Option<serde_json::Value>,
+}
+
 pub struct RemoteState {
     /// Loopback WebSocket endpoint, without authentication credentials.
     pub endpoint: String,
+    // Independent of the bearer token; a new server starts a new event sequence space.
+    instance_id: String,
     /// The event fan-out bus the worker broadcasts into.
     pub bus: Arc<BroadcastBus>,
     /// Per-turn shared state (interrupt / queued / btw).
@@ -1710,9 +1837,458 @@ pub struct RemoteState {
     queue_max: usize,
     session_ids: AtomicU64,
     shutdown: AtomicBool,
+    stop_requested: AtomicBool,
+    restarting: AtomicBool,
+    foreground_download: Mutex<Option<DownloadsWire>>,
+    buddy: Mutex<LiveBuddy>,
+    buddy_viewers: std::sync::atomic::AtomicUsize,
+    frame: Mutex<LiveFrame>,
+    frame_viewers: std::sync::atomic::AtomicUsize,
+    editor_viewers: std::sync::atomic::AtomicUsize,
+    output_control: Mutex<Option<Arc<crate::jobcancel::Hub>>>,
+    live_controls: Mutex<LiveControls>,
+}
+
+impl std::fmt::Debug for RemoteState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteState")
+            .field("endpoint", &self.endpoint)
+            .field("instance_id", &self.instance_id)
+            .field("queue_max", &self.queue_max)
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+// Require fresh OS randomness for replay identities; never derive them from credentials.
+pub(crate) fn replay_instance_id() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    fill_random(&mut bytes)?;
+    Ok(base64url(&bytes))
 }
 
 impl RemoteState {
+    pub(crate) fn remember_controls(&self, value: &serde_json::Value) {
+        let mut controls = self.live_controls.lock().expect("live controls poisoned");
+        if controls.catalog.as_ref() != Some(value) {
+            controls.catalog = Some(value.clone());
+        }
+    }
+
+    fn enqueue_live_control(
+        &self,
+        session: u64,
+        request: crate::livecontrol::LiveControl,
+    ) -> Result<(), String> {
+        let mut policy = self
+            .control
+            .lock()
+            .map_err(|_| "Controller state poisoned")?;
+        let owner = policy
+            .stamp(session)
+            .ok_or("Only the controller may change live settings")?;
+        if self.stop_requested() {
+            return Err("Host is stopping".into());
+        }
+        let mut controls = self
+            .live_controls
+            .lock()
+            .map_err(|_| "Live controls poisoned")?;
+        if controls.catalog.is_none() {
+            return Err("Host settings are not ready".into());
+        }
+        if let Some(required) = request.required_feature()
+            && !controls.catalog.as_ref().is_some_and(|catalog| {
+                catalog["features"].as_array().is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature["name"] == required && feature["available"] == true)
+                })
+            })
+        {
+            return Err("Host does not advertise this mid-turn setting".into());
+        }
+        // Bound bursts independently of the ordinary prompt and frame queues.
+        if controls.pending.len() >= 64 {
+            return Err("Live control queue is full".into());
+        }
+        controls.pending.push_back((owner, request));
+        Ok(())
+    }
+
+    /// Applies queued settings only while their accepting controller grant remains valid.
+    pub(crate) fn poll_live_controls(&self) {
+        // Retain ownership through the side effect, including same-client regrants.
+        let mut policy = self.control.lock().expect("Controller state poisoned");
+        let mut controls = self.live_controls.lock().expect("Live controls poisoned");
+        while let Some((owner, request)) = controls.pending.pop_front() {
+            if self.stop_requested() || policy.stamp(owner.session) != Some(owner) {
+                self.bus.broadcast(UiEvent::Dim(
+                    "Live setting discarded after control changed or the host stopped".into(),
+                ));
+                continue;
+            }
+            let reply = crate::ui::apply_live_control(request);
+            if let Some(catalog) = &mut controls.catalog {
+                crate::ui::refresh_live_settings(catalog);
+                if crate::ui::gui_protocol_enabled() {
+                    eprintln!("+PLANK_CONTROLS {catalog}");
+                }
+                self.bus.broadcast(UiEvent::Controls(catalog.clone()));
+            }
+            self.bus.broadcast(UiEvent::Dim(reply));
+        }
+    }
+
+    pub(crate) fn set_output_control(&self, hub: Arc<crate::jobcancel::Hub>) {
+        if let Ok(mut control) = self.output_control.lock() {
+            *control = Some(hub);
+        }
+    }
+
+    pub(crate) fn stop_job_output(&self, session: u64, observer: &str) -> Result<(), String> {
+        if !crate::joboutput::valid_observer(observer) {
+            return Err("Invalid observer identity".into());
+        }
+        let policy = self
+            .control
+            .lock()
+            .map_err(|_| "Controller state poisoned")?;
+        if !policy.remote_can_control(session) {
+            return Err("Only the controller may stop output observation".into());
+        }
+        if self
+            .output_control
+            .lock()
+            .map_err(|_| "Output control state poisoned")?
+            .as_ref()
+            .is_some_and(|hub| hub.request(observer))
+        {
+            Ok(())
+        } else {
+            Err("Output observer is no longer live".into())
+        }
+    }
+
+    pub(crate) fn has_frame_viewers(&self) -> bool {
+        self.frame_viewers.load(Ordering::Relaxed) != 0
+    }
+
+    pub(crate) fn editor_limit(&self) -> usize {
+        if self.editor_viewers.load(Ordering::Relaxed) == 0 {
+            super::editors::DOCUMENT_BYTES
+        } else {
+            crate::documenttransfer::DOCUMENT_BYTES
+        }
+    }
+
+    pub(crate) fn has_buddy_viewers(&self) -> bool {
+        self.buddy_viewers.load(Ordering::Relaxed) != 0
+    }
+
+    fn buddy_viewer(self: &Arc<Self>) -> BuddyViewer {
+        self.buddy_viewers.fetch_add(1, Ordering::Relaxed);
+        BuddyViewer(Arc::clone(self))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_buddy_viewer(self: &Arc<Self>) -> impl Drop {
+        self.buddy_viewer()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_buddy_snapshot(&self) -> Option<crate::buddyframe::Frame> {
+        self.buddy.lock().unwrap().snapshot.clone()
+    }
+
+    pub(crate) fn buddy_animating(&self) -> bool {
+        self.has_buddy_viewers() && self.buddy.lock().is_ok_and(|buddy| buddy.cursor.active())
+    }
+
+    pub(crate) fn capture_buddy(
+        &self,
+        buffer: &ratatui::buffer::Buffer,
+        output: ratatui::layout::Rect,
+        unobscured: bool,
+    ) {
+        let Ok(mut buddy) = self.buddy.lock() else {
+            return;
+        };
+        let update = if self.has_buddy_viewers() {
+            buddy.cursor.capture(buffer, output, unobscured)
+        } else {
+            buddy.cursor.dismiss()
+        };
+        if let Some(update) = update {
+            buddy.apply(update);
+        }
+    }
+
+    /// Polls the console's shared player only while remote viewers are present.
+    pub(crate) fn poll_console_buddy(&self) {
+        let Ok(mut buddy) = self.buddy.lock() else {
+            return;
+        };
+        let update = if self.has_buddy_viewers() {
+            buddy.cursor.poll_remote()
+        } else {
+            buddy.cursor.dismiss()
+        };
+        if let Some(update) = update {
+            buddy.apply(update);
+        }
+    }
+
+    pub(crate) fn dismiss_buddy(&self) {
+        if let Ok(mut buddy) = self.buddy.lock()
+            && let Some(update) = buddy.cursor.dismiss()
+        {
+            buddy.apply(update);
+        }
+    }
+
+    fn buddy_update(&self, previous: &mut u64) -> Option<ServerMsg> {
+        let buddy = self.buddy.lock().ok()?;
+        if *previous == buddy.revision {
+            return None;
+        }
+        *previous = buddy.revision;
+        Some(ServerMsg::Buddy {
+            snapshot: buddy.snapshot.clone(),
+        })
+    }
+    /// Replaces a coalesced frame without retaining its body in the bus.
+    pub(crate) fn publish_frame(
+        &self,
+        id: &str,
+        snapshot: Option<&crate::guiframe::Snapshot>,
+    ) -> Result<(), String> {
+        self.publish_frame_with(id, snapshot, false).map(|_| ())
+    }
+
+    pub(crate) fn publish_arcade_frame(
+        &self,
+        id: &str,
+        snapshot: Option<&crate::guiframe::Snapshot>,
+    ) -> Result<bool, String> {
+        self.publish_frame_with(id, snapshot, true)
+    }
+
+    pub(crate) fn has_non_arcade_frame(&self) -> bool {
+        self.frame
+            .lock()
+            .map_or(true, |frame| frame.snapshot.is_some() && !frame.arcade)
+    }
+
+    pub(crate) fn is_current_frame(&self, id: &str) -> bool {
+        self.frame
+            .lock()
+            .is_ok_and(|frame| frame.snapshot.is_some() && frame.id == id)
+    }
+
+    fn publish_frame_with(
+        &self,
+        id: &str,
+        snapshot: Option<&crate::guiframe::Snapshot>,
+        arcade: bool,
+    ) -> Result<bool, String> {
+        if snapshot.is_some_and(|frame| !frame.is_valid() || frame.id != id) {
+            return Err("Invalid remote frame".into());
+        }
+        let mut frame = self.frame.lock().map_err(|_| "frame slot poisoned")?;
+        // Editors own the slot until closed; check priority under the publication lock.
+        if arcade && frame.snapshot.is_some() && !frame.arcade {
+            return Ok(false);
+        }
+        if snapshot.is_none() && (frame.id != id || frame.snapshot.is_none()) {
+            return Ok(true);
+        }
+        if frame.id != id || frame.arcade != arcade {
+            frame.inputs.clear();
+        }
+        if frame.snapshot.as_ref() == snapshot && frame.arcade == arcade {
+            return Ok(true);
+        }
+        frame.id = id.into();
+        frame.snapshot = snapshot.cloned();
+        frame.arcade = arcade;
+        frame.revision = frame
+            .revision
+            .checked_add(1)
+            .expect("frame revision exhausted");
+        if snapshot.is_none() {
+            frame.inputs.clear();
+        }
+        Ok(true)
+    }
+
+    fn frame_update(&self, previous: &mut u64) -> Option<ServerMsg> {
+        let frame = self.frame.lock().expect("frame slot poisoned");
+        if *previous == frame.revision {
+            return None;
+        }
+        *previous = frame.revision;
+        Some(ServerMsg::Frame {
+            frame_id: frame.id.clone(),
+            snapshot: frame.snapshot.clone(),
+        })
+    }
+
+    fn frame_update_for_viewer(
+        &self,
+        previous: &mut u64,
+        visible: &mut Option<String>,
+    ) -> Option<ServerMsg> {
+        let mut update = self.frame_update(previous)?;
+        if let ServerMsg::Frame { frame_id, snapshot } = &mut update {
+            if snapshot.is_some() {
+                *visible = Some(frame_id.clone());
+            } else if let Some(last_seen) = visible.take() {
+                *frame_id = last_seen;
+            }
+        }
+        Some(update)
+    }
+
+    fn enqueue_frame_input(
+        &self,
+        session: u64,
+        request: crate::guiframe::Request,
+    ) -> Result<(), String> {
+        // Keep the policy lock through insertion so a revoked grant cannot enqueue.
+        let mut policy = self.control.lock().map_err(|_| "control policy poisoned")?;
+        let owner = policy.stamp(session).ok_or("not the controller")?;
+        if self.stop_requested() || !request.is_valid() {
+            return Err("Host stopping or invalid frame input".into());
+        }
+        let mut frame = self.frame.lock().map_err(|_| "frame slot poisoned")?;
+        if frame.id != request.id || frame.snapshot.is_none() {
+            return Err("Frame is no longer open".into());
+        }
+        // Fits two crossed-cell pointer samples on the largest supported grid.
+        if frame.inputs.len() >= 512 {
+            return Err("Frame input queue is full".into());
+        }
+        frame.inputs.push_back((owner, request));
+        Ok(())
+    }
+
+    /// Consumes only events whose original controller grant remains valid.
+    pub(crate) fn take_frame_inputs(&self) -> Vec<crate::guiframe::Request> {
+        self.take_frame_inputs_for(None)
+    }
+
+    pub(crate) fn take_frame_inputs_for(
+        &self,
+        expected: Option<&str>,
+    ) -> Vec<crate::guiframe::Request> {
+        let mut policy = self.control.lock().expect("control policy poisoned");
+        let mut frame = self.frame.lock().expect("frame slot poisoned");
+        if expected.is_some_and(|expected| expected != frame.id) {
+            return Vec::new();
+        }
+        let id = frame.id.clone();
+        if frame.snapshot.is_none() {
+            frame.inputs.clear();
+            return Vec::new();
+        }
+        frame
+            .inputs
+            .drain(..)
+            .filter_map(|(owner, request)| {
+                (request.id == id && policy.stamp(owner.session) == Some(owner)).then_some(request)
+            })
+            .collect()
+    }
+
+    /// Fences inputs until dispatch acknowledges the stop command and closes the host.
+    pub(crate) fn request_stop(&self) {
+        let _policy = self.control.lock().expect("control policy poisoned");
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+
+    /// Fences and retires waiting input before replacing this listener.
+    #[cfg(unix)]
+    pub(crate) fn prepare_restart(&self) {
+        self.request_stop();
+        self.restarting.store(true, Ordering::Release);
+        for (id, text) in self.shared.take_prompt_requests() {
+            self.bus.broadcast(UiEvent::Error(
+                "Remote input not run: host is restarting before dispatch\n".into(),
+            ));
+            self.complete_input(&id, &text);
+        }
+        for text in self
+            .shared
+            .take_commands()
+            .into_iter()
+            .chain(self.shared.take_queued())
+        {
+            self.bus.broadcast(UiEvent::Error(
+                "Remote input not run: host is restarting before dispatch\n".into(),
+            ));
+            if text.trim_start().starts_with('/') {
+                self.bus.broadcast(UiEvent::CommandDone { text });
+            }
+        }
+    }
+
+    /// Keeps live foreground progress authoritative over detached-helper polling.
+    pub(crate) fn foreground_download(&self, snapshot: Option<DownloadsWire>) {
+        *self
+            .foreground_download
+            .lock()
+            .expect("download snapshot poisoned") = snapshot;
+    }
+
+    pub(crate) fn downloads_snapshot(&self) -> DownloadsWire {
+        let snapshot = self
+            .foreground_download
+            .lock()
+            .expect("download snapshot poisoned")
+            .clone();
+        snapshot.unwrap_or_else(DownloadsWire::capture)
+    }
+    #[cfg(unix)]
+    fn restart_recipe(
+        &self,
+        address: std::net::SocketAddr,
+    ) -> std::io::Result<super::restart::RemoteRestart> {
+        let policy = self
+            .control
+            .lock()
+            .map_err(|_| std::io::Error::other("Remote control policy was poisoned"))?;
+        super::restart::RemoteRestart::new(
+            address,
+            ServerConfig {
+                token: self.token.clone(),
+                local_present: policy.local_present,
+                allow_control: policy.allow_control,
+                allowed_origins: self.allowed_origins.clone(),
+                queue_max: self.queue_max,
+            },
+        )
+    }
+
+    fn hello(&self, session_id: u64, controller: bool) -> ServerMsg {
+        ServerMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            plank_version: env!("CARGO_PKG_VERSION").to_owned(),
+            session_id,
+            instance_id: Some(self.instance_id.clone()),
+            controller,
+            command_completion: true,
+            prompt_completion: true,
+            command_request_completion: true,
+            ownership_fencing: true,
+        }
+    }
+
     /// Checks and queues input under the same controller-policy lock.
     fn enqueue_input(
         &self,
@@ -1725,6 +2301,9 @@ impl RemoteState {
             .control
             .lock()
             .map_err(|_| "control policy is poisoned")?;
+        if self.stop_requested() {
+            return Err("remote host is stopping".into());
+        }
         let owner = policy
             .stamp(session)
             .ok_or("this client does not hold control")?;
@@ -1742,7 +2321,12 @@ impl RemoteState {
             .request_owner(id)
             .is_some_and(|owner| policy.stamp(owner.session) != Some(owner));
         if !stale {
-            return self.shared.begin_prompt_request(id);
+            let begun = self.shared.begin_prompt_request(id);
+            drop(policy);
+            if !begun && !self.shared.request_is_pending(id) {
+                self.complete_input(id, text);
+            }
+            return begun;
         }
         drop(policy);
         self.reject_input(id, text);
@@ -1755,6 +2339,7 @@ impl RemoteState {
         ));
         if self.shared.request_is_legacy(id) && !text.trim_start().starts_with('/') {
             self.bus.broadcast(UiEvent::Notify {
+                mode: Some(crate::notify::mode().as_str().into()),
                 title: "Input rejected".into(),
                 body: "Control changed before queued input started".into(),
             });
@@ -1764,15 +2349,15 @@ impl RemoteState {
 
     /// Retires input and preserves the submitting client's completion protocol.
     pub(crate) fn complete_input(&self, id: &str, text: &str) {
-        let legacy = self.shared.request_is_legacy(id);
-        let command = self.shared.is_command_request(id);
-        self.shared.finish_prompt_request(id);
-        let event = if legacy {
-            if !command {
+        let Some(completed) = self.shared.retire_prompt_request(id) else {
+            return;
+        };
+        let event = if completed.legacy {
+            if !completed.command {
                 return;
             }
             UiEvent::CommandDone { text: text.into() }
-        } else if command {
+        } else if completed.command {
             UiEvent::CommandRequestDone {
                 request_id: id.into(),
             }
@@ -1784,11 +2369,43 @@ impl RemoteState {
         self.bus.broadcast(event);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_frame_update(&self, previous: &mut u64) -> Option<ServerMsg> {
+        self.frame_update(previous)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_frame_input(
+        &self,
+        session: u64,
+        request: crate::guiframe::Request,
+    ) -> Result<(), String> {
+        self.enqueue_frame_input(session, request)
+    }
+
+    /// Runs production authentication and mirroring over a test-owned transport.
+    #[cfg(test)]
+    pub(crate) fn test_connection<S: std::io::Read + std::io::Write>(
+        self: &Arc<Self>,
+        stream: S,
+    ) -> Result<(), String> {
+        let mut socket = tungstenite::WebSocket::from_raw_socket(
+            stream,
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        if let Some((session, streams, rx)) = do_handshake(&mut socket, self)? {
+            mirror_loop(&mut socket, self, session, streams, &rx)?;
+        }
+        Ok(())
+    }
+
     /// Creates a model-free bridge fixture without binding a network listener.
     #[cfg(test)]
     pub(crate) fn test_bridge() -> Arc<Self> {
         Arc::new(Self {
             endpoint: "ws://127.0.0.1:9000/".into(),
+            instance_id: replay_instance_id().expect("fixture requires OS randomness"),
             bus: Arc::new(BroadcastBus::new()),
             shared: Arc::new(TurnShared::default()),
             control: Mutex::new(ControlPolicy::new(true, false)),
@@ -1797,6 +2414,16 @@ impl RemoteState {
             queue_max: 1024,
             session_ids: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
+            foreground_download: Mutex::new(None),
+            frame: Mutex::default(),
+            frame_viewers: std::sync::atomic::AtomicUsize::new(0),
+            editor_viewers: std::sync::atomic::AtomicUsize::new(0),
+            output_control: Mutex::new(None),
+            live_controls: Mutex::default(),
+            buddy: Mutex::default(),
+            buddy_viewers: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1850,7 +2477,7 @@ pub struct RemoteServer {
 /// control-policy seed, and the hardening knobs (`Origin` allow-list and the
 /// per-client outbound queue cap) so [`RemoteServer::start`] stays a small,
 /// stable signature.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Shared bearer secret every client must present.
     pub token: String,
@@ -1864,7 +2491,38 @@ pub struct ServerConfig {
     pub queue_max: usize,
 }
 
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("local_present", &self.local_present)
+            .field("allow_control", &self.allow_control)
+            .field("origins", &self.allowed_origins.len())
+            .field("queue_max", &self.queue_max)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RemoteServer {
+    /// Creates an owned server fixture without accepting network connections.
+    #[cfg(test)]
+    pub(crate) fn test_bridge(state: Arc<RemoteState>) -> Self {
+        Self {
+            state,
+            local_addr: "127.0.0.1:9000".parse().unwrap(),
+            accept: None,
+        }
+    }
+
+    /// Captures listener settings for restart without retaining remote grants or inputs.
+    ///
+    /// # Errors
+    /// Returns poisoned-policy, invalid-listener, or oversized-recipe errors.
+    #[cfg(unix)]
+    pub fn restart_settings(&self) -> std::io::Result<super::restart::RemoteRestart> {
+        self.state.restart_recipe(self.local_addr)
+    }
+
     /// Binds `addr` (loopback expected) and starts the accept thread. See
     /// [`ServerConfig`] for the auth / policy / hardening knobs.
     ///
@@ -1876,12 +2534,15 @@ impl RemoteServer {
         bus: Arc<BroadcastBus>,
         shared: Arc<TurnShared>,
     ) -> std::io::Result<Self> {
+        let instance_id = replay_instance_id()?;
         let listener = TcpListener::bind(addr)?;
-        // A short accept timeout lets the accept loop observe shutdown.
-        listener.set_nonblocking(false)?;
+        // Polling accepts lets shutdown wake the listener without opening a
+        // throwaway socket, which can stall when the listen backlog is full.
+        listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let state = Arc::new(RemoteState {
             endpoint: format!("ws://{local_addr}/"),
+            instance_id,
             bus,
             shared,
             control: Mutex::new(ControlPolicy::new(cfg.local_present, cfg.allow_control)),
@@ -1890,6 +2551,16 @@ impl RemoteServer {
             queue_max: cfg.queue_max,
             session_ids: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
+            foreground_download: Mutex::new(None),
+            frame: Mutex::default(),
+            frame_viewers: std::sync::atomic::AtomicUsize::new(0),
+            editor_viewers: std::sync::atomic::AtomicUsize::new(0),
+            output_control: Mutex::new(None),
+            live_controls: Mutex::default(),
+            buddy: Mutex::default(),
+            buddy_viewers: std::sync::atomic::AtomicUsize::new(0),
         });
         let accept_state = Arc::clone(&state);
         let accept = std::thread::Builder::new()
@@ -1902,12 +2573,11 @@ impl RemoteServer {
         })
     }
 
-    /// Signals shutdown and joins the accept thread.
+    /// Stops accepting clients and waits for every connection to exit.
     pub fn shutdown(&mut self) {
-        self.state.shutdown.store(true, Ordering::Relaxed);
-        // Nudge the blocking accept() by opening a throwaway connection.
-        let _ = TcpStream::connect(self.local_addr);
+        self.state.shutdown.store(true, Ordering::Release);
         if let Some(h) = self.accept.take() {
+            h.thread().unpark();
             let _ = h.join();
         }
     }
@@ -1920,20 +2590,58 @@ impl Drop for RemoteServer {
 }
 
 fn accept_loop(listener: &TcpListener, state: &Arc<RemoteState>) {
-    for stream in listener.incoming() {
-        if state.shutdown.load(Ordering::Relaxed) {
-            break;
+    let mut connections = Connections::default();
+    while !state.shutdown.load(Ordering::Acquire) {
+        connections.reap();
+        let Ok((stream, _)) = listener.accept() else {
+            // Avoid spinning on an empty listener or a transient resource
+            // error. Shutdown unparks this wait immediately.
+            std::thread::park_timeout(POLL_INTERVAL);
+            continue;
+        };
+        // Accepted sockets use bounded blocking I/O on every platform.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
         }
-        let Ok(stream) = stream else { continue };
         let conn_state = Arc::clone(state);
-        let _ = std::thread::Builder::new()
+        if let Ok(connection) = std::thread::Builder::new()
             .name("plank-remote-conn".into())
             .spawn(move || {
                 if let Err(e) = handle_connection(stream, &conn_state) {
                     // Connection errors are per-client and non-fatal.
                     let _ = e;
                 }
-            });
+            })
+        {
+            connections.0.push(connection);
+        }
+    }
+}
+
+/// Retains connection threads until their final frames have been written.
+#[derive(Debug, Default)]
+struct Connections(Vec<JoinHandle<()>>);
+
+impl Connections {
+    fn reap(&mut self) {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index].is_finished() {
+                let _ = self.0.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+impl Drop for Connections {
+    fn drop(&mut self) {
+        // The server's shutdown flag and socket timeouts wake all connection
+        // phases. Joining prevents exec from discarding queued completion frames.
+        for connection in self.0.drain(..) {
+            let _ = connection.join();
+        }
     }
 }
 
@@ -1948,11 +2656,13 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<RemoteState>) -> Result<
     // A bounded write timeout lets the outbound buffer build up (rather than
     // the thread blocking forever) when a client stops reading, so the queue
     // cap can evict it.
-    let _ = stream.set_write_timeout(Some(POLL_INTERVAL));
+    stream
+        .set_write_timeout(Some(POLL_INTERVAL))
+        .map_err(|e| e.to_string())?;
 
     // Read the request head so we can both serve the static web client and
     // inspect `Origin` before completing any WebSocket upgrade.
-    let head = read_http_head(&mut stream)?;
+    let head = read_http_head(&mut stream, &state.shutdown)?;
     let req = parse_request_head(&head);
 
     if !req.is_websocket_upgrade() {
@@ -1984,10 +2694,10 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<RemoteState>) -> Result<
     let mut ws =
         tungstenite::accept_with_config(prefixed, Some(config)).map_err(|e| e.to_string())?;
 
-    let Some((session_id, exports)) = do_handshake(&mut ws, state)? else {
+    let Some((session_id, streams, rx)) = do_handshake(&mut ws, state)? else {
         return Ok(()); // unauthorized; connection already closed
     };
-    let loop_result = mirror_loop(&mut ws, state, session_id, exports);
+    let loop_result = mirror_loop(&mut ws, state, session_id, streams, &rx);
 
     // On disconnect (including slow-consumer eviction) a controller's slot is
     // held for the reconnect grace window (§4.8) so a brief drop can reclaim it
@@ -2018,11 +2728,14 @@ impl ParsedRequest {
 /// (`\r\n\r\n`) or a bounded deadline, tolerating read-timeout wake-ups. The
 /// returned buffer is the raw head, replayed to tungstenite via [`PrefixStream`]
 /// for a WebSocket upgrade.
-fn read_http_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+fn read_http_head(stream: &mut TcpStream, shutdown: &AtomicBool) -> Result<Vec<u8>, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err("server shutting down".into());
+        }
         if std::time::Instant::now() > deadline {
             return Err("timed out reading request head".to_owned());
         }
@@ -2203,8 +2916,8 @@ impl<S: Write> Write for PrefixStream<S> {
 fn do_handshake<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     state: &Arc<RemoteState>,
-) -> Result<Option<(u64, bool)>, String> {
-    let (resume_from, ok, observer, exports) = authenticate(ws, state)?;
+) -> Result<Option<(u64, Streams, MirrorReceiver)>, String> {
+    let (resume_from, ok, observer, streams) = authenticate(ws, state)?;
     if !ok {
         let _ = ws.close(Some(tungstenite::protocol::CloseFrame {
             code: tungstenite::protocol::frame::coding::CloseCode::Library(4401),
@@ -2227,34 +2940,109 @@ fn do_handshake<S: std::io::Read + std::io::Write>(
 
     send(
         ws,
-        &ServerFrame::control(ServerMsg::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            plank_version: env!("CARGO_PKG_VERSION").to_owned(),
-            session_id,
-            controller,
-            command_completion: true,
-            prompt_completion: true,
-            command_request_completion: true,
-            ownership_fencing: true,
-        }),
+        &ServerFrame::control(state.hello(session_id, controller)),
     )?;
 
     // Snapshot: replay scrollback tail (or events newer than resume_from).
-    let (tail, highest_id) = state.bus.scrollback_since(resume_from);
-    let scrollback = tail
-        .into_iter()
-        .filter_map(|s| {
-            ServerMsg::from_event(&s.event).map(|msg| ScrollbackEntry { id: s.id, msg })
-        })
-        .collect();
+    let (rx, tail, highest_id) = state.bus.subscribe_replay(streams.exports, resume_from);
+    send_snapshot(
+        ws,
+        tail,
+        highest_id,
+        streams.editors == EditorTransport::Chunked,
+    )?;
+    Ok(Some((
+        session_id,
+        streams,
+        MirrorReceiver::Exports(Box::new(rx)),
+    )))
+}
+
+fn send_snapshot<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    tail: Vec<SeqEvent>,
+    highest_id: Option<u64>,
+    editors: bool,
+) -> Result<(), String> {
+    let scrollback = if editors {
+        for entry in tail {
+            if let UiEvent::Editor(request) = &entry.event {
+                send_editor_request(ws, entry.id, request.as_ref(), true)?;
+            } else if let Some(msg) = ServerMsg::from_event(&entry.event) {
+                send_replay_event(ws, entry.id, msg, true)?;
+            }
+        }
+        Vec::new()
+    } else {
+        tail.into_iter()
+            .filter_map(|s| {
+                ServerMsg::from_event(&s.event).map(|msg| ScrollbackEntry { id: s.id, msg })
+            })
+            .collect()
+    };
     send(
         ws,
         &ServerFrame::control(ServerMsg::Snapshot {
             scrollback,
             highest_id,
         }),
-    )?;
-    Ok(Some((session_id, exports)))
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Streams {
+    exports: bool,
+    frames: bool,
+    buddy: bool,
+    editors: EditorTransport,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum EditorTransport {
+    #[default]
+    Inline,
+    Chunked,
+}
+
+struct BuddyViewer(Arc<RemoteState>);
+impl Drop for BuddyViewer {
+    fn drop(&mut self) {
+        self.0.buddy_viewers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct LiveBuddy {
+    cursor: crate::buddy::Graphical,
+    revision: u64,
+    snapshot: Option<crate::buddyframe::Frame>,
+}
+
+impl LiveBuddy {
+    fn apply(&mut self, update: crate::buddy::GraphicalUpdate) {
+        self.snapshot = match update {
+            crate::buddy::GraphicalUpdate::Frame(frame) => Some(frame),
+            crate::buddy::GraphicalUpdate::Clear => None,
+        };
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("buddy revision exhausted");
+    }
+}
+
+struct FrameViewer(Arc<RemoteState>);
+impl Drop for FrameViewer {
+    fn drop(&mut self) {
+        self.0.frame_viewers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct EditorViewer(Arc<RemoteState>);
+impl Drop for EditorViewer {
+    fn drop(&mut self) {
+        self.0.editor_viewers.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The post-handshake loop: pump bus events to the socket and handle inbound
@@ -2263,14 +3051,21 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     state: &Arc<RemoteState>,
     session_id: u64,
-    exports: bool,
+    streams: Streams,
+    rx: &MirrorReceiver,
 ) -> Result<(), String> {
-    // Subscribe after the snapshot so no event is missed or duplicated.
-    let rx = if exports {
-        MirrorReceiver::Exports(Box::new(state.bus.subscribe_exports()))
-    } else {
-        MirrorReceiver::Ordinary(state.bus.subscribe())
-    };
+    let _buddy = streams.buddy.then(|| state.buddy_viewer());
+    let _editors = (streams.editors == EditorTransport::Chunked).then(|| {
+        state.editor_viewers.fetch_add(1, Ordering::Relaxed);
+        EditorViewer(Arc::clone(state))
+    });
+    let _frames = streams.frames.then(|| {
+        state.frame_viewers.fetch_add(1, Ordering::Relaxed);
+        FrameViewer(Arc::clone(state))
+    });
+    let mut last_buddy_revision = 0;
+    let mut last_frame_revision = 0;
+    let mut visible_frame = None;
     let mut last_status_at: Option<std::time::Instant> = None;
     let mut last_download_poll: Option<std::time::Instant> = None;
     let mut last_downloads = None;
@@ -2281,17 +3076,38 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
     // client rather than per-session facts. One `Mutex` read per poll tick.
     let mut had_control = is_controller(state, session_id)?;
     loop {
-        if state.shutdown.load(Ordering::Relaxed) {
-            let _ = send(
+        if state.shutdown.load(Ordering::Acquire) {
+            let restart = state
+                .restarting
+                .load(Ordering::Acquire)
+                .then_some(state.instance_id.as_str());
+            let _ = drain_shutdown(
                 ws,
-                &ServerFrame::control(ServerMsg::Bye {
-                    reason: "server shutting down".to_owned(),
-                }),
+                rx,
+                &mut last_status_at,
+                restart,
+                streams.editors == EditorTransport::Chunked,
             );
             break;
         }
         // Pump bus → socket, coalescing status frames.
-        pump_bus(ws, &rx, &mut last_status_at)?;
+        pump_bus(
+            ws,
+            rx,
+            &mut last_status_at,
+            streams.editors == EditorTransport::Chunked,
+        )?;
+        if streams.buddy
+            && let Some(buddy) = state.buddy_update(&mut last_buddy_revision)
+        {
+            send(ws, &ServerFrame::control(buddy))?;
+        }
+        if streams.frames
+            && let Some(frame) =
+                state.frame_update_for_viewer(&mut last_frame_revision, &mut visible_frame)
+        {
+            send(ws, &ServerFrame::control(frame))?;
+        }
         // Downloads are detached from model turns; a quiet/busy engine still
         // delivers updates. Read one small state file per second per connection.
         if last_download_poll.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
@@ -2306,7 +3122,7 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
                 )?;
                 last_host = Some(snapshot);
             }
-            let snapshot = DownloadsWire::capture();
+            let snapshot = state.downloads_snapshot();
             if last_downloads.as_ref() != Some(&snapshot) {
                 send(
                     ws,
@@ -2376,35 +3192,47 @@ fn initial_control(
 fn authenticate<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     state: &RemoteState,
-) -> Result<(Option<u64>, bool, bool, bool), String> {
+) -> Result<(Option<u64>, bool, bool, Streams), String> {
     // Wait (bounded) for the first text frame.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
+        if state.shutdown.load(Ordering::Relaxed) {
+            return Ok((None, false, false, Streams::default()));
+        }
         if std::time::Instant::now() > deadline {
-            return Ok((None, false, false, false));
+            return Ok((None, false, false, Streams::default()));
         }
         match ws.read() {
             Ok(Message::Text(txt)) => {
                 let Ok(frame) = ClientFrame::from_json(&txt) else {
-                    return Ok((None, false, false, false));
+                    return Ok((None, false, false, Streams::default()));
                 };
-                let exports = frame.export_stream.unwrap_or(false);
+                let streams = Streams {
+                    exports: frame.export_stream.unwrap_or(false),
+                    frames: frame.frame_stream.unwrap_or(false),
+                    buddy: frame.buddy_stream.unwrap_or(false),
+                    editors: if frame.editor_stream.unwrap_or(false) {
+                        EditorTransport::Chunked
+                    } else {
+                        EditorTransport::Inline
+                    },
+                };
                 return match frame.msg {
                     ClientMsg::Auth { token, resume_from } => {
                         let ok = constant_time_eq(token.as_bytes(), state.token.as_bytes());
-                        Ok((resume_from, ok, false, exports))
+                        Ok((resume_from, ok, false, streams))
                     }
                     ClientMsg::ObserveAuth { token } => Ok((
                         None,
                         constant_time_eq(token.as_bytes(), state.token.as_bytes()),
                         true,
-                        exports,
+                        streams,
                     )),
                     // Anything but auth first is a policy violation.
-                    _ => Ok((None, false, false, false)),
+                    _ => Ok((None, false, false, Streams::default())),
                 };
             }
-            Ok(Message::Close(_)) => return Ok((None, false, false, false)),
+            Ok(Message::Close(_)) => return Ok((None, false, false, Streams::default())),
             Ok(Message::Ping(p)) => {
                 let _ = ws.send(Message::Pong(p));
             }
@@ -2418,13 +3246,40 @@ fn authenticate<S: std::io::Read + std::io::Write>(
 
 #[derive(Debug)]
 enum MirrorReceiver {
+    #[cfg(test)]
     Ordinary(std::sync::mpsc::Receiver<SeqEvent>),
     Exports(Box<crate::worker::ExportReceiver>),
+}
+
+fn drain_shutdown<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    rx: &MirrorReceiver,
+    last_status_at: &mut Option<std::time::Instant>,
+    restarting: Option<&str>,
+    editors: bool,
+) -> Result<(), String> {
+    // Completion frames already queued by the dispatcher precede the final bye.
+    pump_bus(ws, rx, last_status_at, editors)?;
+    if let Some(instance_id) = restarting {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::Restarting {
+                instance_id: instance_id.into(),
+            }),
+        )?;
+    }
+    send(
+        ws,
+        &ServerFrame::control(ServerMsg::Bye {
+            reason: "server shutting down".into(),
+        }),
+    )
 }
 
 impl MirrorReceiver {
     fn try_recv(&self) -> Result<SeqEvent, std::sync::mpsc::TryRecvError> {
         match self {
+            #[cfg(test)]
             Self::Ordinary(rx) => rx.try_recv(),
             Self::Exports(rx) => rx.try_recv(),
         }
@@ -2436,9 +3291,14 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     rx: &MirrorReceiver,
     last_status_at: &mut Option<std::time::Instant>,
+    editors: bool,
 ) -> Result<(), String> {
     let mut pending_status: Option<SeqEvent> = None;
     while let Ok(seq) = rx.try_recv() {
+        if editors && let UiEvent::Editor(request) = &seq.event {
+            send_editor_request(ws, seq.id, request.as_ref(), false)?;
+            continue;
+        }
         let Some(msg) = ServerMsg::from_event(&seq.event) else {
             continue;
         };
@@ -2446,7 +3306,7 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
             pending_status = Some(seq); // keep only the newest
             continue;
         }
-        send(ws, &ServerFrame::seq(seq.id, msg))?;
+        send_replay_event(ws, seq.id, msg, false)?;
     }
     if let Some(seq) = pending_status {
         let now = std::time::Instant::now();
@@ -2461,6 +3321,62 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
     // Push any buffered data from a prior transient stall; overflow evicts.
     flush_ws(ws)?;
     Ok(())
+}
+
+fn inline_editor(request: &serde_json::Value) -> ServerMsg {
+    if request["text"]
+        .as_str()
+        .is_some_and(|text| text.len() > super::editors::DOCUMENT_BYTES)
+    {
+        ServerMsg::Error { text:"This document needs an updated graphical client. Use the host UI or reconnect with a newer client.".into() }
+    } else {
+        ServerMsg::Editor {
+            request: request.clone(),
+        }
+    }
+}
+
+fn send_editor_request<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    id: u64,
+    request: &serde_json::Value,
+    replay: bool,
+) -> Result<(), String> {
+    let editor = request["id"].as_str().ok_or("Missing editor ID")?;
+    let text = request["text"].as_str().ok_or("Missing document text")?;
+    let title = request["title"].as_str().unwrap_or("Document");
+    if editor.is_empty() || editor.len() > 256 || title.len() > 4096 {
+        return Err("Invalid document transfer metadata".into());
+    }
+    for frame in crate::documenttransfer::Sender::new(editor, text)? {
+        send_replay_event(
+            ws,
+            id,
+            ServerMsg::EditorStream {
+                request: serde_json::json!({"id":editor,"title":title,"frame":frame}),
+            },
+            replay,
+        )?;
+    }
+    Ok(())
+}
+
+fn send_replay_event<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    id: u64,
+    msg: ServerMsg,
+    replay: bool,
+) -> Result<(), String> {
+    if replay {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::Replay {
+                entry: Box::new(ScrollbackEntry { id, msg }),
+            }),
+        )
+    } else {
+        send(ws, &ServerFrame::seq(id, msg))
+    }
 }
 
 /// Queues a controller's identified prompt or replies with a denial.
@@ -2513,7 +3429,10 @@ fn cancel_identified_prompt<S: std::io::Read + std::io::Write>(
     let completion = {
         let control = state.control.lock().map_err(|error| error.to_string())?;
         if control.remote_can_control(session) && state.shared.cancel_prompt_request(request_id) {
-            let completion = if state.shared.is_command_request(request_id) {
+            let Some(completed) = state.shared.retire_prompt_request(request_id) else {
+                return Ok(());
+            };
+            let completion = if completed.command {
                 ServerMsg::CommandRequestDone {
                     request_id: request_id.to_owned(),
                 }
@@ -2522,7 +3441,6 @@ fn cancel_identified_prompt<S: std::io::Read + std::io::Write>(
                     request_id: request_id.to_owned(),
                 }
             };
-            state.shared.finish_prompt_request(request_id);
             Some(completion)
         } else {
             None
@@ -2580,6 +3498,13 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
         return Ok(false);
     };
     match frame.msg {
+        ClientMsg::LiveControl { request } => handle_live_control(ws, state, session_id, request)?,
+        ClientMsg::JobOutputStop { observer } => {
+            handle_output_stop(ws, state, session_id, observer)?;
+        }
+        ClientMsg::FrameInput { request } => {
+            handle_graphical_input(ws, state, session_id, request)?;
+        }
         // Re-auth mid-session is a no-op (already authenticated).
         ClientMsg::Auth { .. } | ClientMsg::ObserveAuth { .. } => {}
         ClientMsg::Ping => send(ws, &ServerFrame::control(ServerMsg::Pong))?,
@@ -2636,35 +3561,7 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
         ClientMsg::Edit { document_id, text } => {
             handle_editor_reply(ws, state, session_id, document_id, &text)?;
         }
-        ClientMsg::RequestControl => {
-            let outcome = state
-                .control
-                .lock()
-                .map_err(|e| e.to_string())?
-                .request(session_id);
-            match outcome {
-                RequestOutcome::Granted => {}
-                RequestOutcome::Denied(reason) => {
-                    send(
-                        ws,
-                        &ServerFrame::control(ServerMsg::ControlDenied { reason }),
-                    )?;
-                }
-                RequestOutcome::NeedsLocalGrant => {
-                    // Surface the request to the local user; the request is now
-                    // recorded as pending, and `Agent::grant_lines` answers it.
-                    state.bus.broadcast(UiEvent::Dim(format!(
-                        "[remote session {session_id} wants control — /grant or /grant {session_id} to allow]"
-                    )));
-                    send(
-                        ws,
-                        &ServerFrame::control(ServerMsg::ControlDenied {
-                            reason: "awaiting local /grant".to_owned(),
-                        }),
-                    )?;
-                }
-            }
-        }
+        ClientMsg::RequestControl => handle_control_request(ws, state, session_id)?,
         ClientMsg::ReleaseControl => {
             state
                 .control
@@ -2674,6 +3571,95 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
         }
     }
     Ok(false)
+}
+
+fn handle_control_request<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &RemoteState,
+    session_id: u64,
+) -> Result<(), String> {
+    let outcome = state
+        .control
+        .lock()
+        .map_err(|e| e.to_string())?
+        .request(session_id);
+    match outcome {
+        RequestOutcome::Granted => {}
+        RequestOutcome::Denied(reason) => {
+            send(
+                ws,
+                &ServerFrame::control(ServerMsg::ControlDenied { reason }),
+            )?;
+        }
+        RequestOutcome::NeedsLocalGrant => {
+            // Surface the request to the local user; the request is now
+            // recorded as pending, and `Agent::grant_lines` answers it.
+            state.bus.broadcast(UiEvent::Dim(format!(
+                "[remote session {session_id} wants control — /grant or /grant {session_id} to allow]"
+            )));
+            send(
+                ws,
+                &ServerFrame::control(ServerMsg::ControlDenied {
+                    reason: "awaiting local /grant".to_owned(),
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_live_control<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &RemoteState,
+    session: u64,
+    request: crate::livecontrol::LiveControl,
+) -> Result<(), String> {
+    if let Err(reason) = state.enqueue_live_control(session, request) {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::LiveControlRejected { request, reason }),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_output_stop<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &RemoteState,
+    session_id: u64,
+    observer: String,
+) -> Result<(), String> {
+    if let Err(reason) = state.stop_job_output(session_id, &observer) {
+        let observer = if crate::joboutput::valid_observer(&observer) {
+            observer
+        } else {
+            String::new()
+        };
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::JobOutputRejected { observer, reason }),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_graphical_input<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+    state: &RemoteState,
+    session: u64,
+    request: crate::guiframe::Request,
+) -> Result<(), String> {
+    let id = request.id.clone();
+    if let Err(reason) = state.enqueue_frame_input(session, request) {
+        send(
+            ws,
+            &ServerFrame::control(ServerMsg::FrameRejected {
+                frame_id: id,
+                reason,
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn accept_question_answer(
@@ -2711,8 +3697,12 @@ fn accept_editor_reply(
     id: &str,
     text: &serde_json::Value,
 ) -> Result<bool, String> {
-    let control = state.control.lock().map_err(|error| error.to_string())?;
-    Ok(control.remote_can_control(session) && state.shared.editors.reply(id, text))
+    let mut control = state.control.lock().map_err(|error| error.to_string())?;
+    // Hold authorization through insertion. Each stream is also bound to this
+    // exact grant, so regranting the same socket cannot revive partial edits.
+    Ok(control
+        .stamp(session)
+        .is_some_and(|stamp| state.shared.editors.reply_from(stamp, id, text)))
 }
 
 fn is_controller(state: &Arc<RemoteState>, session_id: u64) -> Result<bool, String> {
@@ -2766,6 +3756,736 @@ fn flush_ws<S: std::io::Read + std::io::Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_editor_limits_follow_negotiated_viewers_and_bound_legacy_messages() {
+        let state = RemoteState::test_bridge();
+        assert_eq!(state.editor_limit(), super::super::editors::DOCUMENT_BYTES);
+        state.editor_viewers.fetch_add(1, Ordering::Relaxed);
+        let viewer = EditorViewer(Arc::clone(&state));
+        assert_eq!(
+            state.editor_limit(),
+            crate::documenttransfer::DOCUMENT_BYTES
+        );
+        drop(viewer);
+        assert_eq!(state.editor_limit(), super::super::editors::DOCUMENT_BYTES);
+        let message = inline_editor(
+            &serde_json::json!({"id":"large","text":"x".repeat(super::super::editors::DOCUMENT_BYTES + 1)}),
+        );
+        assert!(matches!(message, ServerMsg::Error { .. }));
+        assert!(serde_json::to_vec(&message).unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn remote_editor_openings_negotiate_bounded_live_and_replay_frames() {
+        use tungstenite::{WebSocket, protocol::Role};
+        for (editors, replay) in [(false, false), (true, false), (true, true)] {
+            let text = "🦀\u{0}\\\r\n".repeat(if editors { 131_072 } else { 20_000 });
+            let mut server =
+                WebSocket::from_raw_socket(std::io::Cursor::new(Vec::new()), Role::Server, None);
+            let event = UiEvent::Editor(
+                serde_json::json!({"id":"editor-1","title":"File","text":text}).into(),
+            );
+            if replay {
+                send_snapshot(
+                    &mut server,
+                    vec![SeqEvent { id: 9, event }],
+                    Some(9),
+                    editors,
+                )
+                .unwrap();
+            } else {
+                let bus = crate::worker::BroadcastBus::new();
+                let rx = MirrorReceiver::Ordinary(bus.subscribe());
+                bus.broadcast(UiEvent::Visible("preceding".into()));
+                // Assign this request the same identity used by replay checks.
+                for _ in 1..9 {
+                    bus.broadcast(UiEvent::EndLine);
+                }
+                while rx.try_recv().is_ok() {}
+                bus.broadcast(event);
+                pump_bus(&mut server, &rx, &mut None, editors).unwrap();
+            }
+            let mut client = WebSocket::from_raw_socket(
+                std::io::Cursor::new(server.into_inner().into_inner()),
+                Role::Client,
+                None,
+            );
+            let mut receiver = crate::documenttransfer::Receiver::default();
+            let mut completed = None;
+            let mut count = 0;
+            let mut finished_snapshot = false;
+            while let Ok(frame) = client.read() {
+                let wire = frame.to_text().unwrap();
+                let value: serde_json::Value = serde_json::from_str(wire).unwrap();
+                if value["type"] == "snapshot" {
+                    assert!(replay);
+                    assert!(completed.is_some());
+                    assert_eq!(value["highest_id"], 9);
+                    assert!(value["scrollback"].as_array().unwrap().is_empty());
+                    finished_snapshot = true;
+                    continue;
+                }
+                assert!(
+                    !finished_snapshot,
+                    "Snapshot marker must follow all replay pieces"
+                );
+                count += 1;
+                let value = if replay { &value["entry"] } else { &value };
+                assert_eq!(value["id"], 9);
+                if editors {
+                    assert!(wire.len() < crate::documenttransfer::CHUNK_BYTES * 6 + 32 * 1024);
+                    assert_eq!(value["type"], "editor_stream");
+                    assert_eq!(value["request"]["id"], "editor-1");
+                    assert_eq!(value["request"]["title"], "File");
+                    let piece = serde_json::from_value(value["request"]["frame"].clone()).unwrap();
+                    if let Some(text) = receiver.accept(&piece).unwrap() {
+                        completed = Some(text);
+                    }
+                } else {
+                    assert_eq!(value["type"], "editor");
+                    completed = Some(value["request"]["text"].as_str().unwrap().to_owned());
+                }
+            }
+            assert!(
+                completed.as_deref() == Some(text.as_str()),
+                "Opening must preserve every document byte"
+            );
+            assert_eq!(finished_snapshot, replay);
+            assert!(if editors { count > 3 } else { count == 1 });
+        }
+        let auth = ClientFrame::from_json(
+            r#"{"v":1,"type":"observe_auth","token":"test","editor_stream":true}"#,
+        )
+        .unwrap();
+        assert_eq!(auth.editor_stream, Some(true));
+        let legacy = ClientFrame::new(ClientMsg::ObserveAuth {
+            token: "test".into(),
+        });
+        assert!(!legacy.to_json().unwrap().contains("editor_stream"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_notification_follows_completions_and_precedes_bye_without_replay() {
+        use tungstenite::{WebSocket, protocol::Role};
+        let remote = RemoteState::test_bridge();
+        let rx = MirrorReceiver::Ordinary(remote.bus.subscribe());
+        remote
+            .shared
+            .push_command_request("restart".into(), "/steer direction".into())
+            .unwrap();
+        let inputs = remote.shared.take_prompt_requests();
+        assert!(remote.begin_input(&inputs[0].0, &inputs[0].1));
+        remote.complete_input("restart", "/steer direction");
+        remote
+            .shared
+            .push_prompt_request("late".into(), "Never dispatch".into())
+            .unwrap();
+        remote.prepare_restart();
+        assert!(remote.stop_requested());
+        assert!(!remote.shared.has_prompt_requests());
+        let mut server =
+            WebSocket::from_raw_socket(std::io::Cursor::new(Vec::new()), Role::Server, None);
+        drain_shutdown(
+            &mut server,
+            &rx,
+            &mut None,
+            Some(&remote.instance_id),
+            false,
+        )
+        .unwrap();
+        let mut client = WebSocket::from_raw_socket(
+            std::io::Cursor::new(server.get_ref().get_ref().clone()),
+            Role::Client,
+            None,
+        );
+        let mut frames = Vec::new();
+        for _ in 0..5 {
+            frames.push(
+                serde_json::from_str::<serde_json::Value>(
+                    client.read().unwrap().to_text().unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "command_request_done",
+                "error",
+                "prompt_done",
+                "restarting",
+                "bye"
+            ]
+        );
+        assert_eq!(frames[2]["request_id"], "late");
+        assert_eq!(frames[3]["instance_id"], remote.instance_id);
+        assert!(frames[3].get("id").is_none());
+        let (scrollback, _) = remote.bus.scrollback_since(None);
+        assert!(!scrollback.iter().any(|entry| {
+            ServerMsg::from_event(&entry.event)
+                .is_some_and(|msg| matches!(msg, ServerMsg::Restarting { .. }))
+        }));
+    }
+
+    #[test]
+    fn remote_stop_fences_new_input_and_preserves_the_current_completion() {
+        let remote = RemoteState::test_bridge();
+        remote.control.lock().unwrap().grant(7);
+        remote
+            .enqueue_input(7, Some("stop".into()), "/rc off".into(), true)
+            .unwrap();
+        assert!(
+            remote
+                .enqueue_input(8, Some("observer".into()), "/rc off".into(), true)
+                .is_err()
+        );
+        let inputs = remote.shared.take_prompt_requests();
+        assert!(remote.begin_input(&inputs[0].0, &inputs[0].1));
+        remote.request_stop();
+        assert!(
+            remote
+                .enqueue_input(7, Some("late".into()), "Later prompt".into(), false)
+                .unwrap_err()
+                .contains("stopping")
+        );
+        assert!(
+            !remote.shutdown.load(Ordering::Relaxed),
+            "dispatch still owns the final acknowledgement"
+        );
+        remote.complete_input("stop", "/rc off");
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, UiEvent::CommandRequestDone {request_id} if request_id == "stop")).count(), 1);
+        assert!(!remote.shared.has_prompt_requests());
+    }
+
+    #[test]
+    fn restart_completion_shutdown_waits_for_connections_and_reaps_finished_threads() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        let active = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        ready.recv().unwrap();
+        let finished = std::thread::spawn(|| {});
+        // Observe a terminal handle before testing reaping, with a deadline
+        // so a broken worker cannot hang the test harness.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !finished.is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let mut connections = Connections(vec![active, finished]);
+        connections.reap();
+        assert_eq!(connections.0.len(), 1);
+
+        let (dropping, entered) = std::sync::mpsc::channel();
+        let (stopped, done) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            dropping.send(()).unwrap();
+            drop(connections);
+            stopped.send(()).unwrap();
+        });
+        entered.recv().unwrap();
+        assert_eq!(
+            done.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn remote_frames_coalesced_close_retires_the_frame_each_viewer_actually_saw() {
+        let state = RemoteState::test_bridge();
+        let mut frame = crate::guiframe::Snapshot {
+            id: "first".into(),
+            component: "demo".into(),
+            w: 1,
+            h: 1,
+            cells: vec![],
+        };
+        state.publish_frame(&frame.id, Some(&frame)).unwrap();
+        let (mut revision, mut visible) = (0, None);
+        assert!(
+            matches!(state.frame_update_for_viewer(&mut revision, &mut visible),
+            Some(ServerMsg::Frame { frame_id, snapshot: Some(_) }) if frame_id == "first")
+        );
+        // This intervening frame is never sent to the first viewer.
+        frame.id = "second".into();
+        state.publish_frame(&frame.id, Some(&frame)).unwrap();
+        let (mut other_revision, mut other_visible) = (0, None);
+        state
+            .frame_update_for_viewer(&mut other_revision, &mut other_visible)
+            .unwrap();
+        state.publish_frame(&frame.id, None).unwrap();
+        assert!(
+            matches!(state.frame_update_for_viewer(&mut revision, &mut visible),
+            Some(ServerMsg::Frame { frame_id, snapshot: None }) if frame_id == "first")
+        );
+        assert!(
+            matches!(state.frame_update_for_viewer(&mut other_revision, &mut other_visible),
+            Some(ServerMsg::Frame { frame_id, snapshot: None }) if frame_id == "second")
+        );
+        assert!(visible.is_none() && other_visible.is_none());
+        assert!(
+            state
+                .frame_update_for_viewer(&mut revision, &mut visible)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_frames_coalesce_snapshots_and_fence_input_to_the_accepting_grant() {
+        let state = RemoteState::test_bridge();
+        *state.control.lock().unwrap() = ControlPolicy::new(false, true);
+        let frame = crate::guiframe::Snapshot {
+            id: "frame-1".into(),
+            component: "demo".into(),
+            w: 2,
+            h: 1,
+            cells: vec![crate::guiframe::Cell {
+                x: 0,
+                y: 0,
+                ch: 'X',
+                fg: [1, 2, 3],
+                bg: None,
+                bold: false,
+            }],
+        };
+        state.publish_frame(&frame.id, Some(&frame)).unwrap();
+        let mut cursor = 0;
+        assert!(matches!(
+            state.frame_update(&mut cursor),
+            Some(ServerMsg::Frame {
+                snapshot: Some(_),
+                ..
+            })
+        ));
+        state.publish_frame(&frame.id, Some(&frame)).unwrap();
+        assert!(state.frame_update(&mut cursor).is_none());
+        let request = crate::guiframe::Request {
+            id: frame.id.clone(),
+            input: crate::guiframe::Input::Key {
+                code: "a".into(),
+                text: Some('A'),
+            },
+        };
+        assert!(state.enqueue_frame_input(1, request.clone()).is_err());
+        assert_eq!(
+            state.control.lock().unwrap().request(1),
+            RequestOutcome::Granted
+        );
+        state.enqueue_frame_input(1, request.clone()).unwrap();
+        state.control.lock().unwrap().release(1);
+        assert_eq!(
+            state.control.lock().unwrap().request(1),
+            RequestOutcome::Granted
+        );
+        assert!(state.take_frame_inputs().is_empty());
+        state.enqueue_frame_input(1, request.clone()).unwrap();
+        assert_eq!(state.take_frame_inputs(), vec![request.clone()]);
+        let committed = crate::guiframe::Request {
+            id: frame.id.clone(),
+            input: crate::guiframe::Input::Text {
+                text: "日🦀".into(),
+            },
+        };
+        state.enqueue_frame_input(1, committed.clone()).unwrap();
+        state.control.lock().unwrap().release(1);
+        state.control.lock().unwrap().request(1);
+        assert!(state.take_frame_inputs().is_empty());
+        assert!(state.enqueue_frame_input(2, committed.clone()).is_err());
+        state.enqueue_frame_input(1, committed.clone()).unwrap();
+        assert_eq!(state.take_frame_inputs(), vec![committed]);
+        assert!(state.enqueue_frame_input(2, request.clone()).is_err());
+        let obsolete = crate::guiframe::Request {
+            id: "old-frame".into(),
+            ..request.clone()
+        };
+        assert!(state.enqueue_frame_input(1, obsolete).is_err());
+        for _ in 0..512 {
+            state.enqueue_frame_input(1, request.clone()).unwrap();
+        }
+        assert!(state.enqueue_frame_input(1, request.clone()).is_err());
+        state.publish_frame("old-frame", None).unwrap();
+        assert!(state.frame_update(&mut cursor).is_none());
+        state.publish_frame(&frame.id, None).unwrap();
+        assert!(state.take_frame_inputs().is_empty());
+        assert!(matches!(
+            state.frame_update(&mut cursor),
+            Some(ServerMsg::Frame { snapshot: None, .. })
+        ));
+        assert!(state.enqueue_frame_input(1, request).is_err());
+        assert!(state.bus.scrollback_since(None).0.is_empty());
+        assert!(!state.shared.has_prompt_requests());
+    }
+
+    #[test]
+    fn remote_buddy_slot_coalesces_and_never_enters_reconnect_history() {
+        let state = RemoteState::test_bridge();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend(1_u32.to_be_bytes());
+        png.extend(1_u32.to_be_bytes());
+        for revision in 1..=50 {
+            state
+                .buddy
+                .lock()
+                .unwrap()
+                .apply(crate::buddy::GraphicalUpdate::Frame(
+                    crate::buddyframe::Frame {
+                        revision,
+                        png: png.clone(),
+                    },
+                ));
+        }
+        let mut a = 0;
+        let mut b = 0;
+        assert!(
+            matches!(state.buddy_update(&mut a), Some(ServerMsg::Buddy {snapshot:Some(frame)}) if frame.revision == 50)
+        );
+        assert!(state.buddy_update(&mut a).is_none());
+        state
+            .buddy
+            .lock()
+            .unwrap()
+            .apply(crate::buddy::GraphicalUpdate::Clear);
+        assert!(matches!(
+            state.buddy_update(&mut a),
+            Some(ServerMsg::Buddy { snapshot: None })
+        ));
+        assert!(matches!(
+            state.buddy_update(&mut b),
+            Some(ServerMsg::Buddy { snapshot: None })
+        ));
+        assert!(state.bus.scrollback_since(None).0.is_empty());
+        let wire = ServerFrame::control(ServerMsg::Buddy { snapshot: None });
+        assert!(wire.id.is_none());
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&wire.to_json().unwrap()).unwrap(),
+            wire
+        );
+        assert!(
+            !ClientFrame::new(ClientMsg::Ping)
+                .to_json()
+                .unwrap()
+                .contains("buddy_stream")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_buddy_socket_requires_opt_in_and_authorization() {
+        use std::os::unix::net::UnixStream;
+        use tungstenite::{WebSocket, protocol::Role};
+        for (opt_in, authorized) in [(false, true), (true, true), (true, false)] {
+            let state = RemoteState::test_bridge();
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 128]))
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .unwrap();
+            let frame = crate::buddyframe::Frame {
+                revision: 9,
+                png: encoded.into_inner(),
+            };
+            state
+                .buddy
+                .lock()
+                .unwrap()
+                .apply(crate::buddy::GraphicalUpdate::Frame(frame));
+            let (client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let peer = std::thread::spawn({
+                let state = Arc::clone(&state);
+                move || {
+                    let mut socket = WebSocket::from_raw_socket(server, Role::Server, None);
+                    if let Some((session, streams, rx)) = do_handshake(&mut socket, &state)? {
+                        mirror_loop(&mut socket, &state, session, streams, &rx)?;
+                    }
+                    Ok::<_, String>(())
+                }
+            });
+            let mut socket = WebSocket::from_raw_socket(client, Role::Client, None);
+            let mut auth = ClientFrame::new(ClientMsg::ObserveAuth {
+                token: if authorized { "fixture" } else { "wrong" }.into(),
+            });
+            auth.buddy_stream = opt_in.then_some(true);
+            socket
+                .send(Message::Text(auth.to_json().unwrap().into()))
+                .unwrap();
+            if authorized {
+                for _ in 0..2 {
+                    let _ = socket.read().unwrap();
+                }
+                socket
+                    .send(Message::Text(
+                        ClientFrame::new(ClientMsg::Ping).to_json().unwrap().into(),
+                    ))
+                    .unwrap();
+                let mut seen = false;
+                loop {
+                    let message = socket.read().unwrap();
+                    let frame: ServerFrame =
+                        serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    if matches!(frame.msg, ServerMsg::Buddy { .. }) {
+                        seen = true;
+                        assert!(frame.id.is_none());
+                    }
+                    if matches!(frame.msg, ServerMsg::Pong) {
+                        break;
+                    }
+                }
+                assert_eq!(seen, opt_in);
+                socket.close(None).unwrap();
+            } else {
+                assert!(matches!(socket.read().unwrap(), Message::Close(_)));
+            }
+            peer.join().unwrap().unwrap();
+            assert_eq!(state.buddy_viewers.load(Ordering::Relaxed), 0);
+            assert!(state.bus.scrollback_since(None).0.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_frames_opt_in_preserves_legacy_auth_and_uses_unsequenced_wire_frames() {
+        let legacy = ClientFrame::new(ClientMsg::ObserveAuth {
+            token: "test".into(),
+        });
+        assert!(!legacy.to_json().unwrap().contains("frame_stream"));
+        let modern = ClientFrame::from_json(
+            r#"{"v":1,"type":"observe_auth","token":"test","frame_stream":true}"#,
+        )
+        .unwrap();
+        assert_eq!(modern.frame_stream, Some(true));
+        let wire = ServerFrame::control(ServerMsg::Frame {
+            frame_id: "frame-1".into(),
+            snapshot: None,
+        });
+        assert!(wire.id.is_none());
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&wire.to_json().unwrap()).unwrap(),
+            wire
+        );
+        let state = RemoteState::test_bridge();
+        assert!(!state.has_frame_viewers());
+        state.frame_viewers.fetch_add(1, Ordering::Relaxed);
+        let lease = FrameViewer(Arc::clone(&state));
+        assert!(state.has_frame_viewers());
+        drop(lease);
+        assert!(!state.has_frame_viewers());
+    }
+
+    #[test]
+    fn restart_completion_shutdown_refuses_auth_without_reading_socket() {
+        let state = RemoteState::test_bridge();
+        state.shutdown.store(true, Ordering::Relaxed);
+        let mut ws = tungstenite::WebSocket::from_raw_socket(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        assert_eq!(
+            authenticate(&mut ws, &state).unwrap(),
+            (None, false, false, Streams::default())
+        );
+        assert!(ws.get_ref().get_ref().is_empty());
+    }
+
+    #[test]
+    fn restart_completion_drains_command_ack_before_shutdown_bye() {
+        use tungstenite::{WebSocket, protocol::Role};
+        let remote = RemoteState::test_bridge();
+        let rx = MirrorReceiver::Ordinary(remote.bus.subscribe());
+        remote
+            .shared
+            .push_command_request("restart".into(), "/steer direction".into())
+            .unwrap();
+        let inputs = remote.shared.take_prompt_requests();
+        assert!(remote.begin_input(&inputs[0].0, &inputs[0].1));
+        remote.complete_input("restart", "/steer direction");
+        let mut server =
+            WebSocket::from_raw_socket(std::io::Cursor::new(Vec::new()), Role::Server, None);
+        drain_shutdown(&mut server, &rx, &mut None, None, false).unwrap();
+        let mut client = WebSocket::from_raw_socket(
+            std::io::Cursor::new(server.get_ref().get_ref().clone()),
+            Role::Client,
+            None,
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(client.read().unwrap().to_text().unwrap()).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(client.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(first["type"], "command_request_done");
+        assert_eq!(first["request_id"], "restart");
+        assert_eq!(last["type"], "bye");
+    }
+
+    #[test]
+    fn restart_completion_retires_input_once_without_changing_its_kind() {
+        let remote = RemoteState::test_bridge();
+        remote.control.lock().unwrap().grant(7);
+        remote
+            .enqueue_input(7, Some("restart".into()), "/steer direction".into(), true)
+            .unwrap();
+        let inputs = remote.shared.take_prompt_requests();
+        assert!(remote.begin_input(&inputs[0].0, &inputs[0].1));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| remote.complete_input("restart", "/steer direction"));
+            }
+        });
+        remote.complete_input("restart", "/steer direction");
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, UiEvent::CommandRequestDone { request_id } if request_id == "restart")).count(), 1);
+        assert!(!events.iter().any(|event| matches!(&event.event, UiEvent::PromptDone { request_id } if request_id == "restart")));
+        assert!(!remote.shared.cancel_prompt_request("restart"));
+        assert!(!remote.shared.request_is_pending("restart"));
+        assert!(!remote.shared.has_prompt_requests());
+    }
+
+    #[test]
+    fn restart_completion_covers_waiting_cancelled_and_legacy_requests_once() {
+        let remote = RemoteState::test_bridge();
+        remote.control.lock().unwrap().grant(7);
+        remote
+            .enqueue_input(7, Some("waiting".into()), "later prompt".into(), false)
+            .unwrap();
+        assert!(remote.shared.cancel_prompt_request("waiting"));
+        remote.complete_input("waiting", "later prompt");
+        remote.complete_input("waiting", "later prompt");
+        remote
+            .enqueue_input(7, None, "/usage".into(), true)
+            .unwrap();
+        let inputs = remote.shared.take_prompt_requests();
+        assert!(remote.begin_input(&inputs[0].0, &inputs[0].1));
+        for _ in 0..2 {
+            remote.complete_input(&inputs[0].0, &inputs[0].1);
+        }
+        let (events, _) = remote.bus.scrollback_since(None);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, UiEvent::PromptDone { request_id } if request_id == "waiting")).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, UiEvent::CommandDone { text } if text == "/usage")).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_handover_restores_endpoint_and_policy_with_fresh_runtime_state() {
+        let config = ServerConfig {
+            token: "private-restart-fixture".into(),
+            local_present: true,
+            allow_control: false,
+            allowed_origins: vec!["https://fixture.invalid".into()],
+            queue_max: 16384,
+        };
+        let original = match RemoteServer::start(
+            "127.0.0.1:0",
+            config.clone(),
+            Arc::new(BroadcastBus::new()),
+            Arc::new(TurnShared::default()),
+        ) {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP listener restoration: sandbox denies TCP bind: {error}");
+                return;
+            }
+            Err(error) => panic!("cannot start fixture listener: {error}"),
+        };
+        let address = original.local_addr;
+        let old_state = Arc::clone(&original.state);
+        old_state.control.lock().unwrap().grant(27);
+        old_state.shared.push_queued("old pending input".into());
+        let recipe = original.restart_settings().unwrap();
+        drop(original);
+        // The freed ephemeral port can be reassigned to a parallel test's
+        // listener before the restore binds it; retry briefly on that race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let restored = loop {
+            match recipe.clone().restore() {
+                Ok(server) => break server,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => panic!("cannot restore fixture listener: {error}"),
+            }
+        };
+        assert_eq!(restored.local_addr, address);
+        assert_eq!(restored.state.token, config.token);
+        assert_eq!(restored.state.allowed_origins, config.allowed_origins);
+        assert_eq!(restored.state.queue_max, config.queue_max);
+        assert_ne!(restored.state.instance_id, old_state.instance_id);
+        assert!(!Arc::ptr_eq(&restored.state.bus, &old_state.bus));
+        assert!(!Arc::ptr_eq(&restored.state.shared, &old_state.shared));
+        let policy = restored.state.control.lock().unwrap();
+        assert_eq!(policy.holder(), Holder::Local);
+        assert!(!policy.allow_control);
+        assert!(policy.pending().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_handover_captures_base_policy_without_carrying_grants_queues_or_replay_ids() {
+        let state = RemoteState::test_bridge();
+        state.control.lock().unwrap().grant(27);
+        state.shared.push_queued("private pending request".into());
+        let recipe = state
+            .restart_recipe("127.0.0.1:48731".parse().unwrap())
+            .unwrap();
+        let encoded = serde_json::to_string(&recipe).unwrap();
+        assert!(!encoded.contains("private pending request"));
+        assert!(!encoded.contains(&state.instance_id));
+        assert!(!encoded.contains("holder"));
+        let (address, config) = recipe.into_listener().unwrap();
+        assert_eq!(address.port(), 48731);
+        assert_eq!(config.token, "fixture");
+        assert!(config.local_present);
+        assert!(!config.allow_control);
+        assert_eq!(
+            ControlPolicy::new(config.local_present, config.allow_control).holder(),
+            Holder::Local
+        );
+        assert_eq!(state.control.lock().unwrap().holder(), Holder::Remote(27));
+    }
+
+    #[test]
+    fn replay_instances_are_stable_per_server_and_optional_in_legacy_hello_frames() {
+        let first = RemoteState::test_bridge();
+        let second = RemoteState::test_bridge();
+        let one = serde_json::to_value(first.hello(1, false)).unwrap();
+        let two = serde_json::to_value(first.hello(2, true)).unwrap();
+        let other = serde_json::to_value(second.hello(1, false)).unwrap();
+        assert_eq!(one["instance_id"], two["instance_id"]);
+        assert_ne!(one["instance_id"], other["instance_id"]);
+        assert_eq!(one["instance_id"].as_str().unwrap().len(), 22);
+        let legacy: ServerMsg = serde_json::from_value(serde_json::json!({"type":"hello", "protocol_version":1,"plank_version":"legacy","session_id":1,"controller":false})).unwrap();
+        assert!(matches!(
+            legacy,
+            ServerMsg::Hello {
+                instance_id: None,
+                ..
+            }
+        ));
+        assert!(
+            !serde_json::to_value(legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("instance_id")
+        );
+        assert!(!format!("{first:?}").contains("fixture"));
+    }
+
     #[test]
     fn export_transfer_auth_opt_in_preserves_legacy_frame_bytes() {
         let legacy = ClientFrame::new(ClientMsg::Auth {
@@ -2954,6 +4674,7 @@ mod tests {
     #[test]
     fn notify_event_reaches_the_wire_with_both_fields() {
         let ev = UiEvent::Notify {
+            mode: Some("unfocused".into()),
             title: "finished: rename the thing".into(),
             body: "…done.".into(),
         };
@@ -2964,6 +4685,33 @@ mod tests {
         assert!(json.contains(r#""type":"notify""#), "{json}");
         assert!(json.contains("finished: rename the thing"), "{json}");
         assert!(json.contains("…done."), "{json}");
+        assert!(json.contains(r#""mode":"unfocused""#), "{json}");
+        let decoded: ServerFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.msg,
+            ServerMsg::Notify {
+                title: "finished: rename the thing".into(),
+                body: "…done.".into(),
+                mode: Some("unfocused".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn notify_wire_accepts_legacy_and_preserves_never_policy() {
+        let legacy: ServerMsg = serde_json::from_value(serde_json::json!({
+            "type":"notify", "title":"Done", "body":"Finished"
+        }))
+        .unwrap();
+        assert!(matches!(legacy, ServerMsg::Notify { mode: None, .. }));
+        let event = UiEvent::Notify {
+            title: "Done".into(),
+            body: "Finished".into(),
+            mode: Some("never".into()),
+        };
+        let message = ServerMsg::from_event(&event).unwrap();
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(value["mode"], "never");
     }
 
     /// A remote header shows the same "where am I?" segments as the local
@@ -3017,7 +4765,7 @@ mod tests {
             UiEvent::Jobs(JobsWire::capture(&[])),
             UiEvent::Question(serde_json::json!({"id":"q1","options":[]})),
             UiEvent::QuestionDone { id: "q1".into() },
-            UiEvent::Editor(serde_json::json!({"id":"e1","title":"File","text":"content"})),
+            UiEvent::Editor(serde_json::json!({"id":"e1","title":"File","text":"content"}).into()),
             UiEvent::EditorDone { id: "e1".into() },
             UiEvent::UserEcho("u".into()),
             UiEvent::EndLine,
@@ -3072,6 +4820,7 @@ mod tests {
     fn host_snapshot_tracks_grants_and_expired_reservations_without_credentials() {
         let state = RemoteState {
             endpoint: "ws://127.0.0.1:9000/".into(),
+            instance_id: replay_instance_id().unwrap(),
             bus: Arc::new(BroadcastBus::new()),
             shared: Arc::new(TurnShared::default()),
             control: Mutex::new(ControlPolicy::new(true, false)),
@@ -3080,6 +4829,16 @@ mod tests {
             queue_max: 1024,
             session_ids: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
+            foreground_download: Mutex::new(None),
+            frame: Mutex::default(),
+            frame_viewers: std::sync::atomic::AtomicUsize::new(0),
+            editor_viewers: std::sync::atomic::AtomicUsize::new(0),
+            output_control: Mutex::new(None),
+            live_controls: Mutex::default(),
+            buddy: Mutex::default(),
+            buddy_viewers: std::sync::atomic::AtomicUsize::new(0),
         };
         let local = state.host_snapshot().unwrap();
         assert_eq!(local.holder, "local");
@@ -3134,6 +4893,7 @@ mod tests {
     fn remote_questions_allow_only_the_current_controller() {
         let state = RemoteState {
             endpoint: "ws://127.0.0.1:9000/".into(),
+            instance_id: replay_instance_id().unwrap(),
             bus: Arc::new(BroadcastBus::new()),
             shared: Arc::new(TurnShared::default()),
             control: Mutex::new(ControlPolicy::new(false, false)),
@@ -3142,6 +4902,16 @@ mod tests {
             queue_max: 1024,
             session_ids: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
+            foreground_download: Mutex::new(None),
+            frame: Mutex::default(),
+            frame_viewers: std::sync::atomic::AtomicUsize::new(0),
+            editor_viewers: std::sync::atomic::AtomicUsize::new(0),
+            output_control: Mutex::new(None),
+            live_controls: Mutex::default(),
+            buddy: Mutex::default(),
+            buddy_viewers: std::sync::atomic::AtomicUsize::new(0),
         };
         assert_eq!(
             state.control.lock().unwrap().request(7),
@@ -3172,6 +4942,12 @@ mod tests {
     #[test]
     fn client_frame_roundtrip() {
         let msgs = [
+            ClientMsg::LiveControl {
+                request: crate::livecontrol::LiveControl::MicroCompaction(false),
+            },
+            ClientMsg::JobOutputStop {
+                observer: "live-observer".into(),
+            },
             ClientMsg::Auth {
                 token: "abc".into(),
                 resume_from: Some(5),
@@ -3206,6 +4982,121 @@ mod tests {
     }
 
     #[test]
+    fn job_output_cancel_rejection_roundtrips_without_completion_identity() {
+        let frame = ServerFrame::control(ServerMsg::JobOutputRejected {
+            observer: "live-observer".into(),
+            reason: "not controller".into(),
+        });
+        let json = frame.to_json().unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+        assert!(json.contains("job_output_rejected"));
+        assert!(!json.contains("request_id"));
+    }
+
+    #[test]
+    fn live_controls_require_the_accepting_grant_and_never_change_prompt_ownership() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "remote::control::tests::live_controls_grant_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "process-wide settings fixture invoked by its parent test"]
+    fn live_controls_grant_fixture() {
+        use crate::livecontrol::LiveControl;
+        let state = RemoteState::test_bridge();
+        let request = LiveControl::MicroCompaction(false);
+        assert!(state.enqueue_live_control(7, request).is_err());
+        state.control.lock().unwrap().grant(7);
+        assert!(
+            state.enqueue_live_control(7, request).is_err(),
+            "Catalog must be ready"
+        );
+        state.remember_controls(&serde_json::json!({"version":1,"commands":[],"settings":{"micro_compaction":true,"loop_guard":true}}));
+        assert!(
+            state
+                .enqueue_live_control(7, LiveControl::Hints(true))
+                .is_err()
+        );
+        assert!(
+            state
+                .enqueue_live_control(
+                    7,
+                    LiveControl::Notifications(crate::notify::NotifyMode::Never)
+                )
+                .is_err()
+        );
+        assert!(state.enqueue_live_control(8, request).is_err());
+        state.enqueue_live_control(7, request).unwrap();
+        state.control.lock().unwrap().release(7);
+        state.control.lock().unwrap().grant(7);
+        state.poll_live_controls();
+        assert!(
+            crate::settings::active().context.microcompact,
+            "Regrant must not restore an old control"
+        );
+        state.enqueue_live_control(7, request).unwrap();
+        state.poll_live_controls();
+        assert!(!crate::settings::active().context.microcompact);
+        crate::hints::set_wanted(false);
+        state.remember_controls(&serde_json::json!({"version":1,"commands":[],"features":[{"name":"live_hints","available":true}],"settings":{}}));
+        state
+            .enqueue_live_control(7, LiveControl::Hints(true))
+            .unwrap();
+        state.control.lock().unwrap().release(7);
+        state.control.lock().unwrap().grant(7);
+        state.poll_live_controls();
+        assert!(
+            !crate::hints::wanted(),
+            "Regrant must discard the old hints setting"
+        );
+        for _ in 0..64 {
+            state.enqueue_live_control(7, request).unwrap();
+        }
+        assert!(state.enqueue_live_control(7, request).is_err());
+        state.request_stop();
+        assert!(state.enqueue_live_control(7, request).is_err());
+        state.poll_live_controls();
+        assert!(state.live_controls.lock().unwrap().pending.is_empty());
+        assert!(!state.shared.has_prompt_requests());
+        assert!(!state.shared.interrupt.load(Ordering::Relaxed));
+        let events = state.bus.scrollback_since(None).0;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.event, UiEvent::Controls(_)))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            &event.event,
+            UiEvent::PromptDone { .. }
+                | UiEvent::CommandDone { .. }
+                | UiEvent::CommandRequestDone { .. }
+        )));
+        let frame = ServerFrame::control(ServerMsg::LiveControlRejected {
+            request,
+            reason: "not the controller".into(),
+        });
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&frame.to_json().unwrap()).unwrap(),
+            frame
+        );
+    }
+
+    #[test]
     fn auth_defaults_resume_from_absent() {
         let f = ClientFrame::from_json(r#"{"v":1,"type":"auth","token":"x"}"#).unwrap();
         assert_eq!(
@@ -3218,9 +5109,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_editors_allow_only_the_controller_and_require_explicit_content() {
+    fn job_output_cancel_requires_current_controller_and_observer() {
         let state = RemoteState {
             endpoint: "ws://127.0.0.1:9000/".into(),
+            instance_id: replay_instance_id().unwrap(),
             bus: Arc::new(BroadcastBus::new()),
             shared: Arc::new(TurnShared::default()),
             control: Mutex::new(ControlPolicy::new(false, false)),
@@ -3229,6 +5121,59 @@ mod tests {
             queue_max: 1024,
             session_ids: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
+            foreground_download: Mutex::new(None),
+            frame: Mutex::default(),
+            frame_viewers: std::sync::atomic::AtomicUsize::new(0),
+            editor_viewers: std::sync::atomic::AtomicUsize::new(0),
+            output_control: Mutex::new(None),
+            live_controls: Mutex::default(),
+            buddy: Mutex::default(),
+            buddy_viewers: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let hub = Arc::new(crate::jobcancel::Hub::default());
+        let control = Arc::new(std::sync::atomic::AtomicU8::new(crate::jobcancel::RUNNING));
+        let _lease = hub.register("live-observer", &control).unwrap();
+        state.set_output_control(hub);
+        assert!(state.stop_job_output(7, "live-observer").is_err());
+        assert_eq!(
+            state.control.lock().unwrap().request(7),
+            RequestOutcome::Granted
+        );
+        assert!(state.stop_job_output(8, "live-observer").is_err());
+        assert!(state.stop_job_output(7, "old-observer").is_err());
+        assert_eq!(control.load(Ordering::Acquire), crate::jobcancel::RUNNING);
+        state.stop_job_output(7, "live-observer").unwrap();
+        assert_eq!(control.load(Ordering::Acquire), crate::jobcancel::REQUESTED);
+        state.control.lock().unwrap().release(7);
+        assert!(state.stop_job_output(7, "live-observer").is_err());
+        assert!(!state.shared.interrupt.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn remote_editors_allow_only_the_controller_and_require_explicit_content() {
+        let state = RemoteState {
+            endpoint: "ws://127.0.0.1:9000/".into(),
+            instance_id: replay_instance_id().unwrap(),
+            bus: Arc::new(BroadcastBus::new()),
+            shared: Arc::new(TurnShared::default()),
+            control: Mutex::new(ControlPolicy::new(false, false)),
+            token: "test".into(),
+            allowed_origins: Vec::new(),
+            queue_max: 1024,
+            session_ids: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
+            foreground_download: Mutex::new(None),
+            frame: Mutex::default(),
+            frame_viewers: std::sync::atomic::AtomicUsize::new(0),
+            editor_viewers: std::sync::atomic::AtomicUsize::new(0),
+            output_control: Mutex::new(None),
+            live_controls: Mutex::default(),
+            buddy: Mutex::default(),
+            buddy_viewers: std::sync::atomic::AtomicUsize::new(0),
         };
         assert_eq!(
             state.control.lock().unwrap().request(7),
@@ -3244,6 +5189,28 @@ mod tests {
             state.shared.editors.take_reply("re1"),
             Some(crate::remote::editors::EditReply::Save("saved".into()))
         );
+        state.shared.editors.open("streamed");
+        let body = "🦀\r\n".repeat(100_000);
+        let mut frames = crate::documenttransfer::Sender::new("save-1", &body).unwrap();
+        let begin = serde_json::to_value(frames.next().unwrap()).unwrap();
+        assert!(!accept_editor_reply(&state, 8, "streamed", &begin).unwrap());
+        assert!(accept_editor_reply(&state, 7, "streamed", &begin).unwrap());
+        let first = serde_json::to_value(frames.next().unwrap()).unwrap();
+        assert!(accept_editor_reply(&state, 7, "streamed", &first).unwrap());
+        assert!(state.shared.editors.take_reply("streamed").is_none());
+        state.control.lock().unwrap().grant(7);
+        assert!(!accept_editor_reply(&state, 7, "streamed", &first).unwrap());
+        // A fresh Begin under the new grant is required before any Save can land.
+        for frame in crate::documenttransfer::Sender::new("save-2", &body).unwrap() {
+            let text = serde_json::to_value(frame).unwrap();
+            assert!(!accept_editor_reply(&state, 7, "old", &text).unwrap());
+            assert!(accept_editor_reply(&state, 7, "streamed", &text).unwrap());
+        }
+        assert_eq!(
+            state.shared.editors.take_reply("streamed"),
+            Some(crate::remote::editors::EditReply::Save(body))
+        );
+        assert!(!accept_editor_reply(&state, 7, "streamed", &first).unwrap());
         assert!(ClientFrame::from_json(r#"{"v":1,"type":"edit","document_id":"re1"}"#).is_err());
         assert!(
             ClientFrame::from_json(r#"{"v":1,"type":"edit","document_id":"re1","text":null}"#)
@@ -3505,9 +5472,20 @@ mod tests {
     }
 
     fn read_server(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Option<ServerFrame> {
+        // Periodic Host/Downloads snapshots are background state, not the
+        // frame a given test step is waiting for; skip them.
         loop {
             match ws.read() {
-                Ok(Message::Text(t)) => return Some(serde_json::from_str(&t).unwrap()),
+                Ok(Message::Text(t)) => {
+                    let frame: ServerFrame = serde_json::from_str(&t).unwrap();
+                    if matches!(
+                        frame.msg,
+                        ServerMsg::Host { .. } | ServerMsg::Downloads { .. }
+                    ) {
+                        continue;
+                    }
+                    return Some(frame);
+                }
                 Ok(Message::Close(_)) | Err(_) => return None,
                 Ok(_) => {}
             }
@@ -3640,6 +5618,7 @@ mod tests {
         read_server(&mut ws).expect("snapshot");
 
         server.state.bus.broadcast(UiEvent::Notify {
+            mode: None,
             title: "finished: add the button".into(),
             body: "…and wired it up.".into(),
         });
@@ -3647,6 +5626,7 @@ mod tests {
         assert_eq!(
             frame.msg,
             ServerMsg::Notify {
+                mode: None,
                 title: "finished: add the button".into(),
                 body: "…and wired it up.".into(),
             }

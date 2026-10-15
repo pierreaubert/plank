@@ -234,6 +234,22 @@ Versioned envelope so the web client and server can evolve:
 reads it off `status.state`, and end-of-turn arrives as `notify`. `snapshot`
 carries `scrollback` and `highest_id` (the resume cursor), not a `status`.
 
+Graphical clients may opt into `editor_stream: true` on their initial `auth` or
+`observe_auth` frame. These clients receive `editor_stream` messages whose
+`request` contains `id`, `title`, and a document-transfer `frame` (begin/chunk/end,
+32 KiB UTF-8 chunks, total byte length and SHA-256). Only a validated end publishes
+an editor. `editor_done`, a replacement dialog, reset, or disconnect retires a
+partial opening. Clients without the flag retain inline `editor` requests.
+
+The same opt-in sends reconnect history as individual `replay` envelopes, each
+containing an `entry` with its original event ID. Editors expand into multiple
+bounded pieces sharing that ID; these pieces are assembled before publishing and
+must not be discarded as duplicate transcript entries. The final `snapshot` has
+empty `scrollback` and the captured `highest_id`. Clients wait for this marker
+before submitting input, and suppress notifications inside replay. The bus captures
+replay and registers the live subscriber under one lock, so events emitted while
+replay is being written arrive afterward without a subscription gap.
+
 `reset` and `notify` are the two frames the design did not anticipate, and both
 exist because a *remote* front-end is not the local one:
 

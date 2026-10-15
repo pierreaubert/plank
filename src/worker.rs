@@ -24,6 +24,31 @@ use crate::status::Status;
 use crate::tui::OutputLog;
 use crate::viz::RenderSink;
 
+/// A shared editor original excluded from diagnostic text.
+#[derive(Clone)]
+pub struct EditorRequest(Arc<serde_json::Value>);
+
+impl From<serde_json::Value> for EditorRequest {
+    fn from(value: serde_json::Value) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl AsRef<serde_json::Value> for EditorRequest {
+    fn as_ref(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for EditorRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EditorRequest")
+            .field("bytes", &self.0["text"].as_str().map(str::len))
+            .finish_non_exhaustive()
+    }
+}
+
 /// One worker→UI message during a turn.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -91,6 +116,8 @@ pub enum UiEvent {
         title: String,
         /// Notification body (the tail of the answer).
         body: String,
+        /// Optional desktop policy for rebuilt graphical clients.
+        mode: Option<String>,
     },
     /// A remote slash command returned to the idle dispatcher.
     CommandDone {
@@ -111,7 +138,7 @@ pub enum UiEvent {
         id: String,
     },
     /// A document awaiting an explicit remote Save or Cancel.
-    Editor(serde_json::Value),
+    Editor(EditorRequest),
     /// The pending document editor closed.
     EditorDone {
         /// Identity of the closed editor.
@@ -478,6 +505,42 @@ impl BroadcastBus {
             .any(|subscriber| subscriber.exports.is_some())
     }
 
+    /// Atomically captures replay and subscribes to every subsequent live event.
+    ///
+    /// File events use bounded storage only when `exports` is enabled. Events
+    /// published after the snapshot boundary are queued while replay is sent.
+    #[must_use]
+    pub fn subscribe_replay(
+        &self,
+        exports: bool,
+        resume_from: Option<u64>,
+    ) -> (ExportReceiver, Vec<SeqEvent>, Option<u64>) {
+        let (ordinary, ordinary_rx) = std::sync::mpsc::channel();
+        let (files, files_rx) = std::sync::mpsc::sync_channel(EXPORT_QUEUE_EVENTS);
+        let mut inner = Self::lock(&self.inner);
+        let tail = inner
+            .scrollback
+            .iter()
+            .filter(|event| resume_from.is_none_or(|from| event.id > from))
+            .cloned()
+            .collect();
+        let highest = inner.next_id.checked_sub(1);
+        inner.subscribers.push(Subscriber {
+            ordinary,
+            exports: exports.then_some(files),
+            failed_export: Arc::new(Mutex::new(None)),
+        });
+        (
+            ExportReceiver {
+                ordinary: ordinary_rx,
+                exports: files_rx,
+                heads: Mutex::new([None, None]),
+            },
+            tail,
+            highest,
+        )
+    }
+
     /// Delivers file events with cancellable backpressure and explicit partial retirement.
     ///
     /// # Errors
@@ -586,6 +649,15 @@ impl BroadcastBus {
         if matches!(event, UiEvent::SessionReset) {
             inner.scrollback.clear();
         }
+        // Original documents are current interactive state, not transcript
+        // history. Keep only the pending one and retire its body on closure.
+        match &event {
+            UiEvent::Editor(_) => inner.scrollback.retain(|old| !matches!(old.event, UiEvent::Editor(_))),
+            UiEvent::EditorDone { id } => inner.scrollback.retain(|old| {
+                !matches!(&old.event, UiEvent::Editor(request) if request.as_ref()["id"].as_str() == Some(id.as_str()))
+            }),
+            _ => {}
+        }
         // Snapshots replace older readings so idle polling preserves transcript
         // history and does not retain thousands of copies of large reports.
         if matches!(
@@ -625,7 +697,14 @@ impl BroadcastBus {
         let seq = SeqEvent { id, event };
         inner.scrollback.push_back(seq.clone());
         while inner.scrollback.len() > SCROLLBACK_CAP {
-            inner.scrollback.pop_front();
+            // A pending editor remains available to late joiners even when
+            // unrelated output fills the replay ring. At most one is pinned.
+            let evict = inner
+                .scrollback
+                .iter()
+                .position(|old| !matches!(old.event, UiEvent::Editor(_)))
+                .unwrap_or(0);
+            inner.scrollback.remove(evict);
         }
         inner
             .subscribers
@@ -882,8 +961,15 @@ pub struct TurnShared {
     pub repro_written: Mutex<Option<std::path::PathBuf>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompletedInput {
+    pub(crate) command: bool,
+    pub(crate) legacy: bool,
+}
+
 #[derive(Debug, Default)]
 struct PromptRequests {
+    pending: std::collections::HashSet<String>,
     queued: Vec<(String, String)>,
     recent: std::collections::VecDeque<String>,
     dispatched: std::collections::HashSet<String>,
@@ -904,14 +990,14 @@ impl PromptRequests {
         owner: Option<crate::remote::control::ControlStamp>,
         legacy: bool,
     ) -> Result<(), String> {
-        if self.recent.contains(&id) || self.dispatched.contains(&id) || self.running.contains(&id)
-        {
+        if self.recent.contains(&id) || self.pending.contains(&id) {
             return Err("input request ID already used".into());
         }
         if self.queued.len() >= 64 {
             return Err("identified input queue is full".into());
         }
         self.recent.push_back(id.clone());
+        self.pending.insert(id.clone());
         while self.recent.len() > 128 {
             self.recent.pop_front();
         }
@@ -1169,16 +1255,30 @@ impl TurnShared {
 
     /// Retires a finished request so late cancellation cannot interrupt another turn.
     pub fn finish_prompt_request(&self, id: &str) {
+        let _ = self.retire_prompt_request(id);
+    }
+
+    /// Captures completion identity and retires it exactly once under one lock.
+    pub(crate) fn retire_prompt_request(&self, id: &str) -> Option<CompletedInput> {
         let mut requests = self
             .prompt_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !requests.pending.remove(id) {
+            return None;
+        }
+        let completed = CompletedInput {
+            command: requests.commands.contains(id),
+            legacy: requests.legacy.contains(id),
+        };
+        requests.queued.retain(|(request, _)| request != id);
         requests.dispatched.remove(id);
         requests.running.remove(id);
         requests.cancelled.remove(id);
         requests.commands.remove(id);
         requests.owners.remove(id);
         requests.legacy.remove(id);
+        Some(completed)
     }
 
     /// Identifies completion kind before retiring a cancelled request.
@@ -1470,6 +1570,95 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn editor_originals_are_shared_pinned_and_retired_without_entering_closed_replay() {
+        let bus = BroadcastBus::new();
+        let a = bus.subscribe();
+        let b = bus.subscribe();
+        let original =
+            EditorRequest::from(serde_json::json!({"id":"editor-1","text":"private original"}));
+        let weak = Arc::downgrade(&original.0);
+        assert!(!format!("{original:?}").contains("private original"));
+        bus.broadcast(UiEvent::Editor(original));
+        let UiEvent::Editor(first) = a.try_recv().unwrap().event else {
+            panic!("expected editor");
+        };
+        let UiEvent::Editor(second) = b.try_recv().unwrap().event else {
+            panic!("expected editor");
+        };
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        drop(first);
+        drop(second);
+        for _ in 0..SCROLLBACK_CAP + 2 {
+            bus.broadcast(UiEvent::Visible("output".into()));
+        }
+        {
+            let (tail, _) = bus.scrollback_since(None);
+            assert_eq!(tail.len(), SCROLLBACK_CAP);
+            assert!(
+                tail.iter()
+                    .any(|event| matches!(event.event, UiEvent::Editor(_)))
+            );
+            assert!(tail.windows(2).all(|pair| pair[0].id < pair[1].id));
+        }
+        bus.broadcast(UiEvent::EditorDone { id: "other".into() });
+        assert!(weak.upgrade().is_some());
+        bus.broadcast(UiEvent::EditorDone {
+            id: "editor-1".into(),
+        });
+        assert!(weak.upgrade().is_none());
+        assert!(
+            !bus.scrollback_since(None)
+                .0
+                .iter()
+                .any(|event| matches!(event.event, UiEvent::Editor(_)))
+        );
+        let bus = BroadcastBus::new();
+        let original = EditorRequest::from(serde_json::json!({"id":"old","text":"first"}));
+        let weak = Arc::downgrade(&original.0);
+        bus.broadcast(UiEvent::Editor(original));
+        bus.broadcast(UiEvent::Editor(
+            serde_json::json!({"id":"new","text":"second"}).into(),
+        ));
+        assert!(weak.upgrade().is_none());
+        bus.broadcast(UiEvent::SessionReset);
+        // The reset marker itself is retained (see
+        // `session_reset_drops_the_scrollback_it_invalidates`); only the
+        // pre-reset editor and transcript are gone.
+        let (tail, _) = bus.scrollback_since(None);
+        assert_eq!(tail.len(), 1, "only the reset survives: {tail:?}");
+        assert!(matches!(tail[0].event, UiEvent::SessionReset));
+        assert!(
+            !tail
+                .iter()
+                .any(|event| matches!(event.event, UiEvent::Editor(_)))
+        );
+    }
+
+    #[test]
+    fn replay_subscription_keeps_snapshot_and_live_events_on_opposite_sides() {
+        for exports in [false, true] {
+            let bus = super::BroadcastBus::new();
+            bus.broadcast(super::UiEvent::Visible("Before capture".into()));
+            let (receiver, tail, highest) = bus.subscribe_replay(exports, None);
+            assert_eq!(tail.len(), 1);
+            assert_eq!(Some(tail[0].id), highest);
+            assert_eq!(bus.has_export_subscribers(), exports);
+            // These events occur while the connection is still sending replay.
+            bus.broadcast(super::UiEvent::Visible("During replay".into()));
+            bus.broadcast(super::UiEvent::EditorDone {
+                id: "closed-during-replay".into(),
+            });
+            let live: Vec<_> = receiver.try_iter().collect();
+            assert_eq!(live.len(), 2);
+            assert!(live.iter().all(|event| Some(event.id) > highest));
+            let (next, resumed, latest) = bus.subscribe_replay(exports, highest);
+            assert_eq!(resumed.len(), 2);
+            assert_eq!(latest, Some(live[1].id));
+            assert!(next.try_iter().next().is_none());
+        }
+    }
+
+    #[test]
     fn console_aside_output_is_separate_and_does_not_duplicate_primary_text() {
         use crate::viz::{CollectSink, RenderSink};
         let primary = CollectSink::default();
@@ -1574,7 +1763,7 @@ mod tests {
         let ordinary = {
             let bus = Arc::clone(&bus);
             std::thread::spawn(move || {
-                bus.broadcast(UiEvent::Visible("ordinary output remains live".into()))
+                bus.broadcast(UiEvent::Visible("ordinary output remains live".into()));
             })
         };
         assert!(matches!(
@@ -1672,11 +1861,11 @@ mod tests {
             },
         )
         .unwrap();
-        let received = receiver.try_iter().collect::<Vec<_>>();
-        assert_eq!(received.len(), 3);
+        let captured = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 3);
         let mut log = crate::tui::OutputLog::new();
         let before = log.line_count();
-        for event in received {
+        for event in captured {
             let message = crate::remote::control::ServerMsg::from_event(&event.event).unwrap();
             let frame = crate::remote::control::ServerFrame::seq(event.id, message);
             let encoded = serde_json::to_vec(&frame).unwrap();
@@ -2124,6 +2313,9 @@ mod tests {
                 crate::remote::control::SessionsWire::capture(&[], 1),
             ));
             bus.broadcast(super::UiEvent::Config(crate::remote::control::ConfigWire {
+                scope: None,
+                components: Vec::new(),
+                components_total: 0,
                 total: 0,
                 page: 1,
                 fields: Vec::new(),

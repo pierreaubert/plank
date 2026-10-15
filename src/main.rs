@@ -19,8 +19,8 @@
 //! provider API engines, or the `EchoEngine` stub elsewhere) and [`make_host`] for
 //! the shared-engine variant. Startup maintenance, RAM checks, and
 //! instance-lock guarding are all handled here before handing control to the
-//! UI layer; the remote-control server itself is started at runtime by `/rc`,
-//! not here.
+//! UI layer. `/rc` starts remote-control hosting at runtime; replacement
+//! processes restore its private listener recipe before loading an engine.
 
 use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
@@ -60,7 +60,14 @@ fn print_plugin_warnings(plugins: &plank::plugins::PluginSet) {
 /// Offers to update the installed profile `name` when `source` now declares a
 /// higher `version`. Reads only the source's manifest, so a profile that is
 /// current costs no download; a check that fails launches what is installed.
-fn update_if_newer(source: &str, name: &str, dir: &std::path::Path, home: &std::path::Path) {
+fn update_if_newer(
+    source: &str,
+    name: &str,
+    dir: &std::path::Path,
+    home: &std::path::Path,
+    interactive: bool,
+    approve: &mut impl FnMut(&str) -> bool,
+) {
     let installed = plank::profiles::version_of(dir);
     let available = plank::claudeplugin::source_version(source);
     let plank::profiles::Freshness::Newer {
@@ -70,13 +77,13 @@ fn update_if_newer(source: &str, name: &str, dir: &std::path::Path, home: &std::
     else {
         return;
     };
-    if !can_ask() {
+    if !interactive {
         eprintln!(
             "plank: profile {name} {available} is available (installed: {installed}); launch interactively to update"
         );
         return;
     }
-    if !ask_yes(&format!(
+    if !approve(&format!(
         "Update profile {name} {installed} -> {available}? This replaces the installed copy, including changes made with /edit-profile."
     )) {
         return;
@@ -87,13 +94,23 @@ fn update_if_newer(source: &str, name: &str, dir: &std::path::Path, home: &std::
     }
 }
 
-/// Whether there is a person at a terminal to answer a startup question.
-fn can_ask() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+/// Whether the available frontend can answer startup confirmations.
+fn can_ask(consent: StartupConsent<'_>) -> bool {
+    consent.remote.is_some()
+        || consent.gui
+        || (std::io::stdin().is_terminal() && std::io::stderr().is_terminal())
 }
 
-/// Asks `question` on stderr and reads one line; an empty answer is yes.
-fn ask_yes(question: &str) -> bool {
+/// Requests startup consent through the available frontend.
+///
+/// Ordinary terminals retain `[Y/n]`; GUI and remote clients require explicit Yes.
+fn ask_yes(question: &str, consent: StartupConsent<'_>) -> bool {
+    if let Some(remote) = consent.remote {
+        return plank::ui::startup_confirm(remote, question);
+    }
+    if consent.gui {
+        return plank::ui::gui_startup_confirm(question);
+    }
     eprint!("{question} [Y/n] ");
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
@@ -110,11 +127,23 @@ fn ask_yes(question: &str) -> bool {
 /// An install that recorded this same source is used as is, with no fetch and
 /// no question, which is what lets the same command line launch it every time
 /// (and `/edit-profile`'s restart reuse it). Otherwise the user is asked
-/// before anything is fetched; with no terminal to ask on, nothing is
-/// installed and the error names the command that would do it.
+/// before anything is fetched; without a terminal, GUI or restored controller,
+/// nothing is installed and the error names the command that would do it.
 fn resolve_profile_source(
     source: &str,
     home: Option<&std::path::Path>,
+    consent: StartupConsent<'_>,
+) -> Result<String, ExitCode> {
+    resolve_profile_source_with(source, home, can_ask(consent), |question| {
+        ask_yes(question, consent)
+    })
+}
+
+fn resolve_profile_source_with(
+    source: &str,
+    home: Option<&std::path::Path>,
+    interactive: bool,
+    mut approve: impl FnMut(&str) -> bool,
 ) -> Result<String, ExitCode> {
     let Some(home) = home else {
         eprintln!("plank: no HOME, so there is nowhere to install the profile {source:?}");
@@ -122,16 +151,16 @@ fn resolve_profile_source(
     };
     let normalized = plank::profiles::normalize_source(source);
     if let Some((name, dir)) = plank::profiles::find_by_source(home, &normalized) {
-        update_if_newer(source, &name, &dir, home);
+        update_if_newer(source, &name, &dir, home, interactive, &mut approve);
         return Ok(name);
     }
-    if !can_ask() {
+    if !interactive {
         eprintln!(
             "plank: the profile {source:?} is not installed; install it with /install-profile {source}, or launch interactively to be asked"
         );
         return Err(ExitCode::from(2));
     }
-    if !ask_yes(&format!(
+    if !approve(&format!(
         "Install the profile {source} into {}?",
         plank::profiles::dir(home).display()
     )) {
@@ -184,11 +213,12 @@ fn resolve_and_activate_profile(
     explicit_empty: bool,
     plugins: &mut plank::plugins::PluginSet,
     home: Option<&std::path::Path>,
+    consent: StartupConsent<'_>,
 ) -> Option<ExitCode> {
     // A path or `owner/repo:folder` becomes the name of the installed copy,
     // installing it first when it is not installed yet.
     let resolved = match requested.filter(|r| plank::profiles::is_source(r)) {
-        Some(source) => match resolve_profile_source(source, home) {
+        Some(source) => match resolve_profile_source(source, home, consent) {
             Ok(name) => Some(name),
             Err(code) => return Some(code),
         },
@@ -280,6 +310,40 @@ fn resolve_and_activate_profile(
         plank::profile::Resolution::NotAProfile(name) => {
             eprintln!("plank: plugin {name:?} declares no profile block");
             Some(ExitCode::from(2))
+        }
+    }
+}
+
+fn activate_profile_for_startup(
+    provisional: &AgentConfig,
+    plugins: &mut plank::plugins::PluginSet,
+    remote: Option<&plank::remote::control::RemoteState>,
+) -> Option<ExitCode> {
+    resolve_and_activate_profile(
+        provisional.profile.as_deref(),
+        provisional.profile_explicit_empty,
+        plugins,
+        home_dir().as_deref(),
+        StartupConsent::for_startup(provisional, remote, plank::ui::gui_protocol_enabled()),
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StartupConsent<'a> {
+    remote: Option<&'a plank::remote::control::RemoteState>,
+    gui: bool,
+}
+
+impl<'a> StartupConsent<'a> {
+    fn for_startup(
+        cfg: &AgentConfig,
+        remote: Option<&'a plank::remote::control::RemoteState>,
+        gui: bool,
+    ) -> Self {
+        let interactive = remote_startup_allowed(cfg);
+        Self {
+            remote: remote.filter(|_| interactive),
+            gui: gui && interactive,
         }
     }
 }
@@ -477,6 +541,7 @@ fn pick_engine_before_resolve(
     root: &std::path::Path,
     recommended: Option<plank::engines::Recommendation<'_>>,
     menu_allowed: bool,
+    remote: Option<&plank::remote::control::RemoteState>,
 ) -> Result<(), String> {
     let local = cfg.remote_url.is_none() && cfg.provider.is_none();
     let from_cli = model_from_cli(cfg);
@@ -527,7 +592,7 @@ fn pick_engine_before_resolve(
         },
     );
     let current = probe.as_ref().and_then(|s| s.id).map(|id| id.to_string());
-    let Some(name) = plank::enginepick::run(&rows, current.as_deref())? else {
+    let Some(name) = plank::enginepick::run_with_remote(&rows, current.as_deref(), remote)? else {
         if main_exists {
             cfg.resume = resume_after_skip(cfg.pick_engine_resume.take(), cfg.resume.take());
             return Ok(());
@@ -538,11 +603,12 @@ fn pick_engine_before_resolve(
     // Not installed yet, so `engine.model` is left alone. Picking the engine
     // again later attaches to the helper, or installs its staged set when it
     // has finished.
-    let unfinished = match plank::download::start_and_wait_in(root, &catalog, &sel) {
-        Ok(plank::download::WaitOutcome::Installed) => None,
-        Ok(plank::download::WaitOutcome::Detached) => Some(Unfinished::Detached),
-        Err(e) => Some(Unfinished::Failed(e)),
-    };
+    let unfinished =
+        match plank::download::start_and_wait_in_with_remote(root, &catalog, &sel, remote) {
+            Ok(plank::download::WaitOutcome::Installed) => None,
+            Ok(plank::download::WaitOutcome::Detached) => Some(Unfinished::Detached),
+            Err(e) => Some(Unfinished::Failed(e)),
+        };
     if let Some(end) = unfinished {
         return match after_unfinished_download(
             &name,
@@ -796,17 +862,21 @@ fn parse_config(
     args: &[String],
     prog: &str,
     allow_menu: bool,
+    remote: Option<&plank::remote::control::RemoteState>,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
-    parse_config_in(
+    parse_config_with_menu(
         settings,
         args,
         prog,
         &plank::manifest::plank_dir(),
         active_recommendation(),
-        allow_menu,
-        std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-            && std::io::stderr().is_terminal(),
+        StartupMenu {
+            allow: allow_menu,
+            ttys: std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal(),
+            remote,
+        },
     )
 }
 
@@ -833,6 +903,7 @@ fn menu_allowed_with(
 /// [`parse_config`] with the engine catalog and managed paths under `root`,
 /// and the profile's `recommended` engine passed in rather than read from
 /// the active profile.
+#[cfg(test)]
 fn parse_config_in(
     settings: &plank::settings::Settings,
     args: &[String],
@@ -842,11 +913,59 @@ fn parse_config_in(
     allow_menu: bool,
     ttys: bool,
 ) -> Result<plank::config::AgentConfig, ExitCode> {
+    parse_config_with_menu(
+        settings,
+        args,
+        prog,
+        root,
+        recommended,
+        StartupMenu {
+            allow: allow_menu,
+            ttys,
+            remote: None,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartupMenu<'a> {
+    allow: bool,
+    ttys: bool,
+    remote: Option<&'a plank::remote::control::RemoteState>,
+}
+
+impl StartupMenu<'_> {
+    fn allowed(&self, cfg: &AgentConfig) -> bool {
+        startup_menu_allowed(self.allow, self.ttys, cfg, self.remote.is_some())
+    }
+}
+
+fn startup_menu_allowed(allow: bool, ttys: bool, cfg: &AgentConfig, remote: bool) -> bool {
+    menu_allowed(allow, ttys, cfg) || (allow && remote && remote_startup_allowed(cfg))
+}
+
+fn remote_startup_allowed(cfg: &AgentConfig) -> bool {
+    !answers_and_exits(cfg)
+        && cfg.prompt.is_none()
+        && matches!(
+            cfg.ui,
+            plank::config::UiMode::Tui | plank::config::UiMode::Console
+        )
+}
+
+fn parse_config_with_menu(
+    settings: &plank::settings::Settings,
+    args: &[String],
+    prog: &str,
+    root: &std::path::Path,
+    recommended: Option<plank::engines::Recommendation<'_>>,
+    menu: StartupMenu<'_>,
+) -> Result<plank::config::AgentConfig, ExitCode> {
     plank::config::parse_options_with(settings, args)
         .and_then(|mut cfg| {
             cfg.drop_default_system_under_profile(plank::profile::active().is_some());
-            let menu = menu_allowed(allow_menu, ttys, &cfg);
-            pick_engine_before_resolve(&mut cfg, root, recommended, menu)?;
+            let allowed = menu.allowed(&cfg);
+            pick_engine_before_resolve(&mut cfg, root, recommended, allowed, menu.remote)?;
             match resolve_selection(&mut cfg, root, recommended)
                 .and_then(|catalog| resolve_model_delta(&mut cfg).map(|()| catalog))
             {
@@ -1045,7 +1164,20 @@ fn migrate_engine_layout_unconditionally() {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = run_foreground_worker(&args) {
+        return code;
+    }
+    // Consume the private descriptor before recording arguments or starting
+    // helpers. Keep the fresh listener alive while the replacement loads its
+    // model; it will move into the agent once startup has completed.
+    let remote = match restore_remote_listener(&mut args) {
+        Ok(remote) => remote,
+        Err(error) => {
+            eprintln!("plank: cannot restore remote listener: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Before anything can move the process: `/edit-profile`'s restart re-runs
     // these arguments from this directory.
     plank::profileedit::record_launch(std::env::current_dir().unwrap_or_default(), args.clone());
@@ -1130,16 +1262,19 @@ fn main() -> ExitCode {
     // warnings) purely to observe a directory that is a checkout of the same
     // repo, so the pre-worktree set is reused for the rest of startup.
     let mut plugins = plank::plugins::load_default(&cwd);
+    if remote.is_some() {
+        // Remote profile and engine questions need Ctrl-C before model loading.
+        plank::interrupt::install();
+    }
     // The profile is resolved from the provisional parse because everything
     // downstream — the settings layer, the system prompt, the tool table —
     // needs it, and the real parse at `parse_options_with` happens after the
     // settings it would feed. Warnings drain *after*, not before: a spliced
     // profile can push its own, and draining first would lose them silently.
-    let code = resolve_and_activate_profile(
-        provisional.profile.as_deref(),
-        provisional.profile_explicit_empty,
+    let code = activate_profile_for_startup(
+        &provisional,
         &mut plugins,
-        home_dir().as_deref(),
+        remote.as_ref().map(|server| server.state.as_ref()),
     );
     print_plugin_warnings(&plugins);
     if let Some(code) = code {
@@ -1151,7 +1286,13 @@ fn main() -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match parse_config(&settings, &args, "plank", true) {
+    let cfg = match parse_config(
+        &settings,
+        &args,
+        "plank",
+        true,
+        remote.as_ref().map(|server| server.state.as_ref()),
+    ) {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
@@ -1209,22 +1350,71 @@ fn main() -> ExitCode {
         }
     }
 
-    plank::interrupt::install();
+    run_configured_agent(&cfg, plugins, remote)
+}
+
+fn run_foreground_worker(args: &[String]) -> Option<ExitCode> {
+    (args.first().map(String::as_str) == Some(plank::download::foreground::WORKER_ARG)).then(|| {
+        ExitCode::from(if args.len() == 1 {
+            plank::download::foreground::run_worker()
+        } else {
+            2
+        })
+    })
+}
+
+fn run_configured_agent(
+    cfg: &AgentConfig,
+    plugins: plank::plugins::PluginSet,
+    remote: Option<plank::remote::RemoteServer>,
+) -> ExitCode {
+    if remote.is_none() {
+        plank::interrupt::install();
+    }
     plank::gpuyield::sweep_stray_signals();
     arm_panic_dump();
-    let engine = match make_engine(&cfg, &plugins) {
+    let engine = match make_engine(cfg, &plugins) {
         Ok(engine) => engine,
         Err(e) => {
             eprintln!("plank: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match run(engine.main, engine.local, engine.reopen, &cfg, plugins) {
+    match run(
+        engine.main,
+        engine.local,
+        engine.reopen,
+        cfg,
+        plugins,
+        remote,
+    ) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("plank: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn restore_remote_listener(
+    args: &mut Vec<String>,
+) -> Result<Option<plank::remote::RemoteServer>, String> {
+    #[cfg(unix)]
+    {
+        use plank::remote::restart::{read_inherited, take_descriptor_argument};
+        take_descriptor_argument(args)
+            .and_then(|descriptor| descriptor.map(read_inherited).transpose())
+            .and_then(|recipe| {
+                recipe
+                    .map(plank::remote::restart::RemoteRestart::restore)
+                    .transpose()
+            })
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Ok(None)
     }
 }
 
@@ -1843,6 +2033,7 @@ fn run_serve(args: &[String]) -> ExitCode {
         provisional.profile_explicit_empty,
         &mut plugins,
         home.as_deref(),
+        StartupConsent::default(),
     );
     print_plugin_warnings(&plugins);
     if let Some(code) = code {
@@ -1854,7 +2045,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     // chance to dial the console.
     plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
-    let cfg = match parse_config(&settings, &passthrough, "plank serve", false) {
+    let cfg = match parse_config(&settings, &passthrough, "plank serve", false, None) {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
@@ -1993,6 +2184,7 @@ fn run(
     reopen: Option<plank::gpuyield::ReopenFn>,
     cfg: &AgentConfig,
     plugins: plank::plugins::PluginSet,
+    remote: Option<plank::remote::RemoteServer>,
 ) -> Result<u8, String> {
     // The family check the C makes right after opening the engine: a numeric
     // effort is meaningless to anything but V4.1, and falling back to `high`
@@ -2002,7 +2194,14 @@ fn run(
     }
     let color = std::io::stdout().is_terminal();
     if cfg.ui.is_headless() {
-        let code = plank::ui::run_headless(engine, cfg, local_engine, reopen, plugins)?;
+        let code = plank::ui::run_headless_with_remote(
+            engine,
+            cfg,
+            local_engine,
+            reopen,
+            plugins,
+            remote,
+        )?;
         return match plank::profileedit::take_restart() {
             None => Ok(code),
             Some(restart) => Err(format!(
@@ -2034,7 +2233,14 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    match plank::ui::run_interactive(engine, cfg, local_engine, reopen, plugins)? {
+    match plank::ui::run_interactive_with_remote(
+        engine,
+        cfg,
+        local_engine,
+        reopen,
+        plugins,
+        remote,
+    )? {
         None => Ok(0),
         // `/edit-profile` asked to reopen the session under the edited
         // profile. `exec_restart` returns only when the exec failed.
@@ -2064,6 +2270,163 @@ fn publish_gui_launch(cfg: &AgentConfig, args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_trust_questions_exclude_diagnostics_one_shots_and_noninteractive_modes() {
+        let settings = plank::settings::Settings::default();
+        let mut cfg = AgentConfig::from_settings(&settings);
+        assert!(remote_startup_allowed(&cfg));
+        let gui = StartupConsent::for_startup(&cfg, None, true);
+        assert!(gui.gui && can_ask(gui));
+        assert!(!StartupConsent::for_startup(&cfg, None, false).gui);
+        cfg.ui = plank::config::UiMode::Console;
+        assert!(remote_startup_allowed(&cfg));
+        cfg.prompt = Some("task".into());
+        assert!(!remote_startup_allowed(&cfg));
+        assert!(!StartupConsent::for_startup(&cfg, None, true).gui);
+        for flag in [
+            "--help",
+            "--version",
+            "--dump-config",
+            "--dump-engines",
+            "--dump-profiles",
+        ] {
+            let cfg = plank::config::parse_options_with(&settings, &[flag.into()]).unwrap();
+            assert!(!remote_startup_allowed(&cfg));
+            assert!(!StartupConsent::for_startup(&cfg, None, true).gui);
+        }
+        cfg.prompt = None;
+        for ui in [plank::config::UiMode::Quiet, plank::config::UiMode::Chart] {
+            cfg.ui = ui;
+            assert!(!remote_startup_allowed(&cfg));
+            assert!(!StartupConsent::for_startup(&cfg, None, true).gui);
+        }
+    }
+
+    #[test]
+    fn startup_trust_questions_install_and_update_profiles_only_after_approval() {
+        let root = scratch_root("profile-consent");
+        let home = root.join("home");
+        let source = root.join("source");
+        let write_source = |version: &str, prompt: &str| {
+            std::fs::create_dir_all(source.join(".plank-plugin")).unwrap();
+            std::fs::write(source.join(".plank-plugin/plugin.json"),
+                serde_json::json!({"name":"consent", "version":version, "profile":{"systemPrompt":"prompt.md"}}).to_string()).unwrap();
+            std::fs::write(source.join("prompt.md"), prompt).unwrap();
+        };
+        write_source("1.0.0", "Version one prompt\n");
+        let uri = source.to_str().unwrap();
+        assert_eq!(
+            resolve_profile_source_with(uri, Some(&home), false, |_| panic!(
+                "unattended startup cannot ask"
+            )),
+            Err(ExitCode::from(2))
+        );
+        assert_eq!(
+            resolve_profile_source_with(uri, Some(&home), true, |_| false),
+            Err(ExitCode::SUCCESS)
+        );
+        assert!(plank::profiles::find(&home, "consent").is_none());
+        let installed = resolve_profile_source_with(uri, Some(&home), true, |question| {
+            assert!(question.starts_with("Install the profile"));
+            true
+        })
+        .unwrap();
+        assert_eq!(installed, "consent");
+        let dest = plank::profiles::find(&home, "consent").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("prompt.md")).unwrap(),
+            "Version one prompt\n"
+        );
+        std::fs::write(dest.join("prompt.md"), "Local edit\n").unwrap();
+        write_source("2.0.0", "Version two prompt\n");
+        assert_eq!(
+            resolve_profile_source_with(uri, Some(&home), true, |question| {
+                assert!(question.starts_with("Update profile"));
+                false
+            })
+            .unwrap(),
+            "consent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("prompt.md")).unwrap(),
+            "Local edit\n"
+        );
+        assert_eq!(plank::profiles::version_of(&dest).as_deref(), Some("1.0.0"));
+        resolve_profile_source_with(uri, Some(&home), true, |_| true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("prompt.md")).unwrap(),
+            "Version two prompt\n"
+        );
+        assert_eq!(plank::profiles::version_of(&dest).as_deref(), Some("2.0.0"));
+        resolve_profile_source_with(uri, Some(&home), true, |_| {
+            panic!("current profile does not ask again")
+        })
+        .unwrap();
+        write_source("3.0.0", "Version three prompt\n");
+        resolve_profile_source_with(uri, Some(&home), false, |_| {
+            panic!("unattended update cannot ask")
+        })
+        .unwrap();
+        assert_eq!(plank::profiles::version_of(&dest).as_deref(), Some("2.0.0"));
+        assert_eq!(
+            resolve_profile_source_with(uri, None, true, |_| panic!("missing home cannot ask")),
+            Err(ExitCode::from(2))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_engine_questions_allow_remote_startup_but_exclude_diagnostics_and_one_shots() {
+        let settings = plank::settings::Settings::default();
+        for ui in [plank::config::UiMode::Tui, plank::config::UiMode::Console] {
+            let mut cfg = AgentConfig::from_settings(&settings);
+            cfg.ui = ui;
+            assert!(startup_menu_allowed(true, false, &cfg, true));
+            assert!(!startup_menu_allowed(true, false, &cfg, false));
+            assert!(!startup_menu_allowed(false, false, &cfg, true));
+            cfg.prompt = Some("one shot".into());
+            assert!(!startup_menu_allowed(true, false, &cfg, true));
+        }
+        for flag in [
+            "--help",
+            "--version",
+            "--dump-config",
+            "--dump-engines",
+            "--dump-profiles",
+        ] {
+            let cfg = plank::config::parse_options_with(&settings, &[flag.into()]).unwrap();
+            assert!(!startup_menu_allowed(true, false, &cfg, true));
+        }
+        for ui in [plank::config::UiMode::Quiet, plank::config::UiMode::Chart] {
+            let mut cfg = AgentConfig::from_settings(&settings);
+            cfg.ui = ui;
+            assert!(!startup_menu_allowed(true, false, &cfg, true));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_handover_startup_preserves_normal_args_and_refuses_bad_descriptors() {
+        let mut args = vec![
+            "--model:fixture".to_owned(),
+            "/resume".into(),
+            "saved".into(),
+        ];
+        let original = args.clone();
+        assert!(restore_remote_listener(&mut args).unwrap().is_none());
+        assert_eq!(args, original);
+        args.extend(["--remote-restart-fd".into(), "private-invalid-value".into()]);
+        let invalid = args.clone();
+        let error = restore_remote_listener(&mut args).unwrap_err();
+        assert!(!error.contains("private-invalid-value"));
+        assert_eq!(args, invalid);
+        let last = args.last_mut().unwrap();
+        *last = i32::MAX.to_string();
+        assert!(restore_remote_listener(&mut args).is_err());
+        // Valid syntax is consumed even when the descriptor itself is closed.
+        assert_eq!(args, original);
+    }
 
     #[test]
     fn choice_is_named_default_or_spec() {

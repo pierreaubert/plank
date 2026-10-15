@@ -2004,6 +2004,30 @@ impl Session {
         Ok(parse_frame_outcome(&bytes))
     }
 
+    /// Delivers bounded Unicode text, stopping immediately when the guest closes.
+    ///
+    /// # Errors
+    /// Returns an error before dispatch for invalid text, or when a key traps.
+    pub fn frame_text(&mut self, frame: &OpenFrame, text: &str) -> Result<FrameOutcome, String> {
+        if !crate::guiframe::valid_text(text) {
+            return Err(
+                "Frame text must contain 1–128 printable characters (at most 512 bytes)".into(),
+            );
+        }
+        for character in text.chars() {
+            let code = if character == ' ' {
+                "space".into()
+            } else {
+                character.to_lowercase().collect::<String>()
+            };
+            let outcome = self.frame_key(frame, &code, Some(character))?;
+            if matches!(outcome, FrameOutcome::Close(_)) {
+                return Ok(outcome);
+            }
+        }
+        Ok(FrameOutcome::Stay)
+    }
+
     /// Delivers a mouse event to an open frame.
     ///
     /// `frame_mouse` is optional — a keyboard-only game is a perfectly good

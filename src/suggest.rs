@@ -40,6 +40,8 @@ const ASSISTANT_VOICE: [&str; 10] = [
 /// One suggestion, bound to the transcript it was generated against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
+    /// Unique offer identity, so dismissed hints cannot reappear from snapshots.
+    pub revision: String,
     pub text: String,
     /// Transcript length when this was generated. A suggestion whose depth no
     /// longer matches is stale and must not be shown: it was a guess about a

@@ -13,6 +13,7 @@ pub mod anim;
 pub mod arcade;
 pub mod branch;
 pub mod buddy;
+pub mod buddyframe;
 pub mod cbuf;
 pub mod checkpoint;
 pub mod claudeplugin;
@@ -85,6 +86,7 @@ pub mod feedback;
 /// The ds4 C API, re-exported from `crates/local-inference-engine` so `crate::ffi` paths
 /// keep working.
 pub use local_inference_engine::ffi;
+pub mod documenttransfer;
 pub mod framebridge;
 /// Gemma 4 behind [`engine::Engine`], over the native-Rust `gemma-engine`
 /// crate (candle on Metal). Needs no submodule, so it is on by default.
@@ -96,13 +98,19 @@ pub mod goal;
 pub mod gpuyield;
 pub mod grid;
 pub mod guard;
+mod guiarcade;
+pub mod guifocus;
+pub mod guiframe;
 pub mod hints;
 pub mod home;
 pub mod hooks;
 pub mod host;
 pub mod imagepaste;
+pub mod insightchart;
 pub mod insights;
 pub mod interrupt;
+mod jobcancel;
+pub mod joboutput;
 pub mod kvcache;
 pub mod kvgc;
 pub mod kvladder;
@@ -112,6 +120,7 @@ pub mod kvpane;
 /// compiled so the tier walk is CI-tested; the gated `ds4engine` executes it.
 pub mod kvtier;
 pub mod kvtree;
+pub mod livecontrol;
 pub mod logo;
 pub mod manifest;
 pub mod memextract;
@@ -131,6 +140,7 @@ pub mod profileedit;
 pub mod profiles;
 pub mod provenance;
 pub mod remote;
+pub mod subhistory;
 pub use trace_stream::render;
 pub mod repro;
 pub mod resumepane;

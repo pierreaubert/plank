@@ -3080,6 +3080,115 @@ pub fn write_report(
     Ok(path)
 }
 
+fn chart_label(text: &str) -> String {
+    let mut out = String::new();
+    for character in text.chars().filter(|character| !character.is_control()) {
+        // Bound graph labels independently of the larger text report.
+        if out.len() + character.len_utf8() > 256 {
+            break;
+        }
+        out.push(character);
+    }
+    if out.trim().is_empty() {
+        "(unnamed)".into()
+    } else {
+        out
+    }
+}
+
+/// Captures deterministic chart data without interpreting model-written narrative.
+#[must_use]
+pub fn client_charts(agg: &Aggregated) -> Vec<crate::insightchart::Chart> {
+    use crate::insightchart::{Chart, Kind};
+    let label = chart_label;
+    let mut charts = Vec::new();
+    for (kind, rows, limit) in [
+        (Kind::Tools, &agg.tools, 12),
+        (Kind::Languages, &agg.languages, 10),
+        (Kind::Projects, &agg.projects, 10),
+        (Kind::Errors, &agg.errors, 10),
+        (Kind::ToolFailures, &agg.error_tools, 10),
+        (Kind::ReplyTimes, &agg.response_histogram, 8),
+    ] {
+        if rows.is_empty() || (kind == Kind::ReplyTimes && agg.response_median == 0) {
+            continue;
+        }
+        charts.push(Chart {
+            kind,
+            rows: rows
+                .iter()
+                .take(limit)
+                .map(|(name, count)| (label(name), f64::from(*count)))
+                .collect(),
+            note: if rows.len() > limit {
+                format!("Top {limit} of {} categories.", rows.len())
+            } else {
+                String::new()
+            },
+        });
+    }
+    let coverage = if agg.sessions_without_timing > 0 {
+        format!(
+            "Measured over {} of {} sessions; others predate per-message timestamps.",
+            agg.sessions_counted
+                .saturating_sub(agg.sessions_without_timing),
+            agg.sessions_counted
+        )
+    } else {
+        String::new()
+    };
+    if let Some(chart) = charts
+        .iter_mut()
+        .find(|chart| chart.kind == Kind::ReplyTimes)
+    {
+        chart.note = format!(
+            "Median {}, mean {}. {coverage}",
+            dur(agg.response_median),
+            dur(agg.response_mean)
+        )
+        .trim()
+        .into();
+    }
+    if agg.by_hour.iter().any(|count| *count > 0) {
+        charts.push(Chart {
+            kind: Kind::PromptsByHour,
+            rows: agg
+                .by_hour
+                .iter()
+                .enumerate()
+                .map(|(hour, count)| (format!("{hour:02}:00"), f64::from(*count)))
+                .collect(),
+            note: coverage,
+        });
+    }
+    if !agg.error_rates.is_empty() {
+        charts.push(Chart {
+            kind: Kind::FailureRates,
+            rows: agg
+                .error_rates
+                .iter()
+                .take(5)
+                .map(|(name, rate)| (label(name), *rate))
+                .collect(),
+            note: "Tools used at least 10 times; failed invocations as a percentage.".into(),
+        });
+    }
+    if !agg.satisfaction_by_day.is_empty() {
+        charts.push(Chart {
+            kind: Kind::Satisfaction,
+            rows: agg
+                .satisfaction_by_day
+                .iter()
+                .take(32)
+                .rev()
+                .map(|(day, share)| (label(day), *share * 100.0))
+                .collect(),
+            note: "Up to 32 rated days, oldest to newest; orphaned ratings excluded.".into(),
+        });
+    }
+    charts
+}
+
 /// Renders bounded statistics and narrative for native and browser clients.
 ///
 /// Lists show at most 32 entries; the complete standalone report remains on disk.
@@ -3207,6 +3316,59 @@ fn report_narrative(out: &mut String, value: &serde_json::Value, depth: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_insights_charts_preserve_statistics_coverage_order_and_wire_compatibility() {
+        use crate::insightchart::Kind;
+        let mut agg = super::Aggregated {
+            sessions_counted: 10,
+            sessions_without_timing: 8,
+            tools: (0..20)
+                .map(|index| (format!("tool-{index}"), 20 - index))
+                .collect(),
+            languages: vec![("Rust".into(), 4)],
+            projects: vec![("測試".repeat(100), 2)],
+            response_median: 15,
+            response_mean: 20,
+            response_histogram: vec![("<30s".into(), 3)],
+            error_rates: vec![("bash".into(), 12.5)],
+            satisfaction_by_day: vec![("2026-10-15".into(), 0.75), ("2026-10-14".into(), 0.5)],
+            ..super::Aggregated::default()
+        };
+        agg.by_hour[9] = 7;
+        let charts = super::client_charts(&agg);
+        assert!(crate::insightchart::valid_charts(&charts));
+        let get = |kind| charts.iter().find(|chart| chart.kind == kind).unwrap();
+        assert_eq!(get(Kind::Tools).rows.len(), 12);
+        assert_eq!(get(Kind::Tools).rows[0], ("tool-0".into(), 20.0));
+        assert!(get(Kind::Tools).note.contains("12 of 20"));
+        assert!(get(Kind::Projects).rows[0].0.len() <= 256);
+        assert_eq!(get(Kind::PromptsByHour).rows.len(), 24);
+        assert_eq!(get(Kind::PromptsByHour).rows[9], ("09:00".into(), 7.0));
+        assert!(get(Kind::PromptsByHour).note.contains("2 of 10"));
+        assert!(get(Kind::ReplyTimes).note.contains("2 of 10"));
+        assert!((get(Kind::FailureRates).rows[0].1 - 12.5).abs() < f64::EPSILON);
+        assert_eq!(
+            get(Kind::Satisfaction).rows,
+            vec![("2026-10-14".into(), 50.0), ("2026-10-15".into(), 75.0)]
+        );
+        let metric = crate::remote::control::MetricsWire::Insights {
+            markdown: "report".into(),
+            charts: charts.clone(),
+            html_sha256: None,
+        };
+        let encoded = serde_json::to_value(&metric).unwrap();
+        assert_eq!(
+            serde_json::from_value::<crate::remote::control::MetricsWire>(encoded).unwrap(),
+            metric
+        );
+        let legacy: crate::remote::control::MetricsWire =
+            serde_json::from_value(serde_json::json!({"kind":"insights","markdown":"old report"}))
+                .unwrap();
+        assert!(
+            matches!(legacy, crate::remote::control::MetricsWire::Insights { charts, .. } if charts.is_empty())
+        );
+    }
+
     #[test]
     fn remote_insights_stop_after_empty_scan_progress_is_not_a_completed_scan() {
         let dir =

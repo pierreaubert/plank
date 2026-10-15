@@ -44,6 +44,8 @@ pub mod limits;
 pub mod control;
 pub(crate) mod editors;
 pub(crate) mod questions;
+#[cfg(unix)]
+pub mod restart;
 pub use control::{RemoteServer, generate_token};
 
 /// Bind address for a `/remote-control` activation: loopback, ephemeral port.

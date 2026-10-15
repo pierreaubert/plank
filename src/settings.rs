@@ -1669,6 +1669,15 @@ impl Settings {
             upsert_opt(t, "editUpto", self.tools.edit_upto.map(Json::Bool));
         }
 
+        // Component IDs contain dots, so preserve their flat option keys.
+        // Merge into the existing section to retain options unknown to this host.
+        if !self.plugin_config.is_empty() {
+            let entries = section(&mut root, "pluginConfig");
+            for (key, value) in &self.plugin_config {
+                upsert(entries, key, Json::Str(value.clone()));
+            }
+        }
+
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
         out.push('\n');
@@ -2506,6 +2515,34 @@ mod tests {
         assert_eq!(reloaded.engine.ctx, Some(8192));
         assert_eq!(reloaded.engine.backend, None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_to_round_trips_component_options_and_preserves_unknown_options() {
+        let directory =
+            std::env::temp_dir().join(format!("plank-component-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"pluginConfig":{"other.option":"keep","dev.demo.count":"2"}}"#,
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings
+            .plugin_config
+            .insert("dev.demo.count".into(), "7".into());
+        settings
+            .plugin_config
+            .insert("dev.demo.title".into(), "two words 日本語".into());
+        settings.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert_eq!(reloaded.plugin_config["dev.demo.count"], "7");
+        assert_eq!(reloaded.plugin_config["dev.demo.title"], "two words 日本語");
+        assert_eq!(reloaded.plugin_config["other.option"], "keep");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

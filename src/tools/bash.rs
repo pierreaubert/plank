@@ -42,6 +42,120 @@ struct Stats {
 #[derive(Debug)]
 struct Shared {
     sink: Mutex<(std::fs::File, Stats)>,
+    readers: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug)]
+struct OutputFollow {
+    stopped: Arc<std::sync::atomic::AtomicU8>,
+    last: Arc<Mutex<crate::joboutput::Page>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for OutputFollow {
+    fn drop(&mut self) {
+        let _ = self.stopped.compare_exchange(
+            crate::jobcancel::RUNNING,
+            crate::jobcancel::RETIRED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
+}
+
+struct OutputWatch {
+    path: PathBuf,
+    id: i64,
+    shared: std::sync::Weak<Shared>,
+    stop: Arc<std::sync::atomic::AtomicU8>,
+    latest: Arc<Mutex<crate::joboutput::Page>>,
+    mailbox: Option<PathBuf>,
+    observer: String,
+    lease: crate::jobcancel::Lease,
+}
+
+impl OutputWatch {
+    fn run(self, emit: impl Fn(Result<crate::joboutput::Page, String>)) {
+        let Self {
+            path,
+            id,
+            shared,
+            stop,
+            latest,
+            mailbox,
+            observer,
+            lease,
+        } = self;
+        let _lease = lease;
+        loop {
+            // One observer per table; quiet jobs do no more than one read/second.
+            std::thread::park_timeout(Duration::from_secs(1));
+            if mailbox
+                .as_ref()
+                .is_some_and(|path| crate::jobcancel::mailbox_requested(path, &observer))
+            {
+                let _ = stop.compare_exchange(
+                    crate::jobcancel::RUNNING,
+                    crate::jobcancel::REQUESTED,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
+            }
+            let cancellation = stop.load(std::sync::atomic::Ordering::Acquire);
+            if cancellation == crate::jobcancel::REQUESTED {
+                let stopped = latest.lock().ok().map(|mut last| {
+                    last.following = false;
+                    last.clone()
+                });
+                if let Some(stopped) = stopped {
+                    emit(Ok(stopped));
+                }
+                break;
+            }
+            if cancellation == crate::jobcancel::RETIRED {
+                break;
+            }
+            let following = shared.upgrade().is_some_and(|shared| {
+                shared.readers.load(std::sync::atomic::Ordering::Acquire) > 0
+            });
+            let mut current = match read_output_window(&path, id, u64::MAX, true) {
+                Ok(current) => current,
+                Err(error) => {
+                    let stopped = latest.lock().ok().map(|mut last| {
+                        last.following = false;
+                        last.clone()
+                    });
+                    if let Some(stopped) = stopped {
+                        emit(Ok(stopped));
+                    }
+                    emit(Err(error));
+                    break;
+                }
+            };
+            current.following = following;
+            current.observer = Some(observer.clone());
+            let changed = if let Ok(mut last) = latest.lock() {
+                if *last == current {
+                    false
+                } else {
+                    *last = current.clone();
+                    true
+                }
+            } else {
+                break;
+            };
+            if changed {
+                emit(Ok(current));
+            }
+            if !following {
+                break;
+            }
+        }
+    }
 }
 
 /// One tracked background shell command.
@@ -70,6 +184,8 @@ struct BashJob {
 #[derive(Debug, Default)]
 pub struct BashJobs {
     jobs: Vec<BashJob>,
+    follow: Mutex<Option<OutputFollow>>,
+    output_control: Arc<crate::jobcancel::Hub>,
     next_id: i64,
     /// How the last `bash` call's command ended, when it ended inside the
     /// call (`gpuyield`). Cleared by the agent before each dispatch; a job
@@ -93,7 +209,17 @@ pub struct DecidedSandbox(pub Option<crate::sandbox::Sandbox>);
 
 fn spawn_reader(shared: &Arc<Shared>, mut stream: impl std::io::Read + Send + 'static) {
     let shared = Arc::clone(shared);
+    shared
+        .readers
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     std::thread::spawn(move || {
+        struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _done = Done(&shared.readers);
         let mut buf = [0_u8; 4096];
         loop {
             match stream.read(&mut buf) {
@@ -557,6 +683,7 @@ impl BashJobs {
 
         let shared = Arc::new(Shared {
             sink: Mutex::new((file, Stats::default())),
+            readers: std::sync::atomic::AtomicUsize::new(0),
         });
         if let Some(stdout) = child.stdout.take() {
             spawn_reader(&shared, stdout);
@@ -629,12 +756,132 @@ impl BashJobs {
         render_rows(&self.rows())
     }
 
-    /// Reports or stops a job without consuming its model notification.
+    /// Reads one page without consuming the job's model notification.
     ///
-    /// Reads only the final 32 KiB, matching the tool output tail limit.
+    /// UTF-8 alignment preserves characters across adjacent byte pages.
     ///
     /// # Errors
     ///
+    /// Returns an error if the job disappeared or its output cannot be read.
+    pub(crate) fn output_page(
+        &mut self,
+        id: i64,
+        page: u64,
+    ) -> Result<crate::joboutput::Page, String> {
+        self.sweep();
+        let index = self
+            .find(id, 0)
+            .ok_or_else(|| format!("Background job #{id} is no longer tracked"))?;
+        let snapshot = read_output_page(&self.jobs[index].path, id, page)?;
+        self.stop_following();
+        Ok(snapshot)
+    }
+
+    /// Stops observation without stopping a job or consuming its notification.
+    pub(crate) fn stop_following(&self) -> Option<crate::joboutput::Page> {
+        let follow = self.follow.lock().ok()?.take()?;
+        let last = Arc::clone(&follow.last);
+        drop(follow);
+        let mut snapshot = last.lock().ok()?.clone();
+        snapshot.following = false;
+        Some(snapshot)
+    }
+
+    /// Returns the observer cancellation registry.
+    pub(crate) fn output_control(&self) -> Arc<crate::jobcancel::Hub> {
+        Arc::clone(&self.output_control)
+    }
+
+    /// Follows one owned output file independently of the agent's model turn.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown job, unreadable output, or poisoned state.
+    pub(crate) fn follow_output(
+        &mut self,
+        id: i64,
+        publish: impl Fn(Result<crate::joboutput::Page, String>) + Send + Sync + 'static,
+    ) -> Result<crate::joboutput::Page, String> {
+        self.follow_output_with_mailbox(
+            id,
+            std::env::var_os("PLANK_GUI_JOB_CONTROL").map(PathBuf::from),
+            publish,
+        )
+    }
+
+    fn follow_output_with_mailbox(
+        &mut self,
+        id: i64,
+        mailbox: Option<PathBuf>,
+        publish: impl Fn(Result<crate::joboutput::Page, String>) + Send + Sync + 'static,
+    ) -> Result<crate::joboutput::Page, String> {
+        self.sweep();
+        let index = self
+            .find(id, 0)
+            .ok_or_else(|| format!("Background job #{id} is no longer tracked"))?;
+        let path = self.jobs[index].path.clone();
+        let shared = Arc::downgrade(&self.jobs[index].shared);
+        let mut snapshot = read_output_window(&path, id, u64::MAX, true)?;
+        snapshot.following = shared
+            .upgrade()
+            .is_some_and(|shared| shared.readers.load(std::sync::atomic::Ordering::Acquire) > 0);
+        if snapshot.following {
+            snapshot.observer = Some(
+                crate::remote::control::replay_instance_id().map_err(|error| error.to_string())?,
+            );
+        }
+        self.stop_following();
+        if !snapshot.following {
+            publish(Ok(snapshot.clone()));
+            return Ok(snapshot);
+        }
+        let stopped = Arc::new(std::sync::atomic::AtomicU8::new(crate::jobcancel::RUNNING));
+        let observer = snapshot.observer.clone().expect("live observer identity");
+        let lease = self.output_control.register(&observer, &stopped)?;
+        publish(Ok(snapshot.clone()));
+        let last = Arc::new(Mutex::new(snapshot.clone()));
+        let stop = Arc::clone(&stopped);
+        let latest = Arc::clone(&last);
+        let publish = Arc::new(publish);
+        let emit = Arc::clone(&publish);
+        let worker = std::thread::Builder::new()
+            .name("plank-job-output".into())
+            .spawn(move || {
+                OutputWatch {
+                    path,
+                    id,
+                    shared,
+                    stop,
+                    latest,
+                    mailbox,
+                    observer,
+                    lease,
+                }
+                .run(|page| emit(page));
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let mut stopped = snapshot.clone();
+                stopped.following = false;
+                publish(Ok(stopped));
+                return Err(format!("Cannot start job output observer: {error}"));
+            }
+        };
+        let observer = OutputFollow {
+            stopped,
+            last,
+            worker: Some(worker),
+        };
+        *self
+            .follow
+            .lock()
+            .map_err(|_| "Job output observer state poisoned")? = Some(observer);
+        Ok(snapshot)
+    }
+
+    /// Reports or stops a job, retaining the existing final-32-KiB behavior.
+    ///
+    /// # Errors
     /// Returns an error if the job disappeared or its output cannot be read.
     pub(crate) fn report_job(&mut self, id: i64, stop: bool) -> Result<String, String> {
         self.sweep();
@@ -1317,6 +1564,93 @@ pub fn run_immediate(
     })
 }
 
+fn utf8_boundary_forward(bytes: &[u8], index: usize) -> usize {
+    if bytes.get(index).is_none_or(|byte| byte & 0xc0 != 0x80) {
+        return index;
+    }
+    for start in index.saturating_sub(3)..index {
+        let width = match bytes[start] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => continue,
+        };
+        let end = start + width;
+        if end > index
+            && bytes
+                .get(start..end)
+                .is_some_and(|character| std::str::from_utf8(character).is_ok())
+        {
+            return end;
+        }
+    }
+    index
+}
+
+fn read_output_page(
+    path: &std::path::Path,
+    id: i64,
+    requested: u64,
+) -> Result<crate::joboutput::Page, String> {
+    read_output_window(path, id, requested, false)
+}
+
+fn read_output_window(
+    path: &std::path::Path,
+    id: i64,
+    requested: u64,
+    tail: bool,
+) -> Result<crate::joboutput::Page, String> {
+    use crate::joboutput::{PAGE_BYTES, Page};
+    if id <= 0 || requested == 0 {
+        return Err("Job ID and page must be positive".into());
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("Cannot read job #{id}: {error}"))?;
+    let total = file.metadata().map_err(|error| error.to_string())?.len();
+    let page = requested.min(total.div_ceil(PAGE_BYTES).max(1));
+    let nominal = if tail {
+        total.saturating_sub(PAGE_BYTES)
+    } else {
+        (page - 1) * PAGE_BYTES
+    };
+    let nominal_end = nominal.saturating_add(PAGE_BYTES).min(total);
+    // Three bytes on each side identify any UTF-8 scalar crossing the boundary.
+    let start = nominal.saturating_sub(3);
+    let end = nominal_end.saturating_add(3).min(total);
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(end - start)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != end - start {
+        return Err("Job output changed while reading; refresh the page".into());
+    }
+    let first = utf8_boundary_forward(
+        &bytes,
+        usize::try_from(nominal - start).map_err(|error| error.to_string())?,
+    );
+    let last = utf8_boundary_forward(
+        &bytes,
+        usize::try_from(nominal_end - start).map_err(|error| error.to_string())?,
+    );
+    let output = &bytes[first..last];
+    let lossy = std::str::from_utf8(output).is_err();
+    Ok(Page {
+        id,
+        page,
+        total,
+        start: start + first as u64,
+        end: start + last as u64,
+        text: String::from_utf8_lossy(output).into_owned(),
+        lossy,
+        tail,
+        following: false,
+        observer: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,6 +1777,215 @@ mod tests {
     }
 
     #[test]
+    fn job_output_cancel_mailbox_stops_only_current_observation_without_agent_polling() {
+        let _interrupt = crate::interrupt::test_guard();
+        let (mut ctx, directory) = test_ctx();
+        let mailbox = directory.join("stop.json");
+        let id = ctx.bash.start(&directory, "sleep 30", 60, None).unwrap();
+        let output = ctx.bash.rows()[0].path.clone();
+        let old = ctx.bash.follow_output(id, |_| {}).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let current = ctx
+            .bash
+            .follow_output_with_mailbox(id, Some(mailbox.clone()), move |page| {
+                let _ = tx.send(page);
+            })
+            .unwrap();
+        assert_ne!(old.observer, current.observer);
+        assert_eq!(rx.recv().unwrap().unwrap(), current);
+        std::fs::write(
+            &mailbox,
+            serde_json::to_vec(&serde_json::json!({"observer":old.observer})).unwrap(),
+        )
+        .unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(1200)).is_err());
+        std::fs::write(
+            &mailbox,
+            serde_json::to_vec(&serde_json::json!({"observer":current.observer})).unwrap(),
+        )
+        .unwrap();
+        let stopped = rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        assert!(!stopped.following && stopped.is_valid());
+        assert_eq!(stopped.observer, current.observer);
+        assert!(ctx.bash.jobs[0].running);
+        assert!(!ctx.bash.jobs[0].observed_once);
+        ctx.bash.report_job(id, true).unwrap();
+        assert_eq!(ctx.bash.take_finished().len(), 1);
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn job_output_cancel_hub_stops_independent_observer_without_killing_job() {
+        let _interrupt = crate::interrupt::test_guard();
+        let (mut ctx, directory) = test_ctx();
+        let id = ctx.bash.start(&directory, "sleep 30", 60, None).unwrap();
+        let path = ctx.bash.rows()[0].path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let initial = ctx
+            .bash
+            .follow_output(id, move |page| {
+                let _ = tx.send(page);
+            })
+            .unwrap();
+        assert_eq!(rx.recv().unwrap().unwrap(), initial);
+        let control = ctx.bash.output_control();
+        assert!(control.request(initial.observer.as_deref().unwrap()));
+        let stopped = rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        assert!(!stopped.following);
+        assert_eq!(stopped.observer, initial.observer);
+        assert!(ctx.bash.jobs[0].running);
+        assert!(!ctx.bash.jobs[0].observed_once);
+        ctx.bash.report_job(id, true).unwrap();
+        assert_eq!(ctx.bash.take_finished().len(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn job_output_follow_read_failure_reports_stopped_state_without_stopping_the_job() {
+        let _interrupt = crate::interrupt::test_guard();
+        let (mut ctx, directory) = test_ctx();
+        let id = ctx.bash.start(&directory, "sleep 30", 60, None).unwrap();
+        let path = ctx.bash.rows()[0].path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.bash
+            .follow_output(id, move |page| {
+                let _ = tx.send(page);
+            })
+            .unwrap();
+        assert!(rx.recv().unwrap().unwrap().following);
+        std::fs::remove_file(&path).unwrap();
+        let stopped = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(!stopped.following && stopped.is_valid());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(ctx.bash.jobs[0].running);
+        ctx.bash.stop_following();
+        ctx.bash.jobs[0].terminate();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn job_output_follow_updates_without_agent_polling_and_stops_at_stream_eof() {
+        let _interrupt = crate::interrupt::test_guard();
+        let (mut ctx, directory) = test_ctx();
+        let id = ctx
+            .bash
+            .start(
+                &directory,
+                "while test ! -f follow-release; do sleep 0.01; done; printf '日🦀 complete\\n'",
+                60,
+                None,
+            )
+            .unwrap();
+        let path = ctx.bash.rows()[0].path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let initial = ctx
+            .bash
+            .follow_output(id, move |page| {
+                let _ = tx.send(page);
+            })
+            .unwrap();
+        assert!(initial.is_valid() && initial.following && initial.tail);
+        assert_eq!(rx.recv().unwrap().unwrap(), initial);
+        std::fs::write(directory.join("follow-release"), []).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let final_page = loop {
+            let page = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .unwrap();
+            assert!(page.is_valid());
+            if !page.following {
+                break page;
+            }
+        };
+        assert_eq!(final_page.text, "日🦀 complete\n");
+        // No model/status/agent poll ran while the reader and observer worked.
+        assert!(ctx.bash.jobs[0].running);
+        assert!(!ctx.bash.jobs[0].observed_once);
+        ctx.bash.stop_following();
+        assert_eq!(ctx.bash.take_finished().len(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn job_output_follow_cancellation_and_page_selection_leave_the_job_running() {
+        let _interrupt = crate::interrupt::test_guard();
+        let (mut ctx, directory) = test_ctx();
+        let id = ctx.bash.start(&directory, "sleep 30", 60, None).unwrap();
+        let path = ctx.bash.rows()[0].path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.bash
+            .follow_output(id, move |page| {
+                let _ = tx.send(page);
+            })
+            .unwrap();
+        assert!(rx.recv().unwrap().unwrap().following);
+        assert!(ctx.bash.follow_output(id + 1, |_| {}).is_err());
+        let selected = ctx.bash.output_page(id, 1).unwrap();
+        assert!(!selected.following && !selected.tail);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(ctx.bash.jobs[0].running);
+        assert!(!ctx.bash.jobs[0].observed_once);
+        ctx.bash.report_job(id, true).unwrap();
+        assert_eq!(ctx.bash.take_finished().len(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn job_output_pages_reconstruct_unicode_and_bound_binary_output() {
+        let (_, directory) = test_ctx();
+        let path = directory.join("output-page-test");
+        let page_bytes = usize::try_from(crate::joboutput::PAGE_BYTES).unwrap();
+        for padding in 1..=4 {
+            let text = format!(
+                "{}{}",
+                "x".repeat(page_bytes - padding),
+                "é界🦀e\u{301}\n".repeat(6000)
+            );
+            std::fs::write(&path, &text).unwrap();
+            let mut rebuilt = String::new();
+            let mut previous = 0;
+            for number in 1..=(text.len() as u64).div_ceil(crate::joboutput::PAGE_BYTES) {
+                let page = read_output_page(&path, 7, number).unwrap();
+                assert!(page.is_valid());
+                assert!(!page.lossy);
+                assert_eq!(page.start, previous);
+                previous = page.end;
+                rebuilt.push_str(&page.text);
+            }
+            assert_eq!(rebuilt, text);
+            assert_eq!(previous, text.len() as u64);
+            assert!(read_output_page(&path, 7, u64::MAX).unwrap().is_valid());
+        }
+        std::fs::write(&path, []).unwrap();
+        let empty = read_output_page(&path, 7, 1).unwrap();
+        assert!(empty.is_valid());
+        assert!(empty.text.is_empty());
+        assert!(read_output_page(&path, 0, 1).is_err());
+        assert!(read_output_page(&path, 7, 0).is_err());
+        let binary = vec![0x80; page_bytes + 1];
+        std::fs::write(&path, binary).unwrap();
+        let first = read_output_page(&path, 7, 1).unwrap();
+        let last = read_output_page(&path, 7, 2).unwrap();
+        assert!(first.is_valid() && last.is_valid());
+        assert!(first.lossy && last.lossy);
+        assert_eq!(first.end, last.start);
+        assert_eq!(
+            first.text.chars().count() as u64,
+            crate::joboutput::PAGE_BYTES
+        );
+        assert_eq!(last.text, "\u{fffd}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn job_reports_bound_output_and_preserve_completion_notifications() {
         let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
@@ -1456,6 +1999,9 @@ mod tests {
         assert!(report.ends_with("\nfinal output\n"));
         assert!(report.len() < BASH_TAIL_BYTES + 1024);
         assert!(!ctx.bash.jobs[0].observed_once);
+        assert!(ctx.bash.output_page(id, 1).unwrap().is_valid());
+        assert!(!ctx.bash.jobs[0].observed_once);
+        assert!(ctx.bash.output_page(id + 1, 1).is_err());
         assert!(ctx.bash.report_job(id + 1, true).is_err());
         assert!(ctx.bash.jobs[0].running);
         let report = ctx.bash.report_job(id, true).unwrap();

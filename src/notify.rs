@@ -22,49 +22,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-/// When desktop notifications fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NotifyMode {
-    /// On every qualifying turn event.
-    #[default]
-    Always,
-    /// Only while the terminal window is not focused — the case where a
-    /// banner is informative rather than redundant.
-    Unfocused,
-    /// Never.
-    Never,
-}
-
-impl NotifyMode {
-    /// The settings-file spelling of the mode.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            NotifyMode::Always => "always",
-            NotifyMode::Unfocused => "unfocused",
-            NotifyMode::Never => "never",
-        }
-    }
-
-    /// Parses a settings value; `true`/`false` are accepted as the pre-mode
-    /// boolean spellings (always/never).
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "always" | "true" | "on" => Some(NotifyMode::Always),
-            "unfocused" => Some(NotifyMode::Unfocused),
-            "never" | "false" | "off" => Some(NotifyMode::Never),
-            _ => None,
-        }
-    }
-}
+pub use crate::livecontrol::NotifyMode;
 
 static MODE: AtomicU8 = AtomicU8::new(0);
 
-/// Whether the terminal window is focused. Only the TUI receives focus
-/// events; it seeds this true at startup and tracks changes. The plain REPL
-/// never sets it, so it stays false there and `Unfocused` behaves like
-/// `Always` — better a redundant banner than a silently missing one.
+/// Whether the terminal window is focused. Graphical workers use their expiring
+/// private mailbox instead. A plain REPL receives neither kind of focus update,
+/// so `Unfocused` behaves like `Always` there.
 static FOCUSED: AtomicBool = AtomicBool::new(false);
 
 /// Sets the notification mode for the rest of the session.
@@ -109,8 +73,17 @@ fn should_deliver() -> bool {
     match mode() {
         NotifyMode::Always => true,
         NotifyMode::Never => false,
-        NotifyMode::Unfocused => !FOCUSED.load(Ordering::Relaxed),
+        NotifyMode::Unfocused => !graphical_or_terminal_focused(),
     }
+}
+
+fn graphical_or_terminal_focused() -> bool {
+    std::env::var_os("PLANK_GUI_FOCUS_CONTROL").map_or_else(
+        || FOCUSED.load(Ordering::Relaxed),
+        |path| {
+            crate::guifocus::read_focused(std::path::Path::new(&path), crate::guifocus::now_ms())
+        },
+    )
 }
 
 /// True when a completed turn lasting `elapsed` should notify given the
@@ -522,6 +495,64 @@ mod tests {
         for m in [NotifyMode::Always, NotifyMode::Unfocused, NotifyMode::Never] {
             assert_eq!(NotifyMode::parse(m.as_str()), Some(m));
         }
+    }
+
+    #[test]
+    fn gui_focus_notification_policy_reads_the_private_mailbox_in_a_child_process() {
+        let path =
+            std::env::temp_dir().join(format!("plank-notify-focus-test-{}", std::process::id()));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "notify::tests::gui_focus_notification_policy_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PLANK_GUI_FOCUS_CONTROL", &path)
+            .output()
+            .unwrap();
+        std::fs::remove_file(path).ok();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated notification-policy fixture, invoked by its parent test"]
+    fn gui_focus_notification_policy_fixture() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("PLANK_GUI_FOCUS_CONTROL").expect("private focus mailbox"),
+        );
+        set_mode(NotifyMode::Unfocused);
+        set_focused(true); // Terminal focus cannot override a configured GUI mailbox.
+        assert!(
+            should_deliver(),
+            "missing focus must not hide notifications"
+        );
+        let mut snapshot = crate::guifocus::Snapshot {
+            focused: true,
+            expires_ms: crate::guifocus::now_ms().saturating_add(crate::guifocus::LIFETIME_MS),
+        };
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(!should_deliver());
+        set_mode(NotifyMode::Always);
+        assert!(should_deliver());
+        set_mode(NotifyMode::Never);
+        assert!(!should_deliver());
+        set_mode(NotifyMode::Unfocused);
+        snapshot.focused = false;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(should_deliver());
+        snapshot.focused = true;
+        snapshot.expires_ms = 0;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(
+            should_deliver(),
+            "a dead client cannot suppress a notification"
+        );
     }
 
     #[test]

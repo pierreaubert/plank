@@ -446,13 +446,16 @@ mod tests {
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut queued = server.state.shared.take_queued();
+        let mut queued = server.state.shared.take_prompt_requests();
         while queued.is_empty() {
             assert!(Instant::now() < deadline, "prompt never queued");
             std::thread::sleep(Duration::from_millis(10));
-            queued = server.state.shared.take_queued();
+            queued = server.state.shared.take_prompt_requests();
         }
-        assert_eq!(queued, vec!["drive me"]);
+        assert_eq!(
+            queued.into_iter().map(|(_, text)| text).collect::<Vec<_>>(),
+            vec!["drive me"]
+        );
 
         // A live bus event is mirrored to the client.
         server

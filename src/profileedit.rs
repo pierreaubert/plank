@@ -506,6 +506,9 @@ pub struct Restart {
     /// C binds the vector into the graph at open, so a different direction
     /// needs a fresh engine. `None` keeps the launch's steering as it was.
     pub steering: Option<SteerSwitch>,
+    /// Private listener recipe captured before the old agent is dropped.
+    #[cfg(unix)]
+    pub remote: Option<crate::remote::restart::RemoteRestart>,
 }
 
 /// The direction and FFN scale a restart switches steering to.
@@ -658,10 +661,16 @@ pub fn exec_restart(restart: &Restart) -> String {
     if let Some(switch) = &restart.steering {
         args = switch_steering(&args, switch);
     }
-    std::process::Command::new(exe)
-        .args(args)
-        .exec()
-        .to_string()
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    #[cfg(unix)]
+    if let Some(recipe) = &restart.remote {
+        return match recipe.prepare() {
+            Ok(packet) => packet.exec(command).to_string(),
+            Err(error) => format!("cannot prepare remote listener restart: {error}"),
+        };
+    }
+    command.exec().to_string()
 }
 
 #[cfg(test)]
@@ -908,6 +917,8 @@ mod tests {
             cwd: PathBuf::from("/w"),
             pick_engine: false,
             steering: None,
+            #[cfg(unix)]
+            remote: None,
         };
         request_restart(r.clone());
         assert_eq!(take_restart(), Some(r));
